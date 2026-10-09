@@ -7,6 +7,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <pybind11/functional.h>
@@ -20,6 +21,7 @@
 #include "../comm/api.hpp"
 #include "../utils/tensor.hpp"
 #include "../kernels/ep/api.hpp"
+#include "../kernels/ep/low_latency_policy.hpp"
 #include "../utils/event.hpp"
 
 namespace deep_ep {
@@ -28,6 +30,31 @@ class EPBuffer: public BufferBase {
     int64_t num_buffer_bytes;
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
+
+    static int get_num_used_vec_cores(const int num_ai_cores) {
+        // Persistent kernels require all participating AIVs to be resident.
+        // Query the device directly: runtime vector-core overrides are not physical limits.
+        const auto physical_ai_cores = jit->device.get_num_aicore_cores();
+        const auto physical_vec_cores = jit->device.get_num_vec_cores();
+        EP_HOST_ASSERT(physical_ai_cores > 0 and physical_vec_cores > 0);
+        if (num_ai_cores <= 0 or num_ai_cores > physical_ai_cores)
+            throw EPExceptionWithLineInfo("EPBuffer", "num_sms must be between 1 and " +
+                std::to_string(physical_ai_cores) + " physical AI cores; requested " +
+                std::to_string(num_ai_cores));
+
+        const auto configured_vec_cores = runtime->get_num_vec_cores();
+        if (configured_vec_cores <= 0 or configured_vec_cores > physical_vec_cores)
+            throw EPExceptionWithLineInfo("EPBuffer", "Configured AIV count " +
+                std::to_string(configured_vec_cores) + " exceeds the available range 1.." +
+                std::to_string(physical_vec_cores));
+        const auto num_used_vec_cores = static_cast<int64_t>(num_ai_cores) *
+            (configured_vec_cores / physical_ai_cores);
+        if (num_used_vec_cores <= 0 or num_used_vec_cores > physical_vec_cores)
+            throw EPExceptionWithLineInfo("EPBuffer", "Requested AI cores map to " +
+                std::to_string(num_used_vec_cores) + " AIVs; the physical device provides " +
+                std::to_string(physical_vec_cores));
+        return static_cast<int>(num_used_vec_cores);
+    }
 
 public:
     std::shared_ptr<comm::Context> context;
@@ -187,8 +214,7 @@ public:
         }
 
         // Resource configs
-        EP_HOST_ASSERT(num_ai_cores > 0);
-        const auto num_used_vec_cores = num_ai_cores * runtime->get_num_vec_cores_per_ai_core();
+        const auto num_used_vec_cores = get_num_used_vec_cores(num_ai_cores);
         const auto num_ub_bytes = static_cast<int>(runtime->get_num_ubuf_bytes_per_vec_core());
         EP_HOST_ASSERT(num_ub_bytes > 0);
 
@@ -255,6 +281,10 @@ public:
 
         // Launch dispatch
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
+        const auto low_latency_transport = low_latency_transport_enabled() &&
+            prefer_low_latency_transport_runtime(false, runtime->get_npu_arch(), context->num_ranks, num_tokens,
+                                                 num_max_tokens_per_rank, hidden, num_topk, num_experts,
+                                                 num_used_vec_cores, sf.has_value(), num_ub_bytes);
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr(), topk_weights_ptr,
                         metadata_send_buffer.data_ptr(),
@@ -279,7 +309,7 @@ public:
                         num_ub_bytes,
                         num_used_vec_cores,
                         context->num_gpu_timeout_cycles,
-                        barrier_in_prologue);
+                        barrier_in_prologue, low_latency_transport);
 
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
@@ -293,23 +323,37 @@ public:
                 num_expanded_tokens = cached_num_expanded_tokens.value();
                 num_recv_tokens_per_expert_list = cached_num_recv_tokens_per_expert_list.value();
             } else if (do_cpu_sync) {
-                const auto cpu_sync_deadline =
-                    std::chrono::steady_clock::now() + std::chrono::seconds(context->num_cpu_timeout_secs);
+                // The issue kernel records receive counts into the device-side psum
+                // tensors. Read them back through the runtime with stream-ordered D2H
+                // copies (the current stream is ordered after the issue kernel, and in
+                // deferred mode after the dispatch event via `current_stream_wait`).
+                // Mid-kernel device stores into host-registered memory are not reliably
+                // visible to the host on Ascend, so the old polling protocol timed out.
+                const auto stream = c10_npu::getCurrentNPUStream();
+                const auto rank_stage = const_cast<int*>(host_workspace_layout.get_host_rank_count_ptr());
+                const auto expert_stage = const_cast<int*>(host_workspace_layout.get_host_expert_count_ptr());
+                ACL_CHECK(aclrtMemcpyAsync(rank_stage, context->num_ranks * sizeof(int),
+                                           psum_num_recv_tokens_per_rank.data_ptr<int>(),
+                                           context->num_ranks * sizeof(int),
+                                           ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
+                ACL_CHECK(aclrtMemcpyAsync(expert_stage, num_experts_per_rank * sizeof(int),
+                                           num_unaligned_recv_tokens_per_expert.data_ptr<int>(),
+                                           num_experts_per_rank * sizeof(int),
+                                           ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
+                aclrtEvent sync_event = nullptr;
+                ACL_CHECK(aclrtCreateEventWithFlag(&sync_event, ACL_EVENT_SYNC));
+                ACL_CHECK(aclrtRecordEvent(sync_event, stream.stream()));
+                const auto wait_status = aclrtSynchronizeEventWithTimeout(sync_event,
+                    static_cast<int32_t>(context->num_cpu_timeout_secs) * 1000);
+                ACL_CHECK(aclrtDestroyEvent(sync_event));
+                if (wait_status != 0)
+                    EP_HOST_UNREACHABLE("do_cpu_sync receive-count readback timeout");
 
-                // Wait rank status arrival
-                num_recv_tokens = 0;
-                for (int i = 0; i < context->num_ranks; ++ i) {
-                    const auto status = reduction::host::wait_ready(
-                        host_workspace_layout.get_host_rank_count_ptr(i), context->num_ranks, cpu_sync_deadline);
-                    num_recv_tokens += reduction::get_reduction_value(status);
-                }
-
-                // Wait expert status arrival
+                // psum is inclusive: the last element is the total received token count
+                num_recv_tokens = rank_stage[context->num_ranks - 1];
                 num_recv_tokens_per_expert_list.reserve(num_experts_per_rank);
                 for (int i = 0; i < num_experts_per_rank; ++ i) {
-                    const auto status = reduction::host::wait_ready(
-                        host_workspace_layout.get_host_expert_count_ptr(i), context->num_ranks, cpu_sync_deadline);
-                    const auto count = reduction::get_reduction_value(status);
+                    const auto count = math::align(expert_stage[i], expert_alignment);
                     num_expanded_tokens += count;
                     num_recv_tokens_per_expert_list.push_back(count);
                 }
@@ -471,8 +515,7 @@ public:
         }
 
         // Resource configs
-        EP_HOST_ASSERT(num_sms > 0);
-        const auto num_used_vec_cores = num_sms * runtime->get_num_vec_cores_per_ai_core();
+        const auto num_used_vec_cores = get_num_used_vec_cores(num_sms);
         const auto num_ub_bytes = static_cast<int>(runtime->get_num_ubuf_bytes_per_vec_core());
         EP_HOST_ASSERT(num_ub_bytes > 0);
 
@@ -487,6 +530,10 @@ public:
 
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
+        const auto low_latency_transport = low_latency_transport_enabled() &&
+            prefer_low_latency_transport_runtime(true, runtime->get_npu_arch(), context->num_ranks, num_combined_tokens,
+                                                 num_max_tokens_per_rank, hidden, num_topk, num_experts,
+                                                 num_used_vec_cores, false, num_ub_bytes);
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights_ptr,
@@ -503,7 +550,7 @@ public:
             num_ub_bytes,
             num_used_vec_cores,
             context->num_gpu_timeout_cycles,
-            barrier_in_prologue
+            barrier_in_prologue, low_latency_transport
         );
 
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
