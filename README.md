@@ -9,8 +9,9 @@
 The measurements below and the earlier low-latency BS/EP matrix predate the
 current automatic MTE transport integration and removal of weighting from the
 legacy LL combine kernels. They are historical results, not validation of this
-revision. Production EP8+ correctness and performance validation is still
-pending; the build and limited device checks below do not establish a speedup.
+revision. See [Automatic decode transport in EPBuffer](#automatic-decode-transport-in-epbuffer)
+for the current native EP128 policy and its validation scope; the historical
+tables do not establish a speedup of the current integration.
 
 Measured on Ascend 950DT NPUs with CANN 9.2.0 and the manually configured PoC HDK described under [Recommended HDK and firmware](#recommended-hdk-and-firmware). All measurements use netlayer 1, the supernode's external Clos network.
 
@@ -240,7 +241,7 @@ Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on 
 ## Automatic decode transport in EPBuffer
 
 Use the standard `EPBuffer` for both decode and larger batches. For eligible
-decode shapes it selects direct MTE peer writes inside the normal dispatch and
+EP128 decode shapes it selects direct MTE peer writes inside the normal dispatch and
 combine kernels, using the existing symmetric peer mappings and the same
 communication arena. No `low_latency_mode` flag or second buffer is needed.
 Larger batches and other configurations use the existing transport.
@@ -259,21 +260,30 @@ outputs and does not multiply them by routing weights.** Its optional
 `topk_weights` argument communicates a separate weight tensor, rather than
 scaling the hidden-state tensor.
 
-The initial automatic policy is limited to A5 (`dav-3510`), 64 AIVs, at least
+The automatic policy is limited to EP128, A5 (`dav-3510`), 64 AIVs, at least
 190 KiB of usable UB, BF16, H=7168, K=8, E=128 and `0 < B <= capacity <= 256`:
 
 | EP | Actual tokens per rank considered for MTE transport | Otherwise |
 | --- | --- | --- |
-| 8 | 1–64 | Existing transport |
-| 16, 32, 64, 128 | 1–32 | Existing transport |
+| 128 | 1–32, subject to the conditions above | Existing URMA transport |
 | Other EP sizes or model shapes | None | Existing transport |
 
-These are conservative candidate regions from the **previous implementation's**
-measurements, not measured performance thresholds for the new path. The earlier
-comparison used fused LL kernels and initially omitted the standard epilogues;
-it cannot establish the speedup of this integration. Recheck correctness and
-measure both standard kernels, including their epilogues, before tuning the
-policy. Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` consistently on all ranks to
+EP128 retains the candidate policy used in the native transport comparison:
+small eligible batches use MTE, while larger batches retain URMA. Other EP sizes
+always select URMA in the default native path. This does not change the explicit
+experimental `low_latency_mode=True` interface described below.
+
+The 2026-10-21 comparison of candidate `53e8370` with official `3b25377` covered
+EP128 B=2/8/16/32/48/64/96/128/256/512/1024/2048/4096, with BF16, H7168/K8/E128,
+M=B, alignment=1, no bias and `do_cpu_sync=False`. Actual kernels used MTE only
+at B=2/8/16/32 and URMA at B>=48. Timings included the standard epilogues;
+the paired runs and raw profiler data were verified. These measurements support
+retaining that combined policy, not forcing MTE at every EP128 batch size or
+claiming that all API configurations have been validated. Dispatch and combine
+decide independently: FP8 dispatch uses URMA, but its BF16 combine may use MTE
+if the original B and handle capacity satisfy the policy.
+
+Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` consistently on all ranks to
 disable the new transport for regression comparisons. Default operation is
 automatic; this switch is for validation.
 
@@ -290,27 +300,39 @@ allowing EP2/56-AIV MTE also passed all six BF16 cases in
 dispatch and weight metadata checks. Three additional cases passed for deferred
 epilogues, deterministic ordering, and their combination. Its logs confirmed
 `dispatch_mte` and `combine_mte` ran. These diagnostic EP/core-count overrides are
-not enabled in the production policy; the EP8+ production MTE regions and
-performance still need device validation. Single-layer HCCL rank graphs are now accepted while
-retaining all required UBMEM/UBC_CTP link checks. CPU-synchronized receive-count
-notification did not complete in this environment; the official `3b25377`
-baseline reproduced the dispatch timeout with `do_cpu_sync=True`. Do not
-interpret the `do_cpu_sync=False` results as coverage of that path.
+not enabled in the production policy; those checks did not validate the original
+EP8+ automatic MTE regions. The current policy and later EP128 evidence are
+described above. Single-layer HCCL rank graphs are accepted while
+retaining all required UBMEM/UBC_CTP link checks.
+
+CPU-synchronized receive-count notification did not complete in the earlier
+validation environment; the official `3b25377` baseline also reproduced the
+dispatch timeout with `do_cpu_sync=True`. The unvalidated receive-count repair
+is excluded from this revision. Do not interpret `do_cpu_sync=False` results as
+coverage of that path; validate both `true` and the API default before merging.
+
 After checking every participating node is idle, run the compatibility matrix
 with both transports:
 
 ```bash
-python tests/ep/test_ep_auto_compat.py --num-processes 8 --bs 2 32 64 128 256 2
-EP_DISABLE_LOW_LATENCY_TRANSPORT=1 python tests/ep/test_ep_auto_compat.py --num-processes 8 --bs 2 32 64 128 256 2
+python tests/ep/test_ep_auto_compat.py --backend candidate-auto --num-processes 8 --bs 2 32 33 64 65 128 256 2 --output-dir compat-results/candidate-auto
+python tests/ep/test_ep_auto_compat.py --backend candidate-disabled --num-processes 8 --bs 2 32 33 64 65 128 256 2 --output-dir compat-results/candidate-disabled
 # Host-only policy checks.
 c++ -std=c++17 -I. tests/ep/low_latency_policy_test.cpp -o /tmp/ep-policy
 /tmp/ep-policy
 ```
 
+Use a new output directory for each run. See the [compatibility test guide](tests/ep/README.compat.md) for official-baseline runs, CPU-sync isolation, device-path profiling and all-rank result aggregation.
+
 The matrix covers cached weights, bias, padding, deterministic ordering, deferred
-epilogues, old-handle reuse, masked/duplicate routes and unequal local token counts.
+epilogues, old-handle reuse, bounded masked/duplicate route fixtures and unequal
+local token counts. The duplicate fixtures do not prove arbitrary repeated-expert
+capacity safety; see the inherited allocation boundary in the
+[offline review](docs/pr/ep128-offline-review.md).
 It checks compatibility rather than asserting a speedup. Use the existing
 `test_ep.py` suite as well when validation resumes.
+See the [EP128 pre-merge checklist](docs/pr/ep128-premerge-checklist.md) for
+build, compatibility, device-path and release-evidence requirements.
 
 ### Optional BF16 convenience wrapper
 
