@@ -323,23 +323,37 @@ public:
                 num_expanded_tokens = cached_num_expanded_tokens.value();
                 num_recv_tokens_per_expert_list = cached_num_recv_tokens_per_expert_list.value();
             } else if (do_cpu_sync) {
-                const auto cpu_sync_deadline =
-                    std::chrono::steady_clock::now() + std::chrono::seconds(context->num_cpu_timeout_secs);
+                // The issue kernel records receive counts into the device-side psum
+                // tensors. Read them back through the runtime with stream-ordered D2H
+                // copies (the current stream is ordered after the issue kernel, and in
+                // deferred mode after the dispatch event via `current_stream_wait`).
+                // Mid-kernel device stores into host-registered memory are not reliably
+                // visible to the host on Ascend, so the old polling protocol timed out.
+                const auto stream = c10_npu::getCurrentNPUStream();
+                const auto rank_stage = const_cast<int*>(host_workspace_layout.get_host_rank_count_ptr());
+                const auto expert_stage = const_cast<int*>(host_workspace_layout.get_host_expert_count_ptr());
+                ACL_CHECK(aclrtMemcpyAsync(rank_stage, context->num_ranks * sizeof(int),
+                                           psum_num_recv_tokens_per_rank.data_ptr<int>(),
+                                           context->num_ranks * sizeof(int),
+                                           ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
+                ACL_CHECK(aclrtMemcpyAsync(expert_stage, num_experts_per_rank * sizeof(int),
+                                           num_unaligned_recv_tokens_per_expert.data_ptr<int>(),
+                                           num_experts_per_rank * sizeof(int),
+                                           ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
+                aclrtEvent sync_event = nullptr;
+                ACL_CHECK(aclrtCreateEventWithFlag(&sync_event, ACL_EVENT_SYNC));
+                ACL_CHECK(aclrtRecordEvent(sync_event, stream.stream()));
+                const auto wait_status = aclrtSynchronizeEventWithTimeout(sync_event,
+                    static_cast<int32_t>(context->num_cpu_timeout_secs) * 1000);
+                ACL_CHECK(aclrtDestroyEvent(sync_event));
+                if (wait_status != 0)
+                    EP_HOST_UNREACHABLE("do_cpu_sync receive-count readback timeout");
 
-                // Wait rank status arrival
-                num_recv_tokens = 0;
-                for (int i = 0; i < context->num_ranks; ++ i) {
-                    const auto status = reduction::host::wait_ready(
-                        host_workspace_layout.get_host_rank_count_ptr(i), context->num_ranks, cpu_sync_deadline);
-                    num_recv_tokens += reduction::get_reduction_value(status);
-                }
-
-                // Wait expert status arrival
+                // psum is inclusive: the last element is the total received token count
+                num_recv_tokens = rank_stage[context->num_ranks - 1];
                 num_recv_tokens_per_expert_list.reserve(num_experts_per_rank);
                 for (int i = 0; i < num_experts_per_rank; ++ i) {
-                    const auto status = reduction::host::wait_ready(
-                        host_workspace_layout.get_host_expert_count_ptr(i), context->num_ranks, cpu_sync_deadline);
-                    const auto count = reduction::get_reduction_value(status);
+                    const auto count = math::align(expert_stage[i], expert_alignment);
                     num_expanded_tokens += count;
                     num_recv_tokens_per_expert_list.push_back(count);
                 }

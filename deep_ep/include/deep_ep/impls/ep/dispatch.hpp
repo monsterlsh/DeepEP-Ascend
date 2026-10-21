@@ -83,8 +83,13 @@ template <int kNumMaxTokensPerRank,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumWarps = kNumThreads / warpSize,
           typename ub_layout_t = DispatchUBLayout<kNumExperts, kNumRanks, kNumMaxTokensPerVecCore * kNumTopk, kNumMaxTokensPerVecCore>>
+// NOTES: do_cpu_sync receive-count notification is done by the host epilogue with a
+// stream-ordered D2H copy of the device-side psum tensors. Mid-kernel device stores
+// into host-registered memory are not reliably visible to the host on Ascend (the
+// previous volatile-store + host-polling protocol timed out), so the kernel does not
+// write to `host_workspace` anymore; `kDoCPUSync` is retained for ABI/cache stability.
 __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worker(
-    const layout::EPWorkspaceLayout workspace_layout, const layout::EPWorkspaceLayout host_workspace_layout,
+    const layout::EPWorkspaceLayout workspace_layout,
     __ubuf__ ub_layout_t* ub_layout,
     __gm__ const uint8_t* x, __gm__ const uint8_t* metadata_send_buffer,
     __gm__ const uint64_t* jetty_ptrs,
@@ -482,13 +487,9 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         const auto status = reduction::simt::wait_ready<kNumTimeoutCycles>(
             workspace_layout.get_remote_expert_histogram_ptr(thread_idx), kNumRanks);
 
-        // Record the token count into UB, GM and host buffers
-        // TODO: the results to host may be not aligned
+        // Record the token count into UB and GM; the host reads it back with a
+        // stream-ordered D2H copy when do_cpu_sync is requested (see above).
         const auto num_recv_tokens = reduction::get_reduction_value(status);
-        if constexpr (kDoCPUSync) {
-            *host_workspace_layout.get_host_expert_count_ptr(thread_idx) =
-                reduction::make_reduction_status(kNumRanks, math::align(num_recv_tokens, kExpertAlignment));
-        }
         num_unaligned_recv_tokens_per_expert[thread_idx] = num_recv_tokens;
         ub_layout->expert_histogram[thread_idx] = num_recv_tokens;
         if (cumulative_local_expert_recv_stats != nullptr)
@@ -546,10 +547,6 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             // Write global memory
             if (idx < kNumRanks) {
                 psum_num_recv_tokens_per_rank[idx] = psum;
-                if constexpr (kDoCPUSync) {
-                    *host_workspace_layout.get_host_rank_count_ptr(idx) =
-                        reduction::make_reduction_status(kNumRanks, value);
-                }
             }
 
             // Maintain in-loop psum
@@ -621,7 +618,9 @@ __global__ __vector__ void dispatch_impl(
 
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
     const auto workspace_layout = layout::EPWorkspaceLayout(workspace);
-    const auto host_workspace_layout = layout::EPWorkspaceLayout(host_workspace);
+    // The kernel no longer writes host counts into `host_workspace`; the host
+    // epilogue reads device-side psum tensors back with a D2H copy instead.
+    (void) host_workspace;
 
     // Token and buffer layouts
     // Cached dispatch reuses source metadata from the handle; only SF and weights travel again.
@@ -683,7 +682,7 @@ __global__ __vector__ void dispatch_impl(
                                    kNumVecCores, kNumThreads, kNumSGEPairsPerSQE, kNumTimeoutCycles,
                                    kLowLatencyTransport>>(
             AscendC::Simt::Dim3(kNumThreads, 1, 1),
-            workspace_layout, host_workspace_layout, ub_layout,
+            workspace_layout, ub_layout,
             static_cast<__gm__ const uint8_t*>(x), metadata_send_buffer,
             static_cast<__gm__ const uint64_t*>(jetty_ptrs),
             topk_idx, cumulative_local_expert_recv_stats,
