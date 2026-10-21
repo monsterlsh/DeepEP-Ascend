@@ -5,6 +5,7 @@
 
 using deep_ep::prefer_low_latency_transport;
 using deep_ep::prefer_ll_server_dedup;
+using deep_ep::route_is_legal;
 
 static_assert(prefer_low_latency_transport(3510, 128, 1, 1, 7168, 8, 128, 64, false));
 static_assert(prefer_low_latency_transport(3510, 128, 32, 256, 7168, 8, 128, 64, false));
@@ -56,5 +57,15 @@ int main() {
     assert(!prefer_ll_server_dedup(16, 32, 256, 64, false, false, 1, true, false));    // FP8
     assert(!prefer_ll_server_dedup(16, 32, 256, 64, false, false, 1, false, true));    // cumulative stats
     assert(!prefer_ll_server_dedup(16, 32, 256, 32, false, false, 1, false, false));   // 16 AI, not 32 AI
+
+    // Route legality (D06): no masked (-1) and no duplicate expert per token.
+    {
+        int64_t legal[2][8] = {{0, 1, 2, 3, 4, 5, 6, 7}, {8, 9, 10, 11, 12, 13, 14, 15}};
+        assert(route_is_legal(&legal[0][0], 2, 8));
+        int64_t masked[1][8] = {{0, 1, 2, 3, 4, 5, -1, 7}};
+        assert(!route_is_legal(&masked[0][0], 1, 8));
+        int64_t dup[1][8] = {{0, 1, 2, 3, 4, 5, 6, 0}};
+        assert(!route_is_legal(&dup[0][0], 1, 8));
+    }
     return 0;
 }

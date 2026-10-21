@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 
@@ -51,6 +52,24 @@ constexpr bool prefer_ll_server_dedup(int num_ranks, int num_tokens, int num_max
     if (num_tokens <= 0 or num_tokens > num_max_tokens_per_rank or num_max_tokens_per_rank > 256)
         return false;
     return num_ranks >= 16;
+}
+
+// Route legality for LL server-dedup (D06): no masked (-1) experts and no duplicate
+// experts within a token. Pure host-side reference for the check logic; the device
+// path must still enforce this (or check + all-reduce a group-wide decision) before
+// admitting LL dispatch, so that every rank agrees on the same transport.
+constexpr bool route_is_legal(const int64_t* topk_idx, int num_tokens, int num_topk) {
+    for (int t = 0; t < num_tokens; ++t) {
+        const auto* row = topk_idx + static_cast<size_t>(t) * num_topk;
+        for (int k = 0; k < num_topk; ++k) {
+            if (row[k] < 0)
+                return false;
+            for (int k2 = 0; k2 < k; ++k2)
+                if (row[k2] == row[k])
+                    return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace deep_ep
