@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
+#pragma once
 
-#ifndef DISPATCH_SERVER_DEDUP_MAGIC_H
-#define DISPATCH_SERVER_DEDUP_MAGIC_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <kernel_operator.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
@@ -12,15 +11,12 @@ namespace DispatchDedup {
 // The initial Host clear seeds 0; launches use 1, 0, 1, 0, ... without overflow.
 // Each core owns a 512-byte slot in the LOCAL symmetric allocation's fixed
 // prefix. No other core/rank writes it. Both accesses use DataCopy.
-__aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs* args, uint32_t core,
-                                                          AscendC::TPipe* pipe)
-{
+__aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs* args, uint32_t core, AscendC::TPipe* pipe) {
     using namespace AscendC;
     TBuf<> scratch;
     pipe->InitBuffer(scratch, 32U);
     auto state = scratch.Get<uint32_t>();
-    auto* slot =
-        reinterpret_cast<__gm__ uint32_t*>(args->peerMems[args->rank] + uint64_t(core) * kEpServerDedupMagicStride);
+    auto* slot = reinterpret_cast<__gm__ uint32_t*>(args->peerMems[args->rank] + uint64_t(core) * kEpServerDedupMagicStride);
     GlobalTensor<uint32_t> slotGm;
     slotGm.SetGlobalBuffer(slot);
     DataCopy(state, slotGm, 8U);
@@ -41,4 +37,3 @@ __aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs*
     return magic;
 }
 }  // namespace DispatchDedup
-#endif

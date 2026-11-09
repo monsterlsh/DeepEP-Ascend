@@ -92,6 +92,30 @@ class DecodeContracts(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'restart'):
             self.dispatch(2)
 
+    def test_combine_orders_streams_and_retains_inputs(self):
+        expert, handle, dispatched = self.dispatch(2)
+        counts = handle._handle.num_unaligned_recv_tokens_per_expert
+        with patch.object(self.torch.npu, 'current_stream', return_value='consumer-stream'):
+            _, combined = self.buffer.combine(expert, handle)
+        self.assertEqual(dispatched.event.waits, 1)
+        self.assertEqual(expert.recorded, ['consumer-stream'])
+        self.assertEqual(counts.recorded, ['consumer-stream'])
+        self.assertIs(combined.extra_tensors[0], expert)
+        self.assertIs(combined.extra_tensors[1], handle)
+        self.dispatch(2)
+        self.assertEqual(combined.event.waits, 1)
+
+    def test_failed_combine_blocks_dispatch_and_combine(self):
+        expert, handle, _ = self.dispatch(2)
+        self.arena.combine = Mock(side_effect=RuntimeError('combine failed'))
+        with self.assertRaisesRegex(RuntimeError, 'combine failed'):
+            self.buffer.combine(expert, handle)
+        with self.assertRaisesRegex(RuntimeError, 'restart'):
+            self.buffer.combine(expert, handle)
+        with self.assertRaisesRegex(RuntimeError, 'restart'):
+            self.dispatch(2)
+        self.arena.combine.assert_called_once()
+
     def test_destroy_is_idempotent(self):
         self.dispatch(2)
         self.buffer.destroy()

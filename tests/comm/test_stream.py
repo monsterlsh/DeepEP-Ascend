@@ -292,8 +292,10 @@ def validate_config(args, num_ranks):
 
 
 def configure_backend(backend):
-    # The launcher/environment selects the installed package; this option never
-    # switches repositories. Official accepts the same CLI without new attributes.
+    # Candidate modes must exercise the policy selected by their label.
+    # Official runs preserve the environment and verify the build independently.
+    if backend in ('candidate-disabled', 'candidate-auto'):
+        os.environ.pop('EP_MTE_BS_THRESHOLD', None)
     if backend == 'candidate-disabled':
         os.environ['EP_DISABLE_LOW_LATENCY_TRANSPORT'] = '1'
     elif backend == 'candidate-auto':

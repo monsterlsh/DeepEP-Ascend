@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by ryan_li 2026
+#pragma once
 
-#ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_COUNT_LAYOUT_H
-#define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_COUNT_LAYOUT_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
@@ -19,8 +18,7 @@ constexpr uint32_t kEpServerDedupCoreNum = 64U;
 #define DISPATCH_SERVER_DEDUP_SEND_CORE_NUM 32U
 #endif
 constexpr uint32_t kEpServerDedupSendCoreNum = DISPATCH_SERVER_DEDUP_SEND_CORE_NUM;
-static_assert(kEpServerDedupSendCoreNum >= 16U && kEpServerDedupSendCoreNum <= 48U &&
-                  kEpServerDedupSendCoreNum % 4U == 0U,
+static_assert(kEpServerDedupSendCoreNum >= 16U && kEpServerDedupSendCoreNum <= 48U && kEpServerDedupSendCoreNum % 4U == 0U,
               "DISPATCH_SERVER_DEDUP_SEND_CORE_NUM must be 16..48 in steps of 4");
 constexpr uint32_t kEpServerDedupRecvCoreNum = kEpServerDedupCoreNum - kEpServerDedupSendCoreNum;
 // BS below this threshold uses all 64 cores for Count; otherwise only receivers.
@@ -42,8 +40,7 @@ constexpr uint64_t kEpServerDedupWindowBytes = kEpServerDedupPeerBytes / 2U;
 constexpr uint64_t kEpServerDedupControlBytes = 2ULL * 1024U * 1024U;
 // Runtime owns the domain's final flag region. Leave the same tail unused in
 // window 0 so both windows have identical capacity and shape-independent stride.
-constexpr uint64_t kEpServerDedupWindowUsableBytes =
-    kEpServerDedupWindowBytes - DispatchDedup::DISPATCH_DEDUP_FLAG_BUFF_BYTES;
+constexpr uint64_t kEpServerDedupWindowUsableBytes = kEpServerDedupWindowBytes - DispatchDedup::DISPATCH_DEDUP_FLAG_BUFF_BYTES;
 
 #if DISPATCH_DEDUP_ASCENDC_AICORE_COMPILE
 #define DISPATCH_DEDUP_EP_DEDUP_INLINE FORCE_INLINE_AICORE
@@ -67,16 +64,13 @@ struct EpServerDedupCountLayout {
 // cleared and can overlap another split's control flags. All ranks must use the
 // same communicator call order and serialize its kernels
 // on one stream. Count publication (including zeros) protects two-call reuse.
-DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupWindowOffset(int64_t magic)
-{
+DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupWindowOffset(int64_t magic) {
     return (uint64_t(magic) % 2U) * kEpServerDedupWindowBytes;
 }
 
-DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCountLayout(uint32_t experts)
-{
+DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCountLayout(uint32_t experts) {
     EpServerDedupCountLayout layout{};
-    const uint64_t matrixBytes =
-        uint64_t(kEpServerDedupRecvCoreNum) * kEpServerDedupRecvCoreNum * kEpServerDedupCountRecordBytes;
+    const uint64_t matrixBytes = uint64_t(kEpServerDedupRecvCoreNum) * kEpServerDedupRecvCoreNum * kEpServerDedupCountRecordBytes;
     layout.cntOffset = kEpServerDedupControlPrefixBytes;
     layout.cumsumOffset = uint64_t(experts) * kEpServerDedupCountGmStride;
     layout.prefixOffset = layout.cumsumOffset + matrixBytes;
@@ -91,9 +85,7 @@ DISPATCH_DEDUP_EP_DEDUP_INLINE EpServerDedupCountLayout DispatchServerDedupCount
 // Peak sendCnt allocation: four route-sized UB buffers plus count records/histogram.
 // Sender/receive scratch overlays those four buffers and the histogram after
 // filtering; the records remain reserved until the asynchronous writes retire.
-DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupCountSendUbBytes(uint64_t routes, uint32_t experts,
-                                                                            uint32_t countCores)
-{
+DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupCountSendUbBytes(uint64_t routes, uint32_t experts, uint32_t countCores) {
     const uint64_t routeBytes = (routes * sizeof(int32_t) + 255U) / 256U * 256U;
     const uint32_t records = (experts + countCores - 1U) / countCores;
     const uint32_t alignedRecords = (records + 7U) / 8U * 8U;
@@ -102,4 +94,3 @@ DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupCountSendUbBytes(uint
 
 #undef DISPATCH_DEDUP_EP_DEDUP_INLINE
 }  // namespace DispatchDedup
-#endif

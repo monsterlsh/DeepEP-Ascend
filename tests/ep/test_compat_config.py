@@ -154,15 +154,35 @@ raise SystemExit(compat_config.main(sys.argv[2:]))
 
 class ReportingTests(unittest.TestCase):
     def test_backend_configuration_preserves_official_identity(self):
-        env = {config.TRANSPORT_ENV: "1", "KEEP": "value"}
-        official = config.configure_backend("official", env)
-        self.assertTrue(official["requires_official_build"])
-        self.assertEqual(env[config.TRANSPORT_ENV], "1")
-        config.configure_backend("candidate-auto", env)
-        self.assertNotIn(config.TRANSPORT_ENV, env)
-        config.configure_backend("candidate-disabled", env)
-        self.assertEqual(env[config.TRANSPORT_ENV], "1")
-        self.assertEqual(env["KEEP"], "value")
+        env = {config.TRANSPORT_ENV: '1', config.THRESHOLD_ENV: '4096', 'KEEP': 'value'}
+        original = env.copy()
+        official = config.configure_backend('official', env)
+        self.assertTrue(official['requires_official_build'])
+        self.assertEqual(official['transport_override'], '1')
+        self.assertEqual(env, original)
+
+    def test_candidate_modes_discard_inherited_threshold_overrides(self):
+        for backend in ('candidate-auto', 'candidate-disabled'):
+            for threshold in (None, '0', '4096', 'invalid'):
+                env = {config.TRANSPORT_ENV: 'stale', 'KEEP': 'value'}
+                if threshold is not None:
+                    env[config.THRESHOLD_ENV] = threshold
+                expected = {'KEEP': 'value'}
+                if backend == 'candidate-disabled':
+                    expected[config.TRANSPORT_ENV] = '1'
+                with self.subTest(backend=backend, threshold=threshold):
+                    # Exercise both explicit environment injection and os.environ.
+                    for _ in range(2):
+                        record = config.configure_backend(backend, env)
+                        self.assertEqual(env, expected)
+                        self.assertEqual(record['transport_override'], expected.get(config.TRANSPORT_ENV))
+                        self.assertFalse(record['requires_official_build'])
+                    inherited = {config.TRANSPORT_ENV: 'stale', 'KEEP': 'value'}
+                    if threshold is not None:
+                        inherited[config.THRESHOLD_ENV] = threshold
+                    with patch.dict(os.environ, inherited, clear=True):
+                        config.configure_backend(backend)
+                        self.assertEqual(dict(os.environ), expected)
 
     def test_records_flush_and_existing_rank_file_is_never_replaced(self):
         case = config.plan_cases(config.parse_args(["--bs", "2"]), 8)[0]

@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by ryan_li 2026
+#pragma once
 
-#ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_TILING_H
-#define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_TILING_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <cstddef>
 #include <cstdint>
@@ -35,5 +34,3 @@ static_assert(offsetof(EpServerDedupTilingData, reservedSendCoreNum) == 15U, "re
 static_assert(offsetof(EpServerDedupTilingData, inputMode) == 20U, "input mode offset");
 
 }  // namespace DispatchDedup
-
-#endif

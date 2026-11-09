@@ -6,8 +6,10 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include <pybind11/functional.h>
@@ -281,7 +283,7 @@ public:
 
         // Launch dispatch
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
-        const auto low_latency_transport = low_latency_transport_enabled() &&
+        const auto low_latency_transport = low_latency_transport_enabled() and
             prefer_low_latency_transport_runtime(false, runtime->get_npu_arch(), context->num_ranks, num_tokens,
                                                  num_max_tokens_per_rank, hidden, num_topk, num_experts,
                                                  num_used_vec_cores, sf.has_value(), num_ub_bytes);
@@ -323,31 +325,29 @@ public:
                 num_expanded_tokens = cached_num_expanded_tokens.value();
                 num_recv_tokens_per_expert_list = cached_num_recv_tokens_per_expert_list.value();
             } else if (do_cpu_sync) {
-                // The issue kernel records receive counts into the device-side psum
-                // tensors. Read them back through the runtime with stream-ordered D2H
-                // copies (the current stream is ordered after the issue kernel, and in
-                // deferred mode after the dispatch event via `current_stream_wait`).
-                // Mid-kernel device stores into host-registered memory are not reliably
-                // visible to the host on Ascend, so the old polling protocol timed out.
+                // Read counts after the issue kernel on the current stream. Deferred
+                // calls establish this ordering through current_stream_wait. Direct host
+                // polling does not ensure visibility of writes to registered host memory.
                 const auto stream = c10_npu::getCurrentNPUStream();
                 const auto rank_stage = const_cast<int*>(host_workspace_layout.get_host_rank_count_ptr());
                 const auto expert_stage = const_cast<int*>(host_workspace_layout.get_host_expert_count_ptr());
                 ACL_CHECK(aclrtMemcpyAsync(rank_stage, context->num_ranks * sizeof(int),
-                                           psum_num_recv_tokens_per_rank.data_ptr<int>(),
-                                           context->num_ranks * sizeof(int),
-                                           ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
+                                          psum_num_recv_tokens_per_rank.data_ptr<int>(),
+                                          context->num_ranks * sizeof(int),
+                                          ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
                 ACL_CHECK(aclrtMemcpyAsync(expert_stage, num_experts_per_rank * sizeof(int),
-                                           num_unaligned_recv_tokens_per_expert.data_ptr<int>(),
-                                           num_experts_per_rank * sizeof(int),
-                                           ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
+                                          num_unaligned_recv_tokens_per_expert.data_ptr<int>(),
+                                          num_experts_per_rank * sizeof(int),
+                                          ACL_MEMCPY_DEVICE_TO_HOST, stream.stream()));
                 aclrtEvent sync_event = nullptr;
                 ACL_CHECK(aclrtCreateEventWithFlag(&sync_event, ACL_EVENT_SYNC));
+                // Keep ownership until the checked destroy, including record/wait failures.
+                auto sync_event_guard = std::unique_ptr<std::remove_pointer_t<aclrtEvent>, decltype(&aclrtDestroyEvent)>(
+                    sync_event, &aclrtDestroyEvent);
                 ACL_CHECK(aclrtRecordEvent(sync_event, stream.stream()));
-                const auto wait_status = aclrtSynchronizeEventWithTimeout(sync_event,
-                    static_cast<int32_t>(context->num_cpu_timeout_secs) * 1000);
-                ACL_CHECK(aclrtDestroyEvent(sync_event));
-                if (wait_status != 0)
-                    EP_HOST_UNREACHABLE("do_cpu_sync receive-count readback timeout");
+                ACL_CHECK(aclrtSynchronizeEventWithTimeout(sync_event,
+                    static_cast<int32_t>(context->num_cpu_timeout_secs) * 1000));
+                ACL_CHECK(aclrtDestroyEvent(sync_event_guard.release()));
 
                 // psum is inclusive: the last element is the total received token count
                 num_recv_tokens = rank_stage[context->num_ranks - 1];
@@ -530,7 +530,7 @@ public:
 
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
-        const auto low_latency_transport = low_latency_transport_enabled() &&
+        const auto low_latency_transport = low_latency_transport_enabled() and
             prefer_low_latency_transport_runtime(true, runtime->get_npu_arch(), context->num_ranks, num_combined_tokens,
                                                  num_max_tokens_per_rank, hidden, num_topk, num_experts,
                                                  num_used_vec_cores, false, num_ub_bytes);

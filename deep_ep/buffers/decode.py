@@ -49,7 +49,9 @@ class DecodeBuffer:
     batches up to its capacity. Destroy collectively before the process group.
     """
 
-    def __init__(self, group: dist.ProcessGroup, num_max_tokens_per_rank: int,
+    def __init__(self,
+                 group: dist.ProcessGroup,
+                 num_max_tokens_per_rank: int,
                  hidden: int = 7168, num_topk: int = 8, num_experts: int = 128,
                  *, num_sms: int = 32,
                  use_huge1g_page: bool = True, num_cpu_timeout_secs: int = 300,
@@ -63,7 +65,9 @@ class DecodeBuffer:
         self.group = group
         self.num_ranks = group.size()
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
-        self.hidden, self.num_topk, self.num_experts = hidden, num_topk, num_experts
+        self.hidden = hidden
+        self.num_topk = num_topk
+        self.num_experts = num_experts
         self.num_sms = num_sms
         self.device = torch.device('npu', torch.npu.current_device())
         self._owner = object()
@@ -76,7 +80,7 @@ class DecodeBuffer:
             use_huge1g_page=use_huge1g_page, num_cpu_timeout_secs=num_cpu_timeout_secs,
             num_gpu_timeout_secs=num_gpu_timeout_secs)
 
-    def _check_alive(self):
+    def _check_alive(self) -> None:
         if self._destroyed:
             raise RuntimeError('DecodeBuffer has been destroyed')
         if self._failed:
@@ -84,12 +88,12 @@ class DecodeBuffer:
         if torch.npu.current_device() != self.device.index:
             raise ValueError('Use the NPU on which this DecodeBuffer was constructed')
 
-    def _check_tensor(self, tensor, shape, dtype, name):
+    def _check_tensor(self, tensor, shape, dtype, name) -> None:
         if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != tuple(shape)
                 or tensor.dtype != dtype or tensor.device != self.device or not tensor.is_contiguous()):
             raise ValueError(f'{name} must be a contiguous {shape} {dtype} tensor on {self.device}')
 
-    def _begin(self):
+    def _begin(self) -> None:
         # Order buffer reuse if the caller changes the current stream.
         if self._last_event is not None:
             self._last_event.current_stream_wait()
@@ -126,8 +130,11 @@ class DecodeBuffer:
             counts = handle.num_unaligned_recv_tokens_per_expert.to(torch.int64)
             # The count conversion must be included in the public event.
             event = EventOverlap(EPBuffer.capture(), (recv, counts, weights, handle, event))
-            result = DecodeHandle(counts, handle.num_recv_tokens_per_expert_list,
-                                  handle.num_expanded_tokens, weights, 'ep', self._owner, self._buffer, handle)
+            result = DecodeHandle(
+                expert_recv_counts=counts,
+                num_recv_tokens_per_expert_list=handle.num_recv_tokens_per_expert_list,
+                num_expanded_tokens=handle.num_expanded_tokens, recv_topk_weights=weights,
+                backend='ep', _owner=self._owner, _buffer=self._buffer, _handle=handle)
             self._last_event = event.event
         except Exception:
             self._failed = True
@@ -165,7 +172,7 @@ class DecodeBuffer:
             raise
         return output, event
 
-    def destroy(self):
+    def destroy(self) -> None:
         """Collectively destroy the underlying EPBuffer; safe to call twice."""
         if self._destroyed:
             return

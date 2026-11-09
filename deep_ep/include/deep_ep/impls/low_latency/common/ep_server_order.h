@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by liuboxi, 2026
+#pragma once
 
-#ifndef DEEPEP_EP_SERVER_ORDER_H
-#define DEEPEP_EP_SERVER_ORDER_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <cstdint>
 
@@ -15,9 +14,8 @@ namespace EpServerOrder {
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__
 #endif
-inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer,
-                                                uint32_t ordinal)
-{
+    inline uint32_t
+    ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal) {
     const uint32_t split = servers / 2U;
     const bool lower = ownServer < split;
     const uint32_t ownBase = lower ? 0U : split;
@@ -31,7 +29,8 @@ inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer,
         else
             ordinal = ownLength > split ? split : servers - 1U;
     }
-    if (ordinal < ownLength) return ownBase + (relative + ordinal + 1U) % ownLength;
+    if (ordinal < ownLength)
+        return ownBase + (relative + ordinal + 1U) % ownLength;
     const uint32_t otherBase = lower ? split : 0U;
     const uint32_t otherLength = servers - ownLength;
     return otherBase + (relative + ordinal - ownLength + 1U) % otherLength;
@@ -42,10 +41,8 @@ inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer,
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__
 #endif
-inline uint32_t ServerDedupDispatchDirectOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal)
-{
-    return servers >= 16U ? ServerDedupHalfOrder(servers, ownServer, ordinal) :
-                           (ownServer + ordinal) % servers;
+    inline uint32_t
+    ServerDedupDispatchDirectOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal) {
+    return servers >= 16U ? ServerDedupHalfOrder(servers, ownServer, ordinal) : (ownServer + ordinal) % servers;
 }
 }  // namespace EpServerOrder
-#endif

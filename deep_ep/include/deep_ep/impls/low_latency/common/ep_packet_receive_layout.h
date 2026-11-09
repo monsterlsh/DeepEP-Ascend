@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by liuboxi, 2026
+#pragma once
 
-#ifndef DISPATCH_DEDUP_EP_PACKET_RECEIVE_LAYOUT_H
-#define DISPATCH_DEDUP_EP_PACKET_RECEIVE_LAYOUT_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <cstdint>
 
@@ -18,11 +17,10 @@ enum class State { Pending, Compact, KeepFlags };
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__ inline
 #endif
-constexpr State Decode(float sum, uint32_t blocks)
-{
-    return sum == float(blocks * 8U) ? State::Compact :
-        (sum == float(blocks * 8U) + (kKeepFlags - kCompact) ? State::KeepFlags : State::Pending);
+    constexpr State
+    Decode(float sum, uint32_t blocks) {
+    return sum == float(blocks * 8U) ? State::Compact
+                                     : (sum == float(blocks * 8U) + (kKeepFlags - kCompact) ? State::KeepFlags : State::Pending);
 }
-} // namespace PacketReceiveLayout
-} // namespace DispatchDedup
-#endif
+}  // namespace PacketReceiveLayout
+}  // namespace DispatchDedup

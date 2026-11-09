@@ -258,8 +258,10 @@ BF16, H=7168, K=8, E=128 and `0 < B <= capacity <= 256`:
 
 Zero means URMA. FP8 dispatch uses URMA; its BF16 combine is selected separately.
 Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to disable native MTE.
-`EP_MTE_BS_THRESHOLD` is an experimental override that bypasses the default
-guards; leave it unset for normal use. Transport settings must match across ranks.
+`EP_MTE_BS_THRESHOLD` overrides the batch threshold for enabled operation/EP
+combinations. Hardware, dtype, shape and capacity checks always apply. Zero
+disables MTE; unset, empty, -1 or invalid values use the default thresholds.
+Leave it unset for normal use. Transport settings must match across ranks.
 The explicit `low_latency_mode=True` experiment is described below.
 
 Dispatch returns routing weights as metadata. Apply them once in the expert

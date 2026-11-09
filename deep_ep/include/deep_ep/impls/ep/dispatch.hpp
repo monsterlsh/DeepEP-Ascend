@@ -81,11 +81,9 @@ template <int kNumMaxTokensPerRank,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumWarps = kNumThreads / warpSize,
           typename ub_layout_t = DispatchUBLayout<kNumExperts, kNumRanks, kNumMaxTokensPerVecCore * kNumTopk, kNumMaxTokensPerVecCore>>
-// NOTES: do_cpu_sync receive-count notification is done by the host epilogue with a
-// stream-ordered D2H copy of the device-side psum tensors. Mid-kernel device stores
-// into host-registered memory are not reliably visible to the host on Ascend (the
-// previous volatile-store + host-polling protocol timed out), so the kernel does not
-// write to `host_workspace` anymore; `kDoCPUSync` is retained for ABI/cache stability.
+// NOTES: the host epilogue reads receive counts through stream-ordered D2H copies.
+// The kernel does not notify host_workspace; kDoCPUSync remains a template parameter
+// to preserve existing kernel instantiations.
 __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worker(
     const layout::EPWorkspaceLayout workspace_layout,
     __ubuf__ ub_layout_t* ub_layout,

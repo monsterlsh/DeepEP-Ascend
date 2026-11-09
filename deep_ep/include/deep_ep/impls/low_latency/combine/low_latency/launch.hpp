@@ -1,7 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
-
 #pragma once
+
+// Copyright (c) 2026, Lu Lu
+
 #include <cstdint>
 #include <type_traits>
 namespace deepep {

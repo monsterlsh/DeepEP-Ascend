@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
+#pragma once
 
-#ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_PROTOCOL_H
-#define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_PROTOCOL_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <cstddef>
 #include <cstdint>
@@ -46,4 +45,3 @@ static_assert(sizeof(EpServerDedupReadIndexBlock) == 8U, "read index block ABI")
 static_assert(offsetof(EpServerDedupReadIndexBlock, weightBits) == 4U, "weight bits offset");
 static_assert(sizeof(EpServerDedupDirectTask) == 16U, "source direct task ABI");
 }  // namespace DispatchDedup
-#endif

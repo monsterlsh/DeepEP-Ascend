@@ -188,6 +188,28 @@ class HostContracts(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'restart'):
             self.dispatch()
 
+    def test_failed_combine_keeps_inputs_alive_and_blocks_further_launches(self):
+        recv, _, _, handle, _ = self.dispatch()
+        with patch.object(self.native, 'combine_low_latency', side_effect=RuntimeError('combine failed')) as launch:
+            with self.assertRaisesRegex(RuntimeError, 'combine failed'):
+                self.buffer.combine(recv, handle)
+            self.assertIn(recv, self.buffer._low_latency.inflight)
+            self.assertIn(handle.relay_read_index, self.buffer._low_latency.inflight)
+            with self.assertRaisesRegex(RuntimeError, 'restart'):
+                self.buffer.combine(recv, handle)
+            with self.assertRaisesRegex(RuntimeError, 'restart'):
+                self.dispatch()
+        launch.assert_called_once()
+
+    def test_combine_capacity_is_checked_before_dispatch_launch(self):
+        with patch.object(self.native, 'low_latency_combine_tiling', side_effect=ValueError('combine capacity')):
+            with self.assertRaisesRegex(ValueError, 'combine capacity'):
+                self.dispatch()
+        self.assertEqual(self.native.calls, [])
+        # Rejected input has not entered communication and does not poison the buffer.
+        self.dispatch()
+        self.assertEqual([operation for operation, _ in self.native.calls], ['dispatch'])
+
     def test_destroyed_buffer_is_rejected(self):
         self.buffer.runtime = None
         with self.assertRaisesRegex(RuntimeError, 'destroyed'):

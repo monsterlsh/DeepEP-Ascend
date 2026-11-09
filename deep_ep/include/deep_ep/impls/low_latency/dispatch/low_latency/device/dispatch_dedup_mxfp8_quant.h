@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
+#pragma once
 
-#ifndef DISPATCH_DEDUP_EP_KERNELS_DISPATCH_DEDUP_EP_MXFP8_QUANT_H
-#define DISPATCH_DEDUP_EP_KERNELS_DISPATCH_DEDUP_EP_MXFP8_QUANT_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <kernel_operator.h>
 
@@ -21,13 +20,11 @@ constexpr uint16_t kFp8E5M2MaxExponent = 0x0780;
 constexpr uint16_t kInvalidFp16 = 0x7c00;
 constexpr int64_t kOutputElementsPerBlock = 64;
 
-__aicore__ inline constexpr uint32_t GetUbBlockSize()
-{
+__aicore__ inline constexpr uint32_t GetUbBlockSize() {
     return 32U;
 }
 
-__aicore__ inline constexpr uint32_t GetVectorRegisterSize()
-{
+__aicore__ inline constexpr uint32_t GetVectorRegisterSize() {
 #if __CCE_AICORE__ == 310
     return AscendC::VECTOR_REG_WIDTH;
 #else
@@ -36,15 +33,12 @@ __aicore__ inline constexpr uint32_t GetVectorRegisterSize()
 }
 
 template <typename T>
-__aicore__ inline void ComputeMaxExp(__ubuf__ T* srcAddr, __ubuf__ uint16_t* maxExpAddr, uint32_t totalCountInUb)
-{
+__aicore__ inline void ComputeMaxExp(__ubuf__ T* srcAddr, __ubuf__ uint16_t* maxExpAddr, uint32_t totalCountInUb) {
     const uint32_t elementsPerRegister = GetVectorRegisterSize() / sizeof(T);
     const uint16_t reducedElements = GetVectorRegisterSize() / GetUbBlockSize();
-    const uint16_t loopCount =
-        static_cast<uint16_t>((totalCountInUb + 2 * elementsPerRegister - 1) / (2 * elementsPerRegister));
+    const uint16_t loopCount = static_cast<uint16_t>((totalCountInUb + 2 * elementsPerRegister - 1) / (2 * elementsPerRegister));
 
-    __VEC_SCOPE__
-    {
+    __VEC_SCOPE__ {
         MicroAPI::RegTensor<T> input0;
         MicroAPI::RegTensor<T> input1;
         MicroAPI::RegTensor<bfloat16_t> inputBf160;
@@ -78,10 +72,8 @@ __aicore__ inline void ComputeMaxExp(__ubuf__ T* srcAddr, __ubuf__ uint16_t* max
                 MicroAPI::Compare<uint16_t, CMPMODE::NE>(valid1, selected1, invalidFp16, mask0);
                 MicroAPI::Cast<bfloat16_t, T, kHalfToBf16>(inputBf160, input0, mask0);
                 MicroAPI::Cast<bfloat16_t, T, kHalfToBf16>(inputBf161, input1, mask0);
-                MicroAPI::And(exponent0, reinterpret_cast<MicroAPI::RegTensor<uint16_t>&>(inputBf160), exponentMask,
-                              mask0);
-                MicroAPI::And(exponent1, reinterpret_cast<MicroAPI::RegTensor<uint16_t>&>(inputBf161), exponentMask,
-                              mask0);
+                MicroAPI::And(exponent0, reinterpret_cast<MicroAPI::RegTensor<uint16_t>&>(inputBf160), exponentMask, mask0);
+                MicroAPI::And(exponent1, reinterpret_cast<MicroAPI::RegTensor<uint16_t>&>(inputBf161), exponentMask, mask0);
                 MicroAPI::Select<uint16_t>(exponent0, exponent0, exponentMask, valid0);
                 MicroAPI::Select<uint16_t>(exponent1, exponent1, exponentMask, valid1);
             } else {
@@ -90,8 +82,7 @@ __aicore__ inline void ComputeMaxExp(__ubuf__ T* srcAddr, __ubuf__ uint16_t* max
             }
             MicroAPI::Max(maxExponent, exponent0, exponent1, mask0);
             MicroAPI::ReduceMaxWithDataBlock(maxExponent, maxExponent, mask0);
-            MicroAPI::DataCopyUnAlign<uint16_t, MicroAPI::PostLiteral::POST_MODE_UPDATE>(maxExpAddr, maxExponent,
-                                                                                         unalign, reducedElements);
+            MicroAPI::DataCopyUnAlign<uint16_t, MicroAPI::PostLiteral::POST_MODE_UPDATE>(maxExpAddr, maxExponent, unalign, reducedElements);
         }
         MicroAPI::DataCopyUnAlignPost(maxExpAddr, unalign, 0);
     }
@@ -99,15 +90,12 @@ __aicore__ inline void ComputeMaxExp(__ubuf__ T* srcAddr, __ubuf__ uint16_t* max
 
 template <typename Fp8Type>
 __aicore__ inline void ComputeScale(__ubuf__ uint16_t* maxExpAddr, __ubuf__ uint16_t* mxScaleLocalAddr,
-                                    __ubuf__ uint16_t* halfScaleLocalAddr, uint32_t totalScaleInUb)
-{
+                                    __ubuf__ uint16_t* halfScaleLocalAddr, uint32_t totalScaleInUb) {
     const uint32_t elementsPerRegister = GetVectorRegisterSize() / sizeof(uint16_t);
     const uint16_t loopCount = static_cast<uint16_t>((totalScaleInUb + elementsPerRegister - 1) / elementsPerRegister);
-    const uint16_t maxFp8Exponent =
-        Std::IsSame<Fp8Type, fp8_e4m3fn_t>::value ? kFp8E4M3MaxExponent : kFp8E5M2MaxExponent;
+    const uint16_t maxFp8Exponent = Std::IsSame<Fp8Type, fp8_e4m3fn_t>::value ? kFp8E4M3MaxExponent : kFp8E5M2MaxExponent;
 
-    __VEC_SCOPE__
-    {
+    __VEC_SCOPE__ {
         MicroAPI::RegTensor<uint16_t> exponentMask;
         MicroAPI::RegTensor<uint16_t> maxExponent;
         MicroAPI::Duplicate(exponentMask, kBf16ExponentMask);
@@ -133,8 +121,7 @@ __aicore__ inline void ComputeScale(__ubuf__ uint16_t* maxExpAddr, __ubuf__ uint
 
         for (uint16_t loop = 0; loop < loopCount; ++loop) {
             MicroAPI::MaskReg mask = MicroAPI::UpdateMask<uint16_t>(totalScaleInUb);
-            MicroAPI::DataCopy<uint16_t, MicroAPI::PostLiteral::POST_MODE_UPDATE>(maxExponent, maxExpAddr,
-                                                                                  elementsPerRegister);
+            MicroAPI::DataCopy<uint16_t, MicroAPI::PostLiteral::POST_MODE_UPDATE>(maxExponent, maxExpAddr, elementsPerRegister);
             MicroAPI::Compare<uint16_t, CMPMODE::NE>(validMask, maxExponent, exponentMask, mask);
             MicroAPI::Compare<uint16_t, CMPMODE::NE>(nonzeroMask, maxExponent, zero, mask);
             MicroAPI::Compare<uint16_t, CMPMODE::LE>(boundedMask, maxExponent, maxFp8ExponentTensor, mask);
@@ -151,24 +138,21 @@ __aicore__ inline void ComputeScale(__ubuf__ uint16_t* maxExpAddr, __ubuf__ uint
             MicroAPI::Select<uint16_t>(reciprocalScale, reciprocalScale, nan, validMask);
             MicroAPI::Select<uint16_t>(reciprocalScale, reciprocalScale, zero, nonzeroMask);
             MicroAPI::Select<uint16_t>(reciprocalScale, specialExponent, reciprocalScale, specialMask);
-            MicroAPI::DataCopy<uint16_t, MicroAPI::PostLiteral::POST_MODE_UPDATE>(halfScaleLocalAddr, reciprocalScale,
-                                                                                  elementsPerRegister, mask);
+            MicroAPI::DataCopy<uint16_t, MicroAPI::PostLiteral::POST_MODE_UPDATE>(halfScaleLocalAddr, reciprocalScale, elementsPerRegister,
+                                                                                  mask);
         }
     }
 }
 
 template <typename InputType, typename Fp8Type, RoundMode ToBf16RoundMode, RoundMode Fp8RoundMode>
-__aicore__ inline void ComputeFp8Data(__ubuf__ InputType* srcAddr, __ubuf__ uint16_t* halfScaleLocalAddr,
-                                      __ubuf__ int8_t* outLocalAddr, uint32_t totalCountInUb)
-{
+__aicore__ inline void ComputeFp8Data(__ubuf__ InputType* srcAddr, __ubuf__ uint16_t* halfScaleLocalAddr, __ubuf__ int8_t* outLocalAddr,
+                                      uint32_t totalCountInUb) {
     const uint32_t elementsPerRegister = GetVectorRegisterSize() / sizeof(InputType);
     const uint16_t scaleElementsPerBlock = GetVectorRegisterSize() / GetUbBlockSize();
     uint32_t doubledCount = totalCountInUb * kPairCount;
-    const uint16_t loopCount =
-        static_cast<uint16_t>((totalCountInUb + 2 * elementsPerRegister - 1) / (2 * elementsPerRegister));
+    const uint16_t loopCount = static_cast<uint16_t>((totalCountInUb + 2 * elementsPerRegister - 1) / (2 * elementsPerRegister));
 
-    __VEC_SCOPE__
-    {
+    __VEC_SCOPE__ {
         MicroAPI::MaskReg inputMask0;
         MicroAPI::MaskReg inputMask1;
         MicroAPI::MaskReg fp32Mask0;
@@ -206,8 +190,8 @@ __aicore__ inline void ComputeFp8Data(__ubuf__ InputType* srcAddr, __ubuf__ uint
             if constexpr (Std::IsSame<InputType, half>::value) {
                 MicroAPI::Cast<float, InputType, kEvenElements>(fp32Input00, input0, inputMask0);
                 MicroAPI::Cast<float, InputType, kOddElements>(fp32Input01, input0, inputMask0);
-                MicroAPI::Cast<float, bfloat16_t, kEvenElements>(
-                    fp32Scale, reinterpret_cast<MicroAPI::RegTensor<bfloat16_t>&>(packedScale), allMask);
+                MicroAPI::Cast<float, bfloat16_t, kEvenElements>(fp32Scale, reinterpret_cast<MicroAPI::RegTensor<bfloat16_t>&>(packedScale),
+                                                                 allMask);
                 MicroAPI::Mul(fp32Input00, fp32Input00, fp32Scale, fp32Mask0);
                 MicroAPI::Mul(fp32Input01, fp32Input01, fp32Scale, fp32Mask1);
                 MicroAPI::Interleave(fp32Input00, fp32Input01, fp32Input00, fp32Input01);
@@ -223,10 +207,8 @@ __aicore__ inline void ComputeFp8Data(__ubuf__ InputType* srcAddr, __ubuf__ uint
                 MicroAPI::Cast<Fp8Type, float, kFp32ToFp8>(fp8Input10, fp32Input01, fp32Mask1);
                 MicroAPI::Cast<Fp8Type, float, kFp32ToFp8>(fp8Input11, fp32Input11, fp32Mask1);
             } else {
-                MicroAPI::Mul(input0, input0, reinterpret_cast<MicroAPI::RegTensor<InputType>&>(packedScale),
-                              inputMask0);
-                MicroAPI::Mul(input1, input1, reinterpret_cast<MicroAPI::RegTensor<InputType>&>(packedScale),
-                              inputMask0);
+                MicroAPI::Mul(input0, input0, reinterpret_cast<MicroAPI::RegTensor<InputType>&>(packedScale), inputMask0);
+                MicroAPI::Mul(input1, input1, reinterpret_cast<MicroAPI::RegTensor<InputType>&>(packedScale), inputMask0);
                 MicroAPI::Interleave(input0, input1, input0, input1);
                 MicroAPI::Cast<float, InputType, kEvenElements>(fp32Input00, input0, inputMask0);
                 MicroAPI::Cast<float, InputType, kOddElements>(fp32Input01, input0, inputMask0);
@@ -241,26 +223,20 @@ __aicore__ inline void ComputeFp8Data(__ubuf__ InputType* srcAddr, __ubuf__ uint
             }
 
             MicroAPI::DataCopy<int8_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::StoreDist::DIST_PACK4_B32>(
-                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input00), kOutputElementsPerBlock,
-                fp32Mask0);
+                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input00), kOutputElementsPerBlock, fp32Mask0);
             MicroAPI::DataCopy<int8_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::StoreDist::DIST_PACK4_B32>(
-                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input01), kOutputElementsPerBlock,
-                fp32Mask0);
+                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input01), kOutputElementsPerBlock, fp32Mask0);
             MicroAPI::DataCopy<int8_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::StoreDist::DIST_PACK4_B32>(
-                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input10), kOutputElementsPerBlock,
-                fp32Mask1);
+                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input10), kOutputElementsPerBlock, fp32Mask1);
             MicroAPI::DataCopy<int8_t, MicroAPI::PostLiteral::POST_MODE_UPDATE, MicroAPI::StoreDist::DIST_PACK4_B32>(
-                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input11), kOutputElementsPerBlock,
-                fp32Mask1);
+                outLocalAddr, reinterpret_cast<MicroAPI::RegTensor<int8_t>&>(fp8Input11), kOutputElementsPerBlock, fp32Mask1);
         }
     }
 }
 
 template <typename Fp8Type, bool ApplyExpertScale = true>
-__aicore__ inline void DequantizeAndAccumulate(__ubuf__ uint8_t* tokenAddr, __ubuf__ fp8_e8m0_t* scaleAddr,
-                                               __ubuf__ float* scaleWorkAddr, __ubuf__ float* sumAddr, uint32_t axisH,
-                                               uint32_t scaleCount, float expertScale)
-{
+__aicore__ inline void DequantizeAndAccumulate(__ubuf__ uint8_t* tokenAddr, __ubuf__ fp8_e8m0_t* scaleAddr, __ubuf__ float* scaleWorkAddr,
+                                               __ubuf__ float* sumAddr, uint32_t axisH, uint32_t scaleCount, float expertScale) {
     (void)expertScale;
     const uint32_t fp32RepeatSize = GetVectorRegisterSize() / sizeof(float);
     const uint16_t scaleRepeatTimes = static_cast<uint16_t>((scaleCount + fp32RepeatSize - 1U) / fp32RepeatSize);
@@ -270,8 +246,7 @@ __aicore__ inline void DequantizeAndAccumulate(__ubuf__ uint8_t* tokenAddr, __ub
     uint32_t fp8MaskCount = axisH * 4U;
     constexpr int16_t kFp32ExponentShift = 23;
 
-    __VEC_SCOPE__
-    {
+    __VEC_SCOPE__ {
         MicroAPI::RegTensor<fp8_e8m0_t> scaleReg;
         MicroAPI::RegTensor<Fp8Type> tokenReg;
         MicroAPI::RegTensor<float> tokenFp320;
@@ -288,12 +263,11 @@ __aicore__ inline void DequantizeAndAccumulate(__ubuf__ uint8_t* tokenAddr, __ub
 
         for (uint16_t loop = 0; loop < scaleRepeatTimes; ++loop) {
             MicroAPI::MaskReg mask = MicroAPI::UpdateMask<float>(scaleMaskCount);
-            MicroAPI::DataCopy<fp8_e8m0_t, MicroAPI::LoadDist::DIST_UNPACK4_B8>(scaleReg,
-                                                                                scaleAddr + loop * fp32RepeatSize);
+            MicroAPI::DataCopy<fp8_e8m0_t, MicroAPI::LoadDist::DIST_UNPACK4_B8>(scaleReg, scaleAddr + loop * fp32RepeatSize);
             MicroAPI::ShiftLefts(reinterpret_cast<MicroAPI::RegTensor<uint32_t>&>(scaleFp32),
                                  reinterpret_cast<MicroAPI::RegTensor<uint32_t>&>(scaleReg), kFp32ExponentShift, mask);
-            MicroAPI::DataCopy<float, MicroAPI::StoreDist::DIST_INTLV_B32>(scaleWorkAddr + loop * fp32RepeatSize * 2U,
-                                                                           scaleFp32, scaleFp32, mask);
+            MicroAPI::DataCopy<float, MicroAPI::StoreDist::DIST_INTLV_B32>(scaleWorkAddr + loop * fp32RepeatSize * 2U, scaleFp32, scaleFp32,
+                                                                           mask);
         }
 
         MicroAPI::LocalMemBar<MicroAPI::MemType::VEC_STORE, MicroAPI::MemType::VEC_LOAD>();
@@ -301,10 +275,9 @@ __aicore__ inline void DequantizeAndAccumulate(__ubuf__ uint8_t* tokenAddr, __ub
             MicroAPI::MaskReg dataMask = MicroAPI::UpdateMask<float>(dataMaskCount);
             MicroAPI::MaskReg fp8Mask = MicroAPI::UpdateMask<Fp8Type>(fp8MaskCount);
             MicroAPI::DataCopy<float, MicroAPI::LoadDist::DIST_E2B_B32>(scaleFp32, scaleWorkAddr + loop * 8U);
-            MicroAPI::DataCopy<Fp8Type, MicroAPI::LoadDist::DIST_UNPACK_B8>(
-                tokenReg, reinterpret_cast<__ubuf__ Fp8Type*>(tokenAddr) + 2U * loop * fp32RepeatSize);
-            MicroAPI::DataCopy<float, MicroAPI::LoadDist::DIST_DINTLV_B32>(sum0, sum1,
-                                                                           sumAddr + 2U * loop * fp32RepeatSize);
+            MicroAPI::DataCopy<Fp8Type, MicroAPI::LoadDist::DIST_UNPACK_B8>(tokenReg, reinterpret_cast<__ubuf__ Fp8Type*>(tokenAddr) +
+                                                                                          2U * loop * fp32RepeatSize);
+            MicroAPI::DataCopy<float, MicroAPI::LoadDist::DIST_DINTLV_B32>(sum0, sum1, sumAddr + 2U * loop * fp32RepeatSize);
             MicroAPI::Cast<float, Fp8Type, kCastLane0>(tokenFp320, tokenReg, fp8Mask);
             MicroAPI::Cast<float, Fp8Type, kCastLane2>(tokenFp321, tokenReg, fp8Mask);
             MicroAPI::Mul(weighted0, scaleFp32, tokenFp320, dataMask);
@@ -315,12 +288,9 @@ __aicore__ inline void DequantizeAndAccumulate(__ubuf__ uint8_t* tokenAddr, __ub
             }
             MicroAPI::Add(sum0, sum0, weighted0, dataMask);
             MicroAPI::Add(sum1, sum1, weighted1, dataMask);
-            MicroAPI::DataCopy<float, MicroAPI::StoreDist::DIST_INTLV_B32>(sumAddr + loop * fp32RepeatSize * 2U, sum0,
-                                                                           sum1, dataMask);
+            MicroAPI::DataCopy<float, MicroAPI::StoreDist::DIST_INTLV_B32>(sumAddr + loop * fp32RepeatSize * 2U, sum0, sum1, dataMask);
         }
     }
 }
 
 }  // namespace DispatchDedupMxfp8Quant
-
-#endif  // DISPATCH_DEDUP_EP_KERNELS_DISPATCH_DEDUP_EP_MXFP8_QUANT_H

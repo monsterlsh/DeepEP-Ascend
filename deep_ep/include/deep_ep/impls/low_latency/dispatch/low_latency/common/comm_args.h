@@ -1,5 +1,6 @@
+#pragma once
+
 // Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
 
 /*
  * Copyright (c) 2024 Huawei Technologies Co., Ltd.
@@ -11,8 +12,6 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef DISPATCH_DEDUP_COMM_ARGS_H
-#define DISPATCH_DEDUP_COMM_ARGS_H
 #include <cstdint>
 #include <cstddef>
 
@@ -50,4 +49,3 @@ static_assert(offsetof(CommArgs, peerMems) == 8, "peer address ABI offset");
 static_assert(sizeof(CommArgs) == 2056, "communication ABI size");
 
 }  // namespace DispatchDedup
-#endif  // DISPATCH_DEDUP_COMM_ARGS_H

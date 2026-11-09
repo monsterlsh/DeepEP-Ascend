@@ -46,7 +46,7 @@ def fp8_scales(sources, tokens, hidden, scale_dtype):
     import torch
 
     groups = (hidden + 127) // 128
-    if scale_dtype == "int32":
+    if scale_dtype == 'int32':
         return torch.full((len(sources), groups), 0x7F7F7F7F, dtype=torch.int32)
     # Finite, positive non-unit values with distinct low mantissa bits per row/group.
     bits = (
@@ -74,7 +74,7 @@ def expected_combine(routes, rank, hidden, dtype, fp32_scales=False, *, weighted
     k = len(routes[rank][0]) if b else 0
     x = payload([rank] * b, list(range(b)), hidden, dtype).float()
     if fp32_scales:
-        x *= fp8_scales([rank] * b, list(range(b)), hidden, "float32").repeat_interleave(128, dim=1)[:, :hidden]
+        x *= fp8_scales([rank] * b, list(range(b)), hidden, 'float32').repeat_interleave(128, dim=1)[:, :hidden]
     if reduce_in_local and (experts is None or experts % len(routes)):
         raise ValueError('Native local reduction requires experts divisible by world size')
     expected = torch.full_like(x, bias)

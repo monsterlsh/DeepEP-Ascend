@@ -1,21 +1,13 @@
 #pragma once
 
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 
 namespace deep_ep {
 
-// Native MTE transport selection policy (simple fixed-threshold form).
-//
-// Per-operation batch-size thresholds, fixed at compile time. Values are the
-// conservative crossing points measured in G-p4 (bias 0.40 over the nominal
-// break-even batch):
-//   dispatch (point-to-point, MTE advantage decays slowly with EP):
-//     EP8 = 100, EP16 = 77, EP32 = 70, EP64 = 67, EP128 = 32 (historical)
-//   combine (all-to-all, MTE engines saturate across machines):
-//     EP8 = 60, EP16 = 17, EP128 = 32 (historical), others 0
-// A threshold of 0 means "never use MTE" for that (op, EP). B <= threshold uses
-// MTE, otherwise the official URMA path.
+// Per-operation batch thresholds for native MTE transport.
+// Zero keeps URMA; eligible shapes must also pass the guards below.
 
 constexpr int dispatch_mte_threshold_bs(int num_ranks) {
     switch (num_ranks) {
@@ -42,13 +34,19 @@ inline int mte_threshold_bs(bool is_combine, int num_ranks) {
                       : dispatch_mte_threshold_bs(num_ranks);
 }
 
-// EP_MTE_BS_THRESHOLD=<n> overrides the threshold for every EP and both ops.
-// Returns -1 when unset. Must be identical across all ranks.
+// Override the BS threshold only for supported operation/EP combinations.
+// Unset, empty, -1 or invalid values use the default policy; 0 disables MTE.
+// All ranks must use the same value.
 inline int mte_bs_threshold_override() {
-    const auto v = std::getenv("EP_MTE_BS_THRESHOLD");
-    if (v == nullptr or *v == '\0')
+    const auto value = std::getenv("EP_MTE_BS_THRESHOLD");
+    if (value == nullptr or *value == '\0')
         return -1;
-    return std::atoi(v);
+    const auto end = value + std::strlen(value);
+    int threshold = -1;
+    const auto result = std::from_chars(value, end, threshold);
+    if (result.ec != std::errc{} or result.ptr != end or threshold < -1)
+        return -1;
+    return threshold;
 }
 
 // Host policy: hard hardware/capacity guards + fixed per-operation threshold.
@@ -56,12 +54,15 @@ inline bool prefer_low_latency_transport(bool is_combine, int arch, int num_rank
                                          int num_tokens, int num_max_tokens_per_rank,
                                          int hidden, int num_topk, int num_experts,
                                          int num_vec_cores, bool use_fp8,
-                                         int num_ub_bytes = 190 * 1024) {
-    if (arch != 3510 or use_fp8 or hidden != 7168 or num_topk != 8 or num_experts != 128 or
+                                         int num_ub_bytes = 190 * 1024,
+                                         int bs_threshold_override = -1) {
+    const auto threshold = mte_threshold_bs(is_combine, num_ranks);
+    // A threshold override must not enable unsupported hardware, shapes or ops.
+    if (threshold == 0 or arch != 3510 or use_fp8 or hidden != 7168 or num_topk != 8 or num_experts != 128 or
         num_vec_cores != 64 or num_ub_bytes < 190 * 1024 or num_tokens <= 0 or
         num_tokens > num_max_tokens_per_rank or num_max_tokens_per_rank > 256)
         return false;
-    return num_tokens <= mte_threshold_bs(is_combine, num_ranks);
+    return num_tokens <= (bs_threshold_override >= 0 ? bs_threshold_override : threshold);
 }
 
 // Runtime decision entry: wraps the policy with the environment override.
@@ -71,12 +72,9 @@ inline bool prefer_low_latency_transport_runtime(bool is_combine, int arch, int 
                                                  int hidden, int num_topk, int num_experts,
                                                  int num_vec_cores, bool use_fp8,
                                                  int num_ub_bytes = 190 * 1024) {
-    const int override = mte_bs_threshold_override();
-    if (override >= 0)
-        return num_tokens <= override;
     return prefer_low_latency_transport(is_combine, arch, num_ranks, num_tokens,
                                         num_max_tokens_per_rank, hidden, num_topk, num_experts,
-                                        num_vec_cores, use_fp8, num_ub_bytes);
+                                        num_vec_cores, use_fp8, num_ub_bytes, mte_bs_threshold_override());
 }
 
 // Diagnostic escape hatch for comparing the same public API against its original

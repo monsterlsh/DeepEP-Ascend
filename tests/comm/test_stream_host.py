@@ -67,13 +67,27 @@ class StreamHostTests(unittest.TestCase):
                 validate(SimpleNamespace(ep_shape="mte", ep_bs=16, ep_capacity=16), world)
             validate(SimpleNamespace(ep_shape="fallback", ep_bs=16, ep_capacity=16), world)
 
-    def test_backend_environment_is_explicit(self):
-        with patch.dict(os.environ, {"EP_DISABLE_LOW_LATENCY_TRANSPORT": "stale"}):
-            self.helpers["configure_backend"]("official")
-            self.assertEqual(os.environ["EP_DISABLE_LOW_LATENCY_TRANSPORT"], "stale")
-            for backend, expected in (("candidate-disabled", "1"), ("candidate-auto", None), ("official", None)):
-                self.helpers["configure_backend"](backend)
-                self.assertEqual(os.environ.get("EP_DISABLE_LOW_LATENCY_TRANSPORT"), expected)
+    def test_official_backend_preserves_environment(self):
+        inherited = {'EP_DISABLE_LOW_LATENCY_TRANSPORT': 'stale',
+                     'EP_MTE_BS_THRESHOLD': '4096', 'KEEP': 'value'}
+        with patch.dict(os.environ, inherited, clear=True):
+            self.helpers['configure_backend']('official')
+            self.assertEqual(dict(os.environ), inherited)
+
+    def test_candidate_modes_discard_inherited_threshold_overrides(self):
+        for backend in ('candidate-disabled', 'candidate-auto'):
+            for threshold in (None, '0', '4096', 'invalid'):
+                inherited = {'EP_DISABLE_LOW_LATENCY_TRANSPORT': 'stale', 'KEEP': 'value'}
+                if threshold is not None:
+                    inherited['EP_MTE_BS_THRESHOLD'] = threshold
+                expected = {'KEEP': 'value'}
+                if backend == 'candidate-disabled':
+                    expected['EP_DISABLE_LOW_LATENCY_TRANSPORT'] = '1'
+                with self.subTest(backend=backend, threshold=threshold), \
+                        patch.dict(os.environ, inherited, clear=True):
+                    for _ in range(2):
+                        self.helpers['configure_backend'](backend)
+                        self.assertEqual(dict(os.environ), expected)
 
     def test_delay_preflight_rejects_missing_or_noncallable_api(self):
         for torch in (SimpleNamespace(), SimpleNamespace(npu=SimpleNamespace()),

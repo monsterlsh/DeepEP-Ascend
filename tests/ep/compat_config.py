@@ -17,10 +17,11 @@ import sys
 
 
 DEFAULT_BS = (2, 32, 33, 64, 65, 128, 256, 2)
-BACKENDS = ("official", "candidate-disabled", "candidate-auto")
+BACKENDS = ('official', 'candidate-disabled', 'candidate-auto')
 PRODUCTION_WORLDS = (8, 16, 32, 64, 128)
 DIAGNOSTIC_WORLDS = (1, 2, 4)
-TRANSPORT_ENV = "EP_DISABLE_LOW_LATENCY_TRANSPORT"
+TRANSPORT_ENV = 'EP_DISABLE_LOW_LATENCY_TRANSPORT'
+THRESHOLD_ENV = 'EP_MTE_BS_THRESHOLD'
 
 
 def create_parser():
@@ -172,23 +173,24 @@ def plan_cases(args, world=None):
 
 
 def configure_backend(backend, environ=None):
-    """Configure only candidate transport selection; never impersonate a build.
+    """Configure candidate selection without changing the loaded build identity.
 
-    The runner must independently record/verify the loaded package and commit.
-    For ``official`` this helper does not modify the diagnostic environment and
-    does not claim that a candidate build has become an official build.
+    Candidate modes discard inherited threshold overrides. Official runs leave
+    the environment unchanged; the runner verifies the loaded package separately.
     """
     if backend not in BACKENDS:
-        raise ValueError(f"Unknown backend: {backend}")
+        raise ValueError(f'Unknown backend: {backend}')
     target = os.environ if environ is None else environ
-    if backend == "candidate-disabled":
-        target[TRANSPORT_ENV] = "1"
-    elif backend == "candidate-auto":
+    if backend != 'official':
+        target.pop(THRESHOLD_ENV, None)
+    if backend == 'candidate-disabled':
+        target[TRANSPORT_ENV] = '1'
+    elif backend == 'candidate-auto':
         target.pop(TRANSPORT_ENV, None)
     return {
-        "backend": backend,
-        "transport_override": target.get(TRANSPORT_ENV),
-        "requires_official_build": backend == "official",
+        'backend': backend,
+        'transport_override': target.get(TRANSPORT_ENV),
+        'requires_official_build': backend == 'official',
     }
 
 

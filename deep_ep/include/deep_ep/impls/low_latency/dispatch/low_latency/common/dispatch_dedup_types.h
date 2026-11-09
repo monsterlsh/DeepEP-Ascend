@@ -1,5 +1,6 @@
+#pragma once
+
 // Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
 
 /*
  * Copyright (c) 2024 Huawei Technologies Co., Ltd.
@@ -10,8 +11,6 @@
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  */
-#ifndef DISPATCH_DEDUP_TYPES_H
-#define DISPATCH_DEDUP_TYPES_H
 
 namespace DispatchDedup {
 constexpr int DISPATCH_DEDUP_SUCCESS = 0;
@@ -28,4 +27,3 @@ enum DispatchDedupDataType {
 };
 
 }  // namespace DispatchDedup
-#endif  // DISPATCH_DEDUP_TYPES_H

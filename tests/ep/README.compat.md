@@ -8,9 +8,9 @@
 
 | `--backend` | 实际要求 | 环境开关 |
 | --- | --- | --- |
-| `official` | 独立安装/加载官方 `3b25377`；不得把候选关闭优化称为官方 | 不修改诊断开关 |
-| `candidate-disabled` | 安装/加载候选版本 | 设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` |
-| `candidate-auto` | 安装/加载候选版本 | 移除上述开关 |
+| `official` | 独立安装/加载选定的 main 基线；使用 `--expected-source-commit` 核验 | 不修改诊断开关 |
+| `candidate-disabled` | 安装/加载候选版本 | 设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1`，移除 `EP_MTE_BS_THRESHOLD` |
+| `candidate-auto` | 安装/加载候选版本 | 移除上述两个开关，验证默认策略 |
 
 测试记录实际导入的 `deep_ep` 路径、扩展二进制 SHA256、可获取的源码 commit/工作区状态、Python/Torch/torch_npu、相关运行文件及测试工具哈希。`--build-label` 只是人工标签。`--expected-source-commit` 从实际导入包所在 Git 仓核验；无可核验源码时会报错，不会把标签当作验证结果。
 
@@ -70,15 +70,15 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 | `--profile-paths` | 每个操作采集真实设备 kernel 证据；默认关闭并明确标记 unverified |
 | `--output-dir` | 每 rank 独占创建日志，已有文件拒绝覆盖；三个 backend 和每次复跑使用不同目录 |
 
-测试固定 H7168/K8/E128，生产规模为 EP8/16/32/64/128。默认 native 路径只有 EP128 的合格小 BS 允许选择 MTE；其他 EP（包括 EP1/2/4 诊断规模）预期 URMA。保留其他 EP 的测试，以验证官方路径的兼容性。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示；这是本测试数据的限制，不是库的容量限制。M 可以更大，以验证容量导致的回退。
+测试固定 H7168/K8/E128，生产规模为 EP8/16/32/64/128。默认 native 路径按操作和 EP 分别选择传输，阈值与主 README 的 [策略表](../../README.md#automatic-decode-transport-in-epbuffer) 一致：dispatch 为 EP8/16/32/64/128 的 100/77/70/67/32；combine 为 EP8/16/128 的 60/17/32，EP32/64 保持 URMA。EP1/2/4 诊断规模保持 URMA。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示；这是本测试数据的限制，不是库的容量限制。M 可以更大，以验证容量导致的回退。
 
-MTE 路径验收使用 EP128、arch3510、64 AIV、可用 UB 至少 190 KiB 的目标机器，并要求 `1≤B≤32`、`B≤M≤256`。BF16 dispatch 与 BF16 combine 按各自原始 B/M 计算预期；FP8 dispatch 预期 URMA，后续 BF16 combine 在上述条件满足时可预期 MTE。EP128 大 BS 保持 URMA，不因整组性能通过而强制 MTE。trace 中 UB、M、cached、CPU sync、barrier、dtype/scale pack 和权重分支均与用例核对。实际不符会失败，不以“正确性通过”掩盖意外回退。
+MTE 路径验收要求 arch3510、64 AIV、可用 UB 至少 190 KiB、`0<B≤M≤256`，且 B 不超过当前操作和 EP 的阈值。BF16 dispatch 与 BF16 combine 按各自原始 B/M 计算预期；FP8 dispatch 预期 URMA，后续 BF16 combine 独立选择。大 BS 保持 URMA，不通过强制覆盖阈值验收默认策略。trace 中 UB、M、cached、CPU sync、barrier、dtype/scale pack 和权重分支均与用例核对。实际不符会失败，不以“正确性通过”掩盖意外回退。
 
 ## 设备运行示例
 
 启动约定与已有测试一致：`WORLD_SIZE` 是节点数，`RANK` 是节点编号，`--num-processes` 是本节点 NPU 数。每个节点运行同一命令，使用同一 MASTER_ADDR/MASTER_PORT 和一致用例配置。不要再套 torchrun。
 
-按照现有测试环境规则确认所用设备空闲后再运行。以下只是入口示例，T02 不自动启动这些作业。
+按照现有测试环境规则确认所用设备空闲后再运行。以下命令用于手动启动测试。
 
 先跑小型默认模式正确性，分别选择三个 backend 和对应已安装构建：
 
@@ -91,13 +91,13 @@ python tests/ep/test_ep_auto_compat.py \
   --edge-routes off --output-dir /tmp/ep-compat-auto-default-01
 ```
 
-验证 EP128 的 MTE/URMA 边界时，将 BS 列表改成 `2 32 33 256 2`。其他 EP 的相同用例用于检查 URMA 回退。后续增加 alignment、deferred、deterministic 和 hotspot；默认 planner 不把 CPU sync=True 混进主矩阵，避免它截断其他用例。
+边界用例应包含当前操作阈值的两侧。例如 EP64 dispatch 使用 `2 67 68 256 2`，其 combine 始终预期 URMA；EP128 dispatch/combine 使用 `2 32 33 256 2`。后续增加 alignment、deferred、deterministic 和 hotspot；默认 planner 不把 CPU sync=True 混进主矩阵，避免它截断其他用例。
 
-CPU 同步单独核验官方和候选：
+CPU 同步单独核验官方和候选。先将 `MAIN_SHA` 设为实际构建的 main 提交 SHA：
 
 ```bash
 python tests/ep/test_ep_auto_compat.py \
-  --backend official --expected-source-commit 3b25377d04b24fc6154698ded78a2bcb2c59afff \
+  --backend official --expected-source-commit "$MAIN_SHA" \
   --bs 2 --cpu-sync true --alignment 1 --deferred false \
   --deterministic false --route random --edge-routes off \
   --output-dir /tmp/ep-compat-official-cpusync-01
@@ -116,7 +116,7 @@ python tests/ep/test_ep_auto_compat.py \
   --output-dir /tmp/ep-compat-auto-paths-01
 ```
 
-上述入口仍由启动环境决定全局 EP；单机 EP8 的新策略预期全部 URMA。验证 MTE 必须使用全局 EP128，不能只改 `--num-processes` 为 128。再单独使用 `--edge-routes only` 验证空 rank/不同 B，EP128 下还覆盖混合传输。保留不同路径的设备证据，不按 shape 猜测结果。
+上述入口由节点数与 `--num-processes` 共同决定全局 EP；单机 EP8 的合格小 BS 可使用 MTE，不能把全局 EP 直接作为单节点进程数。再单独使用 `--edge-routes only` 验证空 rank、不同 B 与阈值两侧的混合传输。保留不同路径的设备证据，不按 shape 猜测结果。
 
 FP8 payload 和非单位 scales 用于检查通信字节、stride、padding 及缓存更新；合成专家函数用可精确表示的 FP8 值生成 BF16 输出。该用例不模拟完整模型的反量化/GEMM 性能。combine 同时检查调用者已乘权和未乘权的专家输出，权重回传不能再次改变 hidden。
 
@@ -127,7 +127,7 @@ torch_npu 2.12 环境缺少该接口；入口会显式注册 torch_npu，并在�
 拒绝缺少延迟接口的环境。该环境仍需适配并验证设备端异步延迟，不能用 CPU sleep
 或同步操作代替后宣称完成跨流验收。
 
-保留原 H1024/K1 回退用例、EventOverlap 与 Bucket 冒烟，以及 H7168/K8/E128 shape 的 producer/consumer 双流用例。CLI 中的 `mte` shape 名称保持兼容；是否可用 MTE 还取决于全局 EP 和当前策略，以下单机 EP8 示例只验证 URMA 路径：
+保留原 H1024/K1 回退用例、EventOverlap 与 Bucket 冒烟，以及 H7168/K8/E128 shape 的 producer/consumer 双流用例。CLI 中的 `mte` shape 名称保持兼容；是否可用 MTE 还取决于全局 EP 和当前策略，以下单机 EP8 示例同时覆盖原 shape 的 URMA 与合格小 BS shape 的 MTE；实际路径另由主矩阵的 profiler 证据确认：
 
 ```bash
 python tests/comm/test_stream.py --num-processes 8 \

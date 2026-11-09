@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
+#pragma once
 
-#ifndef COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
-#define COMBINE_DEDUP_EP_SERVER_DEDUP_PARTIAL_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <kernel_operator.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
@@ -19,11 +18,9 @@ using namespace AscendC;
 // addresses and completion events remain live through the M5 handoff.
 class ServerDedupPartial {
 public:
-    __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch,
-                                GM_ADDR expert, GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens,
-                                uint32_t bs, uint32_t h, uint32_t k, uint32_t experts, uint8_t dtype, uint64_t window,
-                                const EpCombineM45WorkspaceLayout& layout)
-    {
+    __aicore__ inline void Init(const __gm__ DispatchDedup::CommArgs* args, TPipe* pipe, LocalTensor<uint8_t> scratch, GM_ADDR expert,
+                                GM_ADDR table2, GM_ADDR table3, GM_ADDR types, uint32_t tokens, uint32_t bs, uint32_t h, uint32_t k,
+                                uint32_t experts, uint8_t dtype, uint64_t window, const EpCombineM45WorkspaceLayout& layout) {
         args_ = args;
         pipe_ = pipe;
         scratch_ = scratch[layout.phaseOffset];
@@ -61,13 +58,12 @@ public:
         types_.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(types));
     }
 
-    __aicore__ inline uint32_t Process()
-    {
-        for (uint32_t lane = 0; lane < inputLanes_; ++lane) SetFlag<HardEvent::V_MTE2>(lane);
+    __aicore__ inline uint32_t Process() {
+        for (uint32_t lane = 0; lane < inputLanes_; ++lane)
+            SetFlag<HardEvent::V_MTE2>(lane);
         uint64_t flagMask[2] = {0xffU, 0U};
         for (uint32_t lane = 0; lane < outputLanes_; ++lane) {
-            Duplicate<float>(outputs_[lane * packetBytes_].ReinterpretCast<float>()[120U], 1.0f, flagMask,
-                             uint8_t(blocks_), 1U, 16U);
+            Duplicate<float>(outputs_[lane * packetBytes_].ReinterpretCast<float>()[120U], 1.0f, flagMask, uint8_t(blocks_), 1U, 16U);
         }
         PipeBarrier<PIPE_V>();
         const uint32_t servers = uint32_t(args_->rankSize) / 8U;
@@ -95,7 +91,8 @@ public:
             }
             // Reuse phase scratch with its Vector dependency, not an MTE3 drain.
         }
-        for (uint32_t lane = 0; lane < inputLanes_; ++lane) WaitFlag<HardEvent::V_MTE2>(lane);
+        for (uint32_t lane = 0; lane < inputLanes_; ++lane)
+            WaitFlag<HardEvent::V_MTE2>(lane);
         // Output events and their UB sources remain owned by the shared ring.
         // The caller hands off only MTE2/Vector before M5 reuses phase metadata.
         return completed;
@@ -103,21 +100,18 @@ public:
 
 private:
     template <class T>
-    __aicore__ inline LocalTensor<T> Allocate(uint32_t bytes)
-    {
+    __aicore__ inline LocalTensor<T> Allocate(uint32_t bytes) {
         auto tensor = scratch_[used_].template ReinterpretCast<T>();
         used_ += bytes;
         return tensor;
     }
     template <HardEvent E>
-    __aicore__ inline void Sync()
-    {
+    __aicore__ inline void Sync() {
         const TEventID id = pipe_->FetchEventID(E);
         SetFlag<E>(id);
         WaitFlag<E>(id);
     }
-    __aicore__ inline uint32_t SelectServer(uint32_t server, uint32_t& owner, bool validateRanks)
-    {
+    __aicore__ inline uint32_t SelectServer(uint32_t server, uint32_t& owner, bool validateRanks) {
         uint32_t count = 0U;
         const uint32_t localCore = GetBlockIdx() - kEpServerDedupCombineSendCoreNum;
         const uint32_t vectorBytes = EpCombineAlign(scanRows_ * 4U, 256U);
@@ -152,8 +146,8 @@ private:
                 uint64_t typed = 0U, valid = 0U;
                 GatherMask(table, indices, typeMask.ReinterpretCast<uint32_t>(), true, span, {1U, 1U, 0U, 0U}, typed);
                 ServerDedupRankMask(mask, upper, ranks, 0, int32_t(args_->rankSize), span);
-                And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(),
-                    typeMask.ReinterpretCast<uint16_t>(), int32_t((span + 15U) / 16U));
+                And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(), typeMask.ReinterpretCast<uint16_t>(),
+                    int32_t((span + 15U) / 16U));
                 PipeBarrier<PIPE_V>();
                 GatherMask(table, indices, mask.ReinterpretCast<uint32_t>(), true, span, {1U, 1U, 0U, 0U}, valid);
                 Sync<HardEvent::V_S>();
@@ -163,8 +157,8 @@ private:
                 }
             }
             ServerDedupRankMask(mask, upper, ranks, int32_t(server * 8U), int32_t((server + 1U) * 8U), span);
-            And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(),
-                typeMask.ReinterpretCast<uint16_t>(), int32_t((span + 15U) / 16U));
+            And(mask.ReinterpretCast<uint16_t>(), mask.ReinterpretCast<uint16_t>(), typeMask.ReinterpretCast<uint16_t>(),
+                int32_t((span + 15U) / 16U));
             PipeBarrier<PIPE_V>();
             uint64_t selected = 0U;
             GatherMask(table, indices, mask.ReinterpretCast<uint32_t>(), true, span, {1U, 1U, 0U, 0U}, selected);
@@ -176,8 +170,7 @@ private:
         }
         return count;
     }
-    __aicore__ inline void LoadTask(uint32_t row)
-    {
+    __aicore__ inline void LoadTask(uint32_t row) {
         // Route is reloaded by original row so the list needs only 4B/task.
         // Table3 is exactly one K*8B row, fetched only for an owned type2 task.
         // Keep the dispatch table ABI; the interleaved weight words are unused.
@@ -185,52 +178,47 @@ private:
         DataCopyPad(table3Ub_, table3_[uint64_t(row) * k_ * 2U], {1U, k_ * 8U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
         Sync<HardEvent::MTE2_S>();
     }
-    __aicore__ inline void Load(uint32_t row, uint32_t source, uint32_t member)
-    {
+    __aicore__ inline void Load(uint32_t row, uint32_t source, uint32_t member) {
         const uint32_t lane = (inputSequence_ + member) % inputLanes_;
         WaitFlag<HardEvent::V_MTE2>(lane);
         GlobalTensor<uint16_t> data;
         if (member == 0U) {
             data = expert_[uint64_t(row) * h_];
-            DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
-                        {false, 0U, 0U, uint16_t(0)});
+            DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U}, {false, 0U, 0U, uint16_t(0)});
         } else {
             const uint32_t packed = table3Ub_.GetValue(member * 2U);
             const uint32_t expert = packed & 0xffffU, q = packed >> 16U;
             const uint32_t memberRank = expert / localExperts_, localExpert = expert % localExperts_;
-            const uint64_t slot =
-                (((uint64_t(source) + memberRank) % uint32_t(args_->rankSize)) * localExperts_ + localExpert) * bs_ + q;
-            data.SetGlobalBuffer(
-                reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[memberRank] + stageBase_ + slot * stageStride_));
-            DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U},
-                        {false, 0U, 0U, uint16_t(0)});
+            const uint64_t slot = (((uint64_t(source) + memberRank) % uint32_t(args_->rankSize)) * localExperts_ + localExpert) * bs_ + q;
+            data.SetGlobalBuffer(reinterpret_cast<__gm__ uint16_t*>(args_->peerMems[memberRank] + stageBase_ + slot * stageStride_));
+            DataCopyPad(inputs_[lane * inputBytes_ / 2U], data, {1U, h_ * 2U, 0U, 0U, 0U}, {false, 0U, 0U, uint16_t(0)});
         }
         SetFlag<HardEvent::MTE2_V>(lane);
     }
     template <class T>
-    __aicore__ inline void Aggregate(uint32_t row, uint32_t source, uint32_t contributions)
-    {
+    __aicore__ inline void Aggregate(uint32_t row, uint32_t source, uint32_t contributions) {
         const uint32_t preload = contributions < inputLanes_ ? contributions : inputLanes_;
-        for (uint32_t member = 0; member < preload; ++member) Load(row, source, member);
+        for (uint32_t member = 0; member < preload; ++member)
+            Load(row, source, member);
         for (uint32_t member = 0; member < contributions; ++member) {
             const uint32_t lane = (inputSequence_ + member) % inputLanes_;
             WaitFlag<HardEvent::MTE2_V>(lane);
-            Cast(member == 0U ? sum_ : cast_, inputs_[lane * inputBytes_ / 2U].template ReinterpretCast<T>(),
-                 RoundMode::CAST_NONE, h_);
+            Cast(member == 0U ? sum_ : cast_, inputs_[lane * inputBytes_ / 2U].template ReinterpretCast<T>(), RoundMode::CAST_NONE, h_);
             SetFlag<HardEvent::V_MTE2>(lane);
             // Prefetch may reuse this input after Cast, independent of
             // accumulation and the previous token's outstanding partial send.
-            if (member + inputLanes_ < contributions) Load(row, source, member + inputLanes_);
+            if (member + inputLanes_ < contributions)
+                Load(row, source, member + inputLanes_);
             PipeBarrier<PIPE_V>();
-            if (member != 0U) Add(sum_, sum_, cast_, h_);
+            if (member != 0U)
+                Add(sum_, sum_, cast_, h_);
             PipeBarrier<PIPE_V>();
         }
         inputSequence_ += contributions;
         Cast(low_.template ReinterpretCast<T>(), sum_, RoundMode::CAST_RINT, h_);
         PipeBarrier<PIPE_V>();
     }
-    __aicore__ inline void Send(uint32_t lane, uint32_t source, uint32_t token, uint32_t topk)
-    {
+    __aicore__ inline void Send(uint32_t lane, uint32_t source, uint32_t token, uint32_t topk) {
         // Only output-lane reuse waits for MTE3; aggregation entry never does.
         WaitFlag<HardEvent::MTE3_V>(lane);
         auto output = outputs_[lane * packetBytes_];
@@ -263,4 +251,3 @@ private:
     uint64_t stageStride_ = 0, stageBase_ = 0, window_ = 0;
 };
 }  // namespace CombineDedup
-#endif

@@ -1,7 +1,7 @@
-"""CPU-only checks of the public Python contract against official 3b25377.
+"""CPU-only checks of the public Python contract against the pinned main baseline.
 
-Signature fixtures below were transcribed from that public release, not from
-the candidate. Calls execute the real Python wrappers with an inert extension
+Signature fixtures below were checked against the main revision recorded below,
+not generated from the candidate. Calls execute the real Python wrappers with an inert extension
 double; they cannot validate NPU ordering, communication or tensor contents.
 Run: python -B tests/ep/test_public_api_compat_host.py
 """
@@ -18,7 +18,7 @@ from test_low_latency_host import Event, Tensor, fake_modules, load
 
 
 ROOT = Path(__file__).resolve().parents[2]
-OFFICIAL_REVISION = '3b25377d04b24fc6154698ded78a2bcb2c59afff'
+OFFICIAL_REVISION = '4dfccac4fc345519427e1019557301c9e59e9c76'
 OFFICIAL_SIGNATURES = {
     'EPHandle.__init__': '(self, do_expand, num_experts, expert_alignment, num_max_tokens_per_rank, num_sms, topk_idx, num_recv_tokens, num_expanded_tokens, num_recv_tokens_per_expert_list, psum_num_recv_tokens_per_rank, psum_num_recv_tokens_per_expert, num_unaligned_recv_tokens_per_expert, recv_src_metadata, dst_buffer_slot_idx, dst_gsge_idx)',
     'EPHandle.deterministic_sort': '(self, do_cpu_sync, is_cached_dispatch, recv_x, recv_sf, recv_topk_weights)',

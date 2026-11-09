@@ -1,7 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by candy_cloud_fly 2026
-
 #pragma once
+
+// Copyright (c) 2026, Lu Lu
+
 // Existing ascendEP dispatch controls end before 764 KiB. Keep its 2 MiB
 // data boundary and fixed 4 GiB bank stride; do not import upstream offsets.
 #define COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_CONTROL_OFFSET (764ULL * 1024ULL)

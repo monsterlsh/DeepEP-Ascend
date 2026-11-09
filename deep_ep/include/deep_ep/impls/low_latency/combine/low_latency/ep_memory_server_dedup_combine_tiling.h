@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by ryan_li 2026
+#pragma once
 
-#ifndef COMBINE_DEDUP_EP_MEMORY_SERVER_DEDUP_COMBINE_TILING_H
-#define COMBINE_DEDUP_EP_MEMORY_SERVER_DEDUP_COMBINE_TILING_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <cstddef>
 #include <cstdint>
@@ -36,4 +35,3 @@ static_assert(offsetof(EpServerDedupCombineTilingData, quantMode) == 14, "quantM
 static_assert(offsetof(EpServerDedupCombineTilingData, reserved) == 15, "reserved zero offset");
 static_assert(offsetof(EpServerDedupCombineTilingData, recvUbBytes) == 16, "receive UB budget offset");
 }  // namespace CombineDedup
-#endif

@@ -1,8 +1,7 @@
-// Copyright (c) 2026, Lu Lu
-// Modified by ryan_li 2026
+#pragma once
 
-#ifndef DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_MODE_H
-#define DISPATCH_DEDUP_EP_MEMORY_SERVER_DEDUP_MODE_H
+// Copyright (c) 2026, Lu Lu
+
 
 #include <cstdint>
 
@@ -15,9 +14,7 @@ constexpr uint32_t kEpServerDedupDedupThreshold = 32U;
 __aicore__ inline
 #endif
     constexpr bool
-    EpServerDedupEnabled(uint32_t numMaxTokensPerRank)
-{
+    EpServerDedupEnabled(uint32_t numMaxTokensPerRank) {
     return numMaxTokensPerRank > kEpServerDedupDedupThreshold;
 }
 }  // namespace DispatchDedup
-#endif
