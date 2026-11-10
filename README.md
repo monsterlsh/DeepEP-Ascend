@@ -73,6 +73,32 @@ PP, Engram and Bucket are experimental; remaining work is listed under [Ongoing]
 
 Routing indices use `deep_ep.topk_idx_t`, currently fixed to `torch.int64`. Explicit RDMA service levels and QP counts are unsupported; leave `sl_idx=None` and QP arguments at their defaults. The NV-compatible `num_sms` argument selects AI cores on Ascend EP, with `0` selecting the default; cached dispatch and combine reuse the count saved in the handle.
 
+### Small-batch dispatch
+
+Dispatch automatically uses direct MTE writes for BF16 inputs on Ascend 950 with
+hidden size 7168, top-8 routing over 128 experts, all 64 AIVs and at least
+190 KiB UB per AIV. This path requires `do_cpu_sync=False` and
+`0 < local tokens <= per-call capacity <= limit`. All ranks use the same per-call
+capacity; a small local input does not enable MTE when that capacity exceeds the
+limit.
+
+| EP size | Maximum capacity for fresh dispatch | Maximum capacity for cached dispatch |
+| --- | ---: | ---: |
+| EP8 | 64 | 64 |
+| EP16 | 64 | 64 |
+| EP32 | 48 | 32 |
+| EP64 | 32 | 16 |
+
+Other configurations use URMA; combine continues to use URMA. No additional
+public API or transport setting is required. EP128 remains on URMA.
+
+The default CPU-synchronized dispatch remains on URMA. Cached dispatch uses
+device-side counts and its own capacity limit while reusing the original handle.
+Both transports use the same token slots and metadata. When the cached limit is
+lower, a handle created by MTE dispatch can be reused by URMA cached dispatch.
+Per-call capacity remains bounded by the buffer allocation; calls above the
+limits stay on URMA even for small inputs.
+
 ## Ongoing
 
 The Ascend backend is under active development:

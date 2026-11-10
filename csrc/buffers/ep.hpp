@@ -20,6 +20,7 @@
 #include "../comm/api.hpp"
 #include "../utils/tensor.hpp"
 #include "../kernels/ep/api.hpp"
+#include "../kernels/ep/dispatch_policy.hpp"
 #include "../utils/event.hpp"
 
 namespace deep_ep {
@@ -255,6 +256,11 @@ public:
 
         // Launch dispatch
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
+        const auto use_mte = prefer_mte_dispatch(
+            runtime->get_npu_arch(), context->num_ranks, num_tokens, num_max_tokens_per_rank,
+            hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes, sf.has_value(), do_cpu_sync, cached_mode) and
+            runtime->get_npu_arch() == jit->device.get_npu_arch() and
+            num_used_vec_cores == jit->device.get_num_vec_cores();
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr(), topk_weights_ptr,
                         metadata_send_buffer.data_ptr(),
@@ -279,7 +285,7 @@ public:
                         num_ub_bytes,
                         num_used_vec_cores,
                         context->num_gpu_timeout_cycles,
-                        barrier_in_prologue);
+                        barrier_in_prologue, use_mte);
 
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
