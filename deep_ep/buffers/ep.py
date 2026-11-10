@@ -163,6 +163,11 @@ class EPHandle:
 class EPBuffer(BufferBase):
     """Expert-parallel dispatch/combine on Ascend, using the expanded layout.
 
+    The native runtime selects a small-batch MTE transport where supported,
+    using the same communication allocation, layouts, handles and epilogues.
+    Dispatch transports routing weights as metadata; combine never multiplies
+    them into the expert outputs. Apply model weights in the expert computation.
+
     Stream usage:
         All operations run on the current stream.
     """
@@ -195,6 +200,11 @@ class EPBuffer(BufferBase):
         overlap preferences are compatibility options. LB storage can be allocated;
         LB kernels, RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
         workspace and must be allocation-aligned.
+
+        The default path automatically selects its internal transport without
+        changing the public API. SHMEM LL dispatch allocates a separate internal
+        arena on first use; unsupported configurations use the native buffer.
+
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
         num_lb_bytes = lb_allocation_plan_or_num_bytes if lb_allocation_plan is None else lb_allocation_plan.num_bytes
@@ -538,7 +548,8 @@ class EPBuffer(BufferBase):
                 original ranks.
             handle: a must-set communication handle, you can obtain this from the `dispatch` function.
             topk_weights: `[num_tokens]` with `torch.float`. The expanded tokens' top-k weights for
-                reducing to their original ranks.
+                restoring to their original ranks as a separate output. These values do not
+                multiply `x`; any model weighting must already be present in the expert outputs.
             bias: `None`, a tensor, or a tuple of 2 `[num_combined_tokens, hidden]` tensors with
                 `torch.bfloat16` final bias to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.

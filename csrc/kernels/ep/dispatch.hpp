@@ -40,7 +40,10 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_ub_bytes,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
-                            const bool& do_barrier = false) {
+                            const bool& do_barrier = false,
+                            const bool& low_latency_transport = false,
+                            const bool& layout_only = false,
+                            void* peer_buffers = nullptr) {
     // Calculate configs
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -49,19 +52,26 @@ static void launch_dispatch(void* x, void* sf,
     EP_HOST_ASSERT(16 <= num_vec_cores);
 
     // Compile
-    const auto kernel = jit->compile("dispatch", std::format(R"(
+    // Layout-only dispatch uses the native MTE metadata path and preserves the
+    // native logical slot / SGE plan. The LL kernel supplies hidden data later.
+    const auto use_mte = low_latency_transport or layout_only;
+    // Optional device uint64[num_ranks] table of SHMEM receive-buffer bases.
+    // Workspace/signals remain in the native HCCL allocation. A null table
+    // preserves the native UBMEM mapping, including the URMA fallback path.
+    EP_HOST_ASSERT(peer_buffers == nullptr or use_mte);
+    const auto kernel = jit->compile(layout_only ? "dispatch_layout" : (use_mte ? "dispatch_mte" : "dispatch"), std::format(R"(
 #include <deep_ep/impls/ep/dispatch.hpp>
 
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_experts, num_topk,
         expert_alignment, cached_mode, do_cpu_sync,
         num_vec_cores,
         num_hidden_bytes, num_sf_packs, num_max_tokens_per_rank, num_ub_bytes,
-        num_timeout_cycles, do_barrier));
+        num_timeout_cycles, do_barrier or layout_only, use_mte, layout_only));
 
     // Launch
     jit->launch(
@@ -78,7 +88,8 @@ static void __instantiate_kernel() {{
         jetty_ptrs,
         rank_idx,
         num_tokens,
-        sf_token_stride, sf_hidden_stride);
+        sf_token_stride, sf_hidden_stride,
+        peer_buffers);
 }
 
 static void launch_dispatch_copy_epilogue(void* buffer,

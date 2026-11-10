@@ -17,9 +17,11 @@
 #include <deep_ep/common/reduction.hpp>
 
 #include "base.hpp"
+#include "dispatch_low_latency.hpp"
 #include "../comm/api.hpp"
 #include "../utils/tensor.hpp"
 #include "../kernels/ep/api.hpp"
+#include "../kernels/ep/low_latency_policy.hpp"
 #include "../utils/event.hpp"
 
 namespace deep_ep {
@@ -28,6 +30,7 @@ class EPBuffer: public BufferBase {
     int64_t num_buffer_bytes;
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
+    std::shared_ptr<DispatchLowLatencyState> dispatch_low_latency;
 
 public:
     std::shared_ptr<comm::Context> context;
@@ -38,7 +41,8 @@ public:
              const bool& use_huge1g_page,
              const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
              const bool& explicitly_destroy):
-        BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes) {
+        BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes),
+        dispatch_low_latency(std::make_shared<DispatchLowLatencyState>(hccl_group_name, num_buffer_bytes)) {
         EP_HOST_ASSERT(num_buffer_bytes >= 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         EP_HOST_ASSERT(num_lb_buffer_bytes >= 0 and num_lb_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         context = std::make_shared<comm::Context>(
@@ -47,6 +51,7 @@ public:
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_common_signals(&workspace.common_signals);
+        dispatch_low_latency->initialize(*context);
         lb_storage = torch::from_blob(
             context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
             torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
@@ -65,6 +70,7 @@ public:
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
         comm::barrier(*context, true);
+        dispatch_low_latency->close();
         ACL_CHECK(aclrtHostUnregister(host_workspace));
         ACL_CHECK(aclrtFreeHost(host_workspace));
         context->finalize();
@@ -245,6 +251,12 @@ public:
             EP_HOST_ASSERT(dst_gsge_idx.device() == x.device());
         }
 
+        const auto ll_launch = dispatch_low_latency->prepare(*context, x, num_max_tokens_per_rank,
+            hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes, sf.has_value());
+        if (ll_launch and previous_event)
+            previous_event->current_stream_wait();
+        const auto dispatch_buffer = ll_launch ? ll_launch->buffer() : context->buffer;
+
         // Clean host workspace
         const auto host_workspace_layout = layout::EPWorkspaceLayout(host_workspace);
         if (not cached_mode) {
@@ -255,6 +267,8 @@ public:
 
         // Launch dispatch
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
+        dispatch_low_latency->begin(ll_launch);
+        const auto ll_failure_guard = dispatch_low_latency->failure_guard();
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr(), topk_weights_ptr,
                         metadata_send_buffer.data_ptr(),
@@ -264,7 +278,7 @@ public:
                         num_unaligned_recv_tokens_per_expert.data_ptr<int>(),
                         dst_buffer_slot_idx.data_ptr<int>(),
                         dst_gsge_idx.data_ptr<int>(),
-                        context->buffer, context->workspace, mapped_host_workspace,
+                        dispatch_buffer, context->workspace, mapped_host_workspace,
                         context->hccl_context->jetty_device_ptrs,
                         context->rank_idx, context->num_ranks,
                         num_tokens, num_max_tokens_per_rank,
@@ -279,11 +293,14 @@ public:
                         num_ub_bytes,
                         num_used_vec_cores,
                         context->num_gpu_timeout_cycles,
-                        barrier_in_prologue);
+                        barrier_in_prologue, ll_launch != nullptr, false,
+                        ll_launch ? ll_launch->peer_buffers.data_ptr() : nullptr);
 
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
-        auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context]() {
+        auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
+                        ll_launch = ll_launch, dispatch_low_latency = dispatch_low_latency]() {
+            const auto ll_failure_guard = dispatch_low_latency->failure_guard();
             // Wait GPU notify or reuse cached allocation sizes
             int num_recv_tokens = context->num_ranks * num_max_tokens_per_rank;
             int num_expanded_tokens = 0;
@@ -351,7 +368,7 @@ public:
             }
 
             launch_dispatch_copy_epilogue(
-                context->buffer,
+                dispatch_buffer,
                 context->workspace,
                 context->hccl_context->jetty_device_ptrs,
                 psum_num_recv_tokens_per_rank.data_ptr<int>(),
@@ -379,6 +396,8 @@ public:
             // Convert row-major epilogue output to column-major
             if (recv_sf.has_value() and use_cube_aligned_col_major_sf)
                 recv_sf = recv_sf->transpose(0, 1).contiguous().transpose(0, 1);
+
+            dispatch_low_latency->record_completion();
 
             return pybind11::make_tuple(
                 recv_x, recv_sf, recv_topk_weights,
@@ -487,6 +506,10 @@ public:
 
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
+        const auto low_latency_transport = low_latency_transport_enabled() and
+            prefer_low_latency_transport_runtime(true, runtime->get_npu_arch(), context->num_ranks, num_combined_tokens,
+                                                 num_max_tokens_per_rank, hidden, num_topk, num_experts,
+                                                 num_used_vec_cores, false, num_ub_bytes);
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights_ptr,
@@ -503,7 +526,7 @@ public:
             num_ub_bytes,
             num_used_vec_cores,
             context->num_gpu_timeout_cycles,
-            barrier_in_prologue
+            barrier_in_prologue, low_latency_transport
         );
 
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.

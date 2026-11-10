@@ -6,6 +6,13 @@
 
 ## Performance
 
+The measurements below and the earlier low-latency BS/EP matrix predate the
+current automatic MTE transport integration and removal of weighting from the
+legacy LL combine kernels. They are historical results, not validation of this
+revision. See [Automatic decode transport in EPBuffer](#automatic-decode-transport-in-epbuffer)
+for the current native MTE/URMA policy and its validation scope; the historical
+tables do not establish a speedup of the current integration.
+
 Measured on Ascend 950DT NPUs with CANN 9.2.0 and the manually configured PoC HDK described under [Recommended HDK and firmware](#recommended-hdk-and-firmware). All measurements use netlayer 1, the supernode's external Clos network.
 
 The following runs use 16,384 tokens/rank capacity, hidden size 7168, top-6 routing over 256 experts, 32 AI cores / 64 AIVs, expert alignment 128 and no bias. Dispatch uses FP8 with row-major scales; combine uses BF16. Each rank uses 10 warmups and 50 samples with cache flushing.
@@ -28,12 +35,24 @@ Bandwidth ranges cover all ranks, using timings that include issue and drain but
 - Ascend 950 (A5) with UBMEM connectivity and UBC_CTP/URMA channels between the participating ranks.
 - An even number of ranks for multi-rank communication.
 - CANN with Ascend C, the Bisheng compiler, HCCL and HCOMM headers/libraries.
-- Python 3.10 or newer, a matching PyTorch/`torch_npu` installation, and NumPy for the tests.
-- A C++20 compiler and standard library supporting `std::format`.
+- Python 3.10 or newer, matching CPU-build PyTorch/`torch_npu` packages, and NumPy for the tests.
+- A C++20 compiler and standard library supporting `std::format`. For GCC/libstdc++, use GCC 13 or newer with matching development headers and runtime libraries ([GCC 13 release notes](https://gcc.gnu.org/gcc-13/changes.html)).
+- elfutils development headers, including `elfutils/libdwfl.h`, for DeepJIT's host-side exception handling.
 
 The validated stack is Ascend 950DT, CANN 9.2.0, Python 3.12, PyTorch 2.13.0+cpu and torch_npu 2.13.0rc1, with the PoC HDK configuration described below. Kernel support on other Ascend generations or CANN versions has not been established by these measurements.
 
 Installation builds the host extension; device kernels are compiled on first use. Keep the CANN toolkit and Bisheng available at runtime. Set `ASCEND_HOME_PATH` to the active CANN installation, or use `ASCEND_TOOLKIT_HOME`.
+
+Use the CPU build of PyTorch with `torch_npu`. In the Python 3.11 build check,
+PyTorch `2.12.0+cu130` and `torch_npu 2.12.0.post1` failed during import because
+both registered the same allocator configuration keys. Using `2.12.0+cpu`
+resolved that failure; disabling backend autoload alone did not.
+
+The build selects the installed CANN directories for the host CPU (`x86_64` or
+`aarch64`). The pinned DeepJIT revision assumes an ARM toolkit path, so the
+build creates a version-checked header copy under its temporary build directory
+with a host-aware toolkit lookup. The source submodule and CANN installation
+are not changed. Updating DeepJIT requires reviewing this compatibility copy.
 
 ### Recommended HDK and firmware
 
@@ -42,6 +61,29 @@ Use Huawei's Q3 commercial HDK release for Atlas 850E when it becomes publicly a
 The performance results in this README were collected using a PoC HDK supplied to DeepSeek, with additional manual configuration. That configuration is not a publicly distributed release. Users on earlier PoC versions may observe lower bandwidth and should first check their HDK version and configuration. Use the Q3 commercial release, once available, as the recommended public deployment baseline; these measurements are not results from that unreleased commercial version.
 
 ### Installation
+
+Install the elfutils development packages in the host or container where you build the extension. On Ubuntu/Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libdw-dev libelf-dev
+```
+
+On openEuler/Fedora/RHEL, use the corresponding packages:
+
+```bash
+sudo dnf install -y elfutils-devel elfutils-libelf-devel
+```
+
+On openEuler 24.03 LTS SP4, enable [GCC Toolset 14](https://docs.openeuler.org/zh/docs/25.03/server/development/gcc/gcc-14-secondary-version-compilation-toolchain-user-guide.html) for C++20 `<format>` support. The C++ package in the [SP4 aarch64 repository](https://repo.openeuler.org/openEuler-24.03-LTS-SP4/everything/aarch64/Packages/) is named `gcc-toolset-14-gcc-c++`:
+
+```bash
+sudo dnf install -y gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ \
+    gcc-toolset-14-binutils gcc-toolset-14-libstdc++-devel
+source /opt/openEuler/gcc-toolset-14/enable
+export CC=/opt/openEuler/gcc-toolset-14/root/usr/bin/gcc
+export CXX=/opt/openEuler/gcc-toolset-14/root/usr/bin/g++
+```
 
 Activate the CANN environment and install the matching PyTorch/`torch_npu` packages first, then:
 
@@ -63,7 +105,8 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues |
+| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues; automatic SHMEM LL dispatch with native fallback |
+| `DecodeBuffer` | BF16 convenience wrapper over one `EPBuffer`; exposes received routing weights and leaves weighting to the expert computation |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
@@ -194,6 +237,77 @@ output, _ = pending.wait()
 ```
 
 Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on their returned events in the same way. See [EP tests](tests/ep/test_ep.py) for complete examples.
+
+## Automatic decode transport in EPBuffer
+
+`EPBuffer.dispatch` uses a low-latency direct-push path when SHMEM,
+hardware and layout requirements are met, and the native URMA path otherwise.
+No additional constructor or dispatch argument is needed. Both paths return
+the standard weights, counts, handle and deferred event results. Cached
+dispatch and the existing combine implementation use the same native metadata.
+
+The LL path reuses native routing and deduplicates each token by destination
+rank. MTE writes payload and metadata directly into a SHMEM buffer with the
+native receive layout; the original epilogue produces the outputs. There is
+no intermediate expert-expanded payload or layout conversion.
+
+BF16 on A5 is admitted by the native UB, buffer and integer limits, without
+fixed H/K/E or batch-size gates. FP8 and unsupported layouts retain the native
+implementation. All ranks use the same M/H/K/E and collective order. Actual
+token counts may differ, including zero; routes and weights are unchanged.
+
+Build with `SHMEM_ROOT=/path/to/shmem/install/shmem` to enable the backend.
+The SDK headers must match the pinned SHMEM revision
+`4dd80e2129da42bd773982c2bb3758af1ed0bba8`. The wheel records SDK header and
+library hashes in `deep_ep/shmem-sdk.json`. Without the SDK the standard build
+remains available and dispatch uses the native path. SHMEM owns one 32-GiB
+heap per process, shared by same-group arenas; each LL buffer reserves its
+configured native buffer size. Unsupported or unavailable resources select native before launch.
+Initialization or communication failure is reported, never retried with a
+different protocol.
+
+LL is initially preferred for all admitted shapes. Performance crossover
+points can be added in `prefer_dispatch_low_latency` without changing the API.
+Device correctness and performance validation remain outstanding; offline
+compilation and historical MTE measurements do not validate this path on NPUs.
+
+Combine is unchanged. Its existing MTE policy remains BF16/H7168/K8/E128,
+capacity at most 256, and at most 60/17/32 tokens for EP8/16/128 respectively;
+other cases use URMA. The existing `EP_DISABLE_LOW_LATENCY_TRANSPORT` and
+`EP_MTE_BS_THRESHOLD` controls apply to that native transport policy, not to
+SHMEM LL dispatch.
+
+Dispatch returns routing weights as metadata. Apply them once in the expert
+computation. Combine sums expert outputs; its optional `topk_weights` argument
+returns a separate weight tensor without scaling the outputs.
+
+### Optional BF16 convenience wrapper
+
+`DecodeBuffer` wraps one native `EPBuffer`. All ranks must use matching shapes
+and call order, with distinct valid int64 expert IDs and FP32 routing weights.
+Only the leading `sum(handle.expert_recv_counts)` rows are valid.
+
+```python
+from deep_ep import DecodeBuffer
+
+buffer = DecodeBuffer(ep_group, num_max_tokens_per_rank=256,
+                      hidden=7168, num_topk=8, num_experts=128)
+recv_x, handle, event = buffer.dispatch(x, topk_idx, topk_weights)
+event.wait()
+expert_output = local_experts_forward(
+    recv_x, handle.expert_recv_counts, handle.recv_topk_weights)
+output, event = buffer.combine(expert_output, handle)
+event.wait()
+buffer.destroy()  # Collective; before destroying the process group.
+```
+
+See the [compatibility test guide](tests/ep/README.compat.md) and
+[DecodeBuffer test](tests/ep/test_decode.py) for validation examples.
+
+The former explicit LL adapter remains accessible only through the private
+fixture in `tests/ep/_low_latency_fixture.py` for source-kernel regression.
+It is not the public EPBuffer entry point and does not validate the integrated
+SHMEM dispatch path.
 
 ## Other buffer interfaces
 

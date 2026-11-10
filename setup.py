@@ -1,4 +1,6 @@
 import ast
+import hashlib
+import json
 import re
 import os
 import shutil
@@ -23,6 +25,50 @@ persistent_env_names = (
     'EP_JIT_PRINT_COMPILER_COMMAND',
     'EP_JIT_PRINT_LOAD_TIME',
 )
+
+shmem_revision = '4dd80e2129da42bd773982c2bb3758af1ed0bba8'
+shmem_header_hashes = {
+    'host/shmem_host_def.h': '659aaa719af9c38bafef72921a73cca325c3c30f0f43be30b6ba9f0535de6cf6',
+    'host/init/shmem_host_init.h': '9f17760542e9f3b6dfa8bd6aad724250f686233398b5b2043c7d28f66d6f5fbb',
+    'host/mem/shmem_host_heap.h': '5ef864fd9c6c812169de6e1dfbbb6b55481cd9cb67e543a681c3e19d5ce627b4',
+    'host/data_plane/shmem_host_cc.h': 'dc8704f0d3fe00abe99ad5c9fa0bb74a79f7cda8c2af9242dc717cdd9f45ceb6',
+    'host_device/shmem_common_types.h': '528cd9698815312358253c40b74f4f0668b86af637843f9f767f6d625c273a34',
+    'host_device/shmem_common_macros.h': 'd1540f47e041ddc544a975ddf9fda2e9801c5243d5730a5966598229adb7af60',
+}
+
+
+def get_shmem_build_config():
+    explicit_root = os.environ.get('SHMEM_ROOT')
+    root = Path(explicit_root or Path(current_dir) / 'third-party' / 'shmem' / 'install' / 'shmem')
+    if not explicit_root and not root.exists():
+        return {'enabled': False}
+    root = root.resolve()
+    hashes = {}
+    for name, expected in shmem_header_hashes.items():
+        path = root / 'include' / name
+        if not path.is_file():
+            raise RuntimeError(f'SHMEM SDK header missing: {path}')
+        hashes[name] = hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+        if hashes[name] != expected:
+            raise RuntimeError(f'SHMEM SDK header does not match {shmem_revision}: {path}')
+    for name in ('host/data_plane/shmem_host_rma.h',):
+        path = root / 'include' / name
+        if not path.is_file():
+            raise RuntimeError(f'SHMEM SDK header missing: {path}')
+        hashes[name] = hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
+    library = next((root / name / 'libshmem.so' for name in ('lib', 'lib64')
+                    if (root / name / 'libshmem.so').is_file()), None)
+    if library is None:
+        raise RuntimeError(f'SHMEM SDK library missing under {root}: lib/libshmem.so or lib64/libshmem.so')
+    return {
+        'enabled': True,
+        'root': str(root),
+        'expected_source_revision': shmem_revision,
+        'header_sha256_lf': hashes,
+        'library': str(library),
+        'library_sha256': hashlib.sha256(library.read_bytes()).hexdigest(),
+        'binary_source_revision_verified': False,
+    }
 
 
 def get_package_version():
@@ -66,12 +112,18 @@ class CustomBuildPy(build_py):
     def run(self):
         # Make clusters' cache setting default into `envs.py`
         self.generate_default_envs()
+        self.generate_shmem_manifest()
 
         # Then, copy csrc into the wheel for agent-side error lookup
         self.prepare_agent_files()
 
         # Finally, run the regular build
         build_py.run(self)
+
+    def generate_shmem_manifest(self):
+        path = Path(self.build_lib) / 'deep_ep' / 'shmem-sdk.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(get_shmem_build_config(), indent=2) + '\n', encoding='utf-8')
 
     def prepare_agent_files(self):
         # Copy csrc into the wheel for agent-side error lookup
@@ -133,6 +185,15 @@ if __name__ == '__main__':
         '-Wl,-Bsymbolic-functions',
         '-Wl,--enable-new-dtags',
     ]
+    shmem_config = get_shmem_build_config()
+    define_macros = []
+    if shmem_config['enabled']:
+        include_dirs.append(str(Path(shmem_config['root']) / 'include'))
+        shmem_libdir = str(Path(shmem_config['library']).parent)
+        library_dirs.append(shmem_libdir)
+        libraries.append('shmem')
+        extra_link_args.append(f'-Wl,-rpath,{shmem_libdir}')
+        define_macros.append(('DEEPEP_WITH_SHMEM', '1'))
 
     # Summary
     print('Build summary:')
@@ -143,6 +204,7 @@ if __name__ == '__main__':
     print(f' > CXX flags: {cxx_flags}')
     print(f' > ASCEND_HOME_PATH: {ascend_home}')
     print(f' > TORCH_NPU_DIR: {torch_npu_dir}')
+    print(f' > SHMEM: {json.dumps(shmem_config, sort_keys=True)}')
     # Print persistent env variables
     persistent_envs = []
     for name in persistent_env_names:
@@ -160,6 +222,7 @@ if __name__ == '__main__':
         include_dirs=include_dirs,
         library_dirs=library_dirs,
         libraries=libraries,
+        define_macros=define_macros,
         extra_compile_args=cxx_flags,
         extra_link_args=extra_link_args,
         language='c++',
@@ -171,7 +234,8 @@ if __name__ == '__main__':
         version=get_package_version(),
         packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
         # Older setuptools versions do not expand recursive package-data globs.
-        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*.hpp')]},
+        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*')
+                                 if path.suffix in ('.hpp', '.h')]},
         ext_modules=[ext_module],
         cmdclass={'build_ext': BuildExtension, 'build_py': CustomBuildPy},
     )
