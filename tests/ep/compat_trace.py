@@ -129,6 +129,7 @@ def parse_kernel(name, operation, backend='candidate'):
         _require(len(values) > transport_index,
                  f"Missing candidate MTE template argument: {name}")
         low_latency = boolean(transport_index, 'low_latency_transport')
+        # Historical dispatch symbols may have a layout-only bool before the derived integer arguments.
         layout_only = (operation == 'dispatch' and len(values) > 14 and values[14][0] == 'b'
                        and boolean(14, 'layout_only'))
         if operation == 'dispatch':

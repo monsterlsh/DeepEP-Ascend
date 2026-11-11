@@ -31,7 +31,7 @@ DISPATCH_EPILOGUE = '_ZN7deep_ep27dispatch_copy_epilogue_implILi16ELi128ELi8ELi1
 COMBINE_EPILOGUE = '_ZN7deep_ep28combine_reduce_epilogue_implILi16ELi128ELi8ELi7168ELi2ELi221184ELi64ELl100000000000ELb0ELi14336EEEvPu6__bf16PfPlS1_S1_S1_PvS4_i'
 
 
-# Synthetic new-ABI fixtures only; these are not NPU validation results.
+# Synthetic fixtures for the historical metadata-only dispatch and LL bridge.
 DISPATCH_LAYOUT = DISPATCH_MTE.replace('ELb1ELb1ELi1ELi64ELi6E', 'ELb1ELb1ELb1ELi1ELi64ELi6E')
 LL_PAYLOAD = 'void dispatch_server_dedup_kernel<0>(...)'
 LL_ORIGIN_MAP = 'void deep_ep::dispatch_ll_origin_map_impl<16, 2, 8>(...)'
@@ -44,16 +44,16 @@ def ll_records():
 
 
 class KernelParserTests(unittest.TestCase):
-    def test_explicit_historical_template_arity(self):
+    def test_dispatch_template_versions(self):
         arguments = '16, 128, 8, 1, false, false, 64, 14336, 0, 2, 221184, 100000000000L, true'
         official = f'void deep_ep::dispatch_impl<{arguments}>(...)'
-        historical = f'void deep_ep::dispatch_impl<{arguments}, true>(...)'
-        current = f'void deep_ep::dispatch_impl<{arguments}, true, true>(...)'
+        direct = f'void deep_ep::dispatch_impl<{arguments}, true>(...)'
+        historical_layout = f'void deep_ep::dispatch_impl<{arguments}, true, true>(...)'
         self.assertEqual(trace.identify_transport(official, 'dispatch', 'official'), 'urma')
-        self.assertEqual(trace.identify_transport(historical, 'dispatch'), 'mte')
-        self.assertEqual(trace.identify_transport(current, 'dispatch'), 'metadata_mte')
+        self.assertEqual(trace.identify_transport(direct, 'dispatch'), 'mte')
+        self.assertEqual(trace.identify_transport(historical_layout, 'dispatch'), 'metadata_mte')
 
-    def test_new_dispatch_layout_is_not_payload_evidence(self):
+    def test_historical_dispatch_layout_is_not_payload_evidence(self):
         parameters = trace.parse_kernel(DISPATCH_LAYOUT, 'dispatch')
         self.assertTrue(parameters['layout_only'])
         self.assertEqual(parameters['transport'], 'metadata_mte')
@@ -84,7 +84,7 @@ class KernelParserTests(unittest.TestCase):
         with self.assertRaises(trace.TraceVerificationError):
             trace.verify_kernel_records(rows, 'dispatch', expected_transport='ll')
 
-    def test_new_full_native_dispatch_still_proves_urma(self):
+    def test_historical_full_native_dispatch_still_proves_urma(self):
         symbol = DISPATCH_LAYOUT.replace('ELb1ELb1ELb1ELi1', 'ELb1ELb0ELb0ELi1')
         self.assertEqual(trace.identify_transport(symbol, 'dispatch'), 'urma')
         self.assertFalse(trace.parse_kernel(symbol, 'dispatch')['layout_only'])

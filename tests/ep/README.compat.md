@@ -14,7 +14,7 @@
 
 测试记录实际导入的 `deep_ep` 路径、扩展二进制 SHA256、可获取的源码 commit/工作区状态、Python/Torch/torch_npu、相关运行文件及测试工具哈希。`--build-label` 只是人工标签。`--expected-source-commit` 从实际导入包所在 Git 仓核验；无可核验源码时会报错，不会把标签当作验证结果。
 
-官方和当前候选均不要求上层传入 `low_latency_mode`，测试要求公共对象没有 `low_latency_mode/is_low_latency` 标记；公共返回值、metadata、权重和事件检查保持一致。设备是否执行 LL 由完整 kernel 序列确认。
+官方和当前候选均不要求上层传入 `low_latency_mode`，测试要求公共对象没有 `low_latency_mode/is_low_latency` 标记。测试按相同规则检查公共返回值、metadata、权重和事件，设备 trace 用于识别实际执行的传输特化。
 
 在官方环境运行时，把下列四个文件作为一个外部测试目录使用即可，无需修改官方通信实现：
 
@@ -72,9 +72,11 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 
 测试固定 H7168/K8/E128，生产规模为 EP8/16/32/64/128。候选 BF16 dispatch 的选择取决于共同 M、SHMEM 可用性和真实 UB/arena 限制；测试不再用旧的逐 rank MTE 阈值判定成功或失败。combine 仍检查当前原生策略：EP8/16/128 的 B 阈值为60/17/32，EP32/64 为 URMA。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示；这是测试数据限制，不是库容量限制。
 
-dispatch 只有在同一设备、同一流中按序采集到 native metadata-only dispatch、`dispatch_server_dedup_kernel`、`dispatch_ll_origin_map_impl`、`dispatch_ll_copy_payload_impl`，才记为 `actual_transport=ll`。单独的 metadata MTE 符号不证明 LL payload 已执行；缺少阶段、阶段顺序或流身份不一致均失败。原生完整 dispatch 记为 `urma`；历史候选完整 MTE 仍解析为 `mte`。解析器保留官方13参数、历史候选14参数及当前15参数模板兼容。
+当前 dispatch 使用 14 个显式模板参数。第 14 项 `low_latency_transport` 为 true 时，内核直接传输 hidden 和 metadata，trace 记为 `actual_transport=mte`；为 false 时记为 `urma`。SHMEM peer 地址表在运行时传入；确认内存来自 SHMEM 还需要对应调用的 arena 选路证据。
 
-FP8 dispatch 仍预期 URMA，后续 BF16 combine 独立选择。trace 核对 UB、M、cached、CPU sync、dtype/scale pack 和权重分支；metadata-only 强制的内部 barrier 单独识别，不误判成调用方修改了 barrier 配置。未开启 profiler 时明确记录 unverified；观察到 URMA 只证明该回退路径，本次 LL 仍未覆盖。完整 LL kernel 序列也不能单凭符号证明 SHMEM 初始化成功，需同时保留构建/部署与运行时证据。
+解析器也接受官方 13 参数与历史候选 15 参数的 dispatch。对历史 metadata-only 特化，只有同一设备、同一流依次包含 metadata、`dispatch_server_dedup_kernel`、`dispatch_ll_origin_map_impl`、`dispatch_ll_copy_payload_impl` 才记为 `actual_transport=ll`。这类记录的内部 barrier 按桥接协议单独核对。
+
+FP8 dispatch 预期 URMA，后续 BF16 combine 独立选择。trace 核对 UB、M、cached、CPU sync、dtype/scale pack 和权重分支。未开启 profiler 时路径记为 unverified。
 
 ## 设备运行示例
 

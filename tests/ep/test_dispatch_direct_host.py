@@ -36,14 +36,14 @@ class DirectDispatchHostTests(unittest.TestCase):
 using namespace deep_ep;
 ''' + layout + r'''
 template<int T, int K, bool Cached, int UB = 194560, int H = 14336, bool Direct = true,
-         bool LayoutOnly = false, int Ranks = 8, int Capacity = T * 64>
+         int Ranks = 8, int Capacity = T * 64>
 void check(int expected_stages, bool expected_resident, bool expected_packed = false) {
     struct alignas(32) Workspace {
         uint8_t bytes[get_dispatch_routing_workspace_bytes(Ranks, 128, T, K)];
     };
     constexpr int kNumTopk = K, kNumSFPacks = 0, kNumMaxTokensPerVecCore = T;
     constexpr int kNumHiddenBytes = H, kNumRanks = Ranks, kNumMaxTokensPerRank = Capacity;
-    constexpr bool kCachedMode = Cached, kLowLatencyTransport = Direct, kLayoutOnly = LayoutOnly;
+    constexpr bool kCachedMode = Cached, kLowLatencyTransport = Direct;
     using Allocation = UBLayoutWithBuffer<Workspace, H, 0, K, T, UB, Cached>;
     using ub_layout_with_buffer_t = Allocation;
     static_assert(sizeof(Allocation) <= UB);
@@ -96,12 +96,11 @@ int main() {
     // Four-token batches under a tight UB budget limit the metadata slots.
     check<8, 32, false, 8192, 32>(4, false);
     check<64, 8, false, 194560, 14336, false>(8, false);
-    check<64, 8, true, 194560, 14336, true, true>(8, false);
-    check<1, 8, false, 194560, 14336, true, false, 16, 31>(1, true);
-    check<1, 8, false, 194560, 14336, true, false, 16, 32>(1, true, true);
-    check<4, 8, true, 194560, 14336, true, false, 16, 256>(4, true, true);
-    check<5, 8, true, 194560, 14336, true, false, 16, 257>(5, true);
-    check<4, 8, false, 32768, 14336, true, false, 16, 256>(1, true);
+    check<1, 8, false, 194560, 14336, true, 16, 31>(1, true);
+    check<1, 8, false, 194560, 14336, true, 16, 32>(1, true, true);
+    check<4, 8, true, 194560, 14336, true, 16, 256>(4, true, true);
+    check<5, 8, true, 194560, 14336, true, 16, 257>(5, true);
+    check<4, 8, false, 32768, 14336, true, 16, 256>(1, true);
 }
 '''
         run_layout_check(source)

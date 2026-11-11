@@ -558,7 +558,6 @@ template <int kNumRanks, int kNumExperts, int kNumTopk,
           int kNumVecCores,
           int kNumHiddenBytes, int kNumSFPacks, int kNumMaxTokensPerRank, int kNumUbBytes,
           int64_t kNumTimeoutCycles, bool kDoBarrier = false, bool kLowLatencyTransport = false,
-          bool kLayoutOnly = false,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumJetties = kNumVecCores,
           int kNumSGEPairsPerSQE = 6>
@@ -583,8 +582,6 @@ __global__ __vector__ void dispatch_impl(
     // Checks
     // NOTES: the one-to-many-rank Jetty is private for this vector core
     EP_STATIC_ASSERT(kNumRanks <= kNumMaxRanks);
-    EP_STATIC_ASSERT(not kLayoutOnly or kLowLatencyTransport,
-                     "Layout-only dispatch requires the MTE metadata path");
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0);
     EP_STATIC_ASSERT(math::is_power_of_2(kExpertAlignment));
     EP_STATIC_ASSERT(kNumVecCores > 0);
@@ -648,7 +645,7 @@ __global__ __vector__ void dispatch_impl(
     constexpr auto kNumMetadataMTEStages = ub_layout_with_buffer_t::kNumMetadataMTEStages;
     constexpr auto kNumHiddenMTEStages = ub_layout_with_buffer_t::kNumHiddenMTEStages;
     constexpr auto kNumTokensPerMetadataMTE = ub_layout_with_buffer_t::kNumTokensPerMetadataMTE;
-    constexpr bool kKeepMetadataInUB = kLowLatencyTransport and not kLayoutOnly and kNumSFPacks == 0 and
+    constexpr bool kKeepMetadataInUB = kLowLatencyTransport and kNumSFPacks == 0 and
         kNumMetadataMTEStages * kNumTokensPerMetadataMTE >= kNumMaxTokensPerVecCore;
     constexpr auto kDirectTokenBytes = get_dispatch_token_bytes(kNumHiddenBytes, 0, kNumTopk, kCachedMode);
     constexpr bool kPackDirectTokens = kKeepMetadataInUB and kNumRanks == 16 and
@@ -893,13 +890,11 @@ __global__ __vector__ void dispatch_impl(
                 ub->metadata, static_cast<int64_t>(kKeepMetadataInUB ? i : stage_idx) * kMetadataBytes);
             const auto event_idx = static_cast<event_t>(stage_idx);
             asc_sync_wait(PIPE_MTE3, PIPE_MTE2, event_idx);
-            if constexpr (not kLayoutOnly) {
-                asc_copy_gm2ub_align(
-                    ub_hidden,
-                    math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
-                    1, kNumHiddenBytes, 0, 0, false,
-                    asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, 0, 0);
-            }
+            asc_copy_gm2ub_align(
+                ub_hidden,
+                math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
+                1, kNumHiddenBytes, 0, 0, false,
+                asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, 0, 0);
             if constexpr (not kKeepMetadataInUB) {
                 asc_copy_gm2ub_align(
                     ub_metadata, metadata_send_buffer + static_cast<int64_t>(token_idx) * kMetadataBytes,
@@ -916,9 +911,8 @@ __global__ __vector__ void dispatch_impl(
                 if (dst_rank_idx < 0)
                     continue;
                 const auto remote_hidden = get_remote_token(dst_rank_idx, ub_layout->dst_slot_idx[entry_idx]);
-                if constexpr (not kLayoutOnly)
-                    asc_copy_ub2gm_align(remote_hidden, ub_hidden, 1, kNumHiddenBytes,
-                                         asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
+                asc_copy_ub2gm_align(remote_hidden, ub_hidden, 1, kNumHiddenBytes,
+                                     asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
                 asc_copy_ub2gm_align(remote_hidden + kNumHiddenBytes, ub_metadata, 1, kMetadataBytes,
                                      asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
             }

@@ -42,7 +42,6 @@ static void launch_dispatch(void* x, void* sf,
                             const int64_t& num_timeout_cycles,
                             const bool& do_barrier = false,
                             const bool& low_latency_transport = false,
-                            const bool& layout_only = false,
                             void* peer_buffers = nullptr) {
     // Calculate configs
     EP_HOST_ASSERT(num_vec_cores > 0);
@@ -51,26 +50,23 @@ static void launch_dispatch(void* x, void* sf,
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(16 <= num_vec_cores);
 
-    // Layout-only dispatch issues the MTE metadata pass. The LL kernel supplies the payload.
-    const auto use_mte = low_latency_transport or layout_only;
     // peer_buffers holds the SHMEM receive addresses. A null table selects native UBMEM.
-    EP_HOST_ASSERT(peer_buffers == nullptr or use_mte);
+    EP_HOST_ASSERT(peer_buffers == nullptr or low_latency_transport);
 
     // Compile
-    const auto kernel_name = layout_only ? "dispatch_layout" : (use_mte ? "dispatch_mte" : "dispatch");
-    const auto kernel = jit->compile(kernel_name, std::format(R"(
+    const auto kernel = jit->compile(low_latency_transport ? "dispatch_mte" : "dispatch", std::format(R"(
 #include <deep_ep/impls/ep/dispatch.hpp>
 
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_experts, num_topk,
         expert_alignment, cached_mode, do_cpu_sync,
         num_vec_cores,
         num_hidden_bytes, num_sf_packs, num_max_tokens_per_rank, num_ub_bytes,
-        num_timeout_cycles, do_barrier or layout_only, use_mte, layout_only));
+        num_timeout_cycles, do_barrier, low_latency_transport));
 
     // Launch
     jit->launch(

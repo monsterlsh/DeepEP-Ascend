@@ -294,7 +294,7 @@ public:
                         num_ub_bytes,
                         num_used_vec_cores,
                         context->num_gpu_timeout_cycles,
-                        barrier_in_prologue, ll_launch != nullptr, false,
+                        barrier_in_prologue, ll_launch != nullptr,
                         ll_launch ? ll_launch->peer_buffers.data_ptr() : nullptr);
 
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
