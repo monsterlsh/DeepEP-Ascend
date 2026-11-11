@@ -654,13 +654,18 @@ __global__ __vector__ void dispatch_impl(
     constexpr auto kNumTokensPerMetadataMTE = ub_layout_with_buffer_t::kNumTokensPerMetadataMTE;
     constexpr bool kKeepMetadataInUB = kLowLatencyTransport and not kLayoutOnly and kNumSFPacks == 0 and
         kNumMetadataMTEStages * kNumTokensPerMetadataMTE >= kNumMaxTokensPerVecCore;
+    constexpr auto kDirectTokenBytes = get_dispatch_token_bytes(kNumHiddenBytes, 0, kNumTopk, kCachedMode);
+    constexpr bool kPackDirectTokens = kKeepMetadataInUB and kNumRanks == 16 and
+        kNumMaxTokensPerRank >= 32 and kNumMaxTokensPerRank <= 256 and
+        kNumMaxTokensPerVecCore <= kNumTokensPerMetadataMTE and
+        kNumMaxTokensPerVecCore * kDirectTokenBytes <= sizeof(ub_layout_with_buffer_t::hidden);
     const auto ub = reinterpret_cast<__ubuf__ ub_layout_with_buffer_t*>(0);
     const auto ub_layout = &ub->workspace;
     const auto metadata_token_layout = layout::TokenLayout(
-        0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode);
+        kPackDirectTokens ? kNumHiddenBytes : 0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode);
     const auto ub_metadata_buffer = layout::BufferLayout(
         metadata_token_layout, kNumMetadataMTEStages, kNumTokensPerMetadataMTE,
-        math::advance_ptr<void>(ub->metadata, 0)
+        kPackDirectTokens ? math::advance_ptr<void>(ub->hidden, 0) : math::advance_ptr<void>(ub->metadata, 0)
     );
 
     // Barrier before dispatch
@@ -712,13 +717,20 @@ __global__ __vector__ void dispatch_impl(
 
     auto preload_metadata = [&](const int token_idx, const int stage_idx) __aicore__ {
         const auto ub_metadata = ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE);
-        const auto num_metadata_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
+        const auto ub_token_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
         const auto num_tokens_in_stage = math::min(
             kNumTokensPerMetadataMTE,
             math::max(0, math::min(num_tokens, (vec_core_idx + 1) * kNumMaxTokensPerVecCore) - token_idx));
 
-        // Copy metadata within this AIV's contiguous token range
+        // Load this AIV's contiguous token range at the selected UB pitch.
         asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
+        if constexpr (kPackDirectTokens) {
+            asc_copy_gm2ub_align(
+                ub_metadata.template get_hidden_ptr<__ubuf__ uint8_t>(),
+                math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
+                static_cast<uint16_t>(num_tokens_in_stage), kNumHiddenBytes, 0, 0, false,
+                asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, static_cast<uint64_t>(kNumHiddenBytes), ub_token_bytes);
+        }
         if constexpr (kNumSFPacks > 0) {
             const auto gm_sf = math::advance_ptr<__gm__ sf_pack_t>(
                 sf, static_cast<int64_t>(token_idx) * sf_token_stride * sizeof(sf_pack_t));
@@ -731,13 +743,13 @@ __global__ __vector__ void dispatch_impl(
                     /* enable_constant_pad= */ false,
                     /* l2_cache_mode= */ static_cast<uint8_t>(LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV),
                     /* src_stride= */ static_cast<uint64_t>(sf_token_stride) * sizeof(sf_pack_t),
-                    /* dst_stride= */ num_metadata_bytes
+                    /* dst_stride= */ ub_token_bytes
                 );
             } else {
                 const nddma_desc sf_desc(
                     nddma_desc::loop_desc(
                         static_cast<uint32_t>(num_tokens_in_stage),
-                        num_metadata_bytes / sizeof(sf_pack_t),
+                        ub_token_bytes / sizeof(sf_pack_t),
                         static_cast<uint32_t>(sf_token_stride)),
                     nddma_desc::loop_desc(
                         kNumSFPacks, 1, static_cast<uint32_t>(sf_hidden_stride))
@@ -759,7 +771,7 @@ __global__ __vector__ void dispatch_impl(
                 /* enable_constant_pad= */ false,
                 /* l2_cache_mode= */ static_cast<uint8_t>(LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV),
                 /* src_stride= */ static_cast<uint64_t>(kNumTopk) * sizeof(int64_t),
-                /* dst_stride= */ num_metadata_bytes
+                /* dst_stride= */ ub_token_bytes
             );
         }
         if (topk_weights != nullptr) {
@@ -771,7 +783,7 @@ __global__ __vector__ void dispatch_impl(
                 /* enable_constant_pad= */ false,
                 /* l2_cache_mode= */ static_cast<uint8_t>(LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV),
                 /* src_stride= */ static_cast<uint64_t>(kNumTopk) * sizeof(float),
-                /* dst_stride= */ num_metadata_bytes
+                /* dst_stride= */ ub_token_bytes
             );
         }
         asc_sync_notify(PIPE_MTE2, PIPE_S, static_cast<event_t>(stage_idx));
@@ -830,7 +842,31 @@ __global__ __vector__ void dispatch_impl(
     while (ub_layout->local_copy_ready != 1)
         asm volatile("nop");
 
-    if constexpr (kLowLatencyTransport) {
+    const auto get_remote_token = [&](int dst_rank_idx, int dst_slot_idx) __aicore__ {
+        if (peer_buffers != nullptr) {
+            return reinterpret_cast<__gm__ uint8_t*>(dispatch_direct_token_address(
+                peer_buffers[dst_rank_idx], rank_idx, kNumMaxTokensPerRank, dst_slot_idx, token_layout.get_num_bytes()));
+        }
+        const auto local_slot = recv_buffer.get_token_buffer(dst_slot_idx);
+        return layout::get_sym_ptr(workspace_layout.get_common_signals(),
+                                   local_slot.template get_hidden_ptr<__gm__ uint8_t>(), dst_rank_idx);
+    };
+
+    if constexpr (kPackDirectTokens) {
+        for (int i = 0; i < num_tokens_for_vec_core; ++ i) {
+            const auto packet = ub_metadata_buffer.get_token_buffer(i).template get_hidden_ptr<__ubuf__ uint8_t>();
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const auto entry_idx = i * kNumTopk + k;
+                const auto dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
+                if (dst_rank_idx >= 0)
+                    asc_copy_ub2gm_align(get_remote_token(dst_rank_idx, ub_layout->dst_slot_idx[entry_idx]), packet,
+                                         1, static_cast<uint32_t>(kDirectTokenBytes),
+                                         asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
+            }
+        }
+        asc_sync_notify(PIPE_MTE3, PIPE_S, EVENT_ID0);
+        asc_sync_wait(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    } else if constexpr (kLowLatencyTransport) {
         // Resident metadata keeps its token index; other paths reuse staging slots after their GM copies.
         // Each lane holds one token and its metadata until every destination has
         // consumed both MTE3 reads. No packet arena or receive layout is changed.
@@ -882,32 +918,11 @@ __global__ __vector__ void dispatch_impl(
                 const auto dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
                 if (dst_rank_idx < 0)
                     continue;
-                const auto dst_slot_idx = ub_layout->dst_slot_idx[entry_idx];
-                const auto local_slot = recv_buffer.get_token_buffer(dst_slot_idx);
-                __gm__ uint8_t* remote_hidden;
-                __gm__ uint8_t* remote_metadata;
-                if (peer_buffers != nullptr) {
-                    // The dispatch buffer can be a separate SHMEM allocation;
-                    // never map its addresses relative to HCCL CommonSignals.
-                    // Preserve the exact native source-rank / destination-slot
-                    // layout so the ordinary epilogue and cached handle agree.
-                    const auto remote_token = dispatch_direct_token_address(
-                        peer_buffers[dst_rank_idx], rank_idx, kNumMaxTokensPerRank,
-                        dst_slot_idx, token_layout.get_num_bytes());
-                    remote_hidden = reinterpret_cast<__gm__ uint8_t*>(remote_token);
-                    remote_metadata = reinterpret_cast<__gm__ uint8_t*>(remote_token + kNumHiddenBytes);
-                } else {
-                    remote_hidden = layout::get_sym_ptr(
-                        workspace_layout.get_common_signals(),
-                        local_slot.template get_hidden_ptr<__gm__ uint8_t>(), dst_rank_idx);
-                    remote_metadata = layout::get_sym_ptr(
-                        workspace_layout.get_common_signals(),
-                        local_slot.template get_base_ptr<__gm__ uint8_t>(true), dst_rank_idx);
-                }
+                const auto remote_hidden = get_remote_token(dst_rank_idx, ub_layout->dst_slot_idx[entry_idx]);
                 if constexpr (not kLayoutOnly)
                     asc_copy_ub2gm_align(remote_hidden, ub_hidden, 1, kNumHiddenBytes,
                                          asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
-                asc_copy_ub2gm_align(remote_metadata, ub_metadata, 1, kMetadataBytes,
+                asc_copy_ub2gm_align(remote_hidden + kNumHiddenBytes, ub_metadata, 1, kMetadataBytes,
                                      asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
             }
             asc_sync_notify(PIPE_MTE3, PIPE_MTE2, event_idx);

@@ -24,6 +24,8 @@ class DirectDispatchHostTests(unittest.TestCase):
         pointer = direct[direct.index('const auto ub_metadata ='):direct.index('            const auto event_idx =')]
         resident_start = device.index('constexpr bool kKeepMetadataInUB =')
         resident = device[resident_start:device.index('    const auto ub =', resident_start)]
+        staging = device[device.index('    const auto metadata_token_layout ='):
+                         device.index('    // Barrier before dispatch')]
         source = r'''
 #include <cassert>
 #include <cstring>
@@ -31,14 +33,17 @@ class DirectDispatchHostTests(unittest.TestCase):
 #include <deep_ep/layout/ep/token.hpp>
 using namespace deep_ep;
 ''' + layout + r'''
-template<int T, int K, bool Cached, int UB = 194560, int H = 14336, bool Direct = true, bool LayoutOnly = false>
-void check(int expected_stages, bool expected_resident) {
+template<int T, int K, bool Cached, int UB = 194560, int H = 14336, bool Direct = true,
+         bool LayoutOnly = false, int Ranks = 8, int Capacity = T * 64>
+void check(int expected_stages, bool expected_resident, bool expected_packed = false) {
     struct alignas(32) Workspace {
-        uint8_t bytes[get_dispatch_routing_workspace_bytes(8, 128, T, K)];
+        uint8_t bytes[get_dispatch_routing_workspace_bytes(Ranks, 128, T, K)];
     };
     constexpr int kNumTopk = K, kNumSFPacks = 0, kNumMaxTokensPerVecCore = T;
+    constexpr int kNumHiddenBytes = H, kNumRanks = Ranks, kNumMaxTokensPerRank = Capacity;
     constexpr bool kCachedMode = Cached, kLowLatencyTransport = Direct, kLayoutOnly = LayoutOnly;
     using Allocation = UBLayoutWithBuffer<Workspace, H, 0, K, T, UB, Cached>;
+    using ub_layout_with_buffer_t = Allocation;
     static_assert(sizeof(Allocation) <= UB);
     Allocation allocation;
     std::memset(&allocation, 0xcd, sizeof(allocation));
@@ -46,9 +51,23 @@ void check(int expected_stages, bool expected_resident) {
     constexpr auto kNumHiddenMTEStages = Allocation::kNumHiddenMTEStages;
     constexpr auto kNumMetadataMTEStages = Allocation::kNumMetadataMTEStages;
     constexpr auto kNumTokensPerMetadataMTE = Allocation::kNumTokensPerMetadataMTE;
-''' + resident + bounds + r'''
+''' + resident + staging + bounds + r'''
     assert(kNumMTEStages == expected_stages);
     assert(kKeepMetadataInUB == expected_resident);
+    assert(kPackDirectTokens == expected_packed);
+    if constexpr (kPackDirectTokens) {
+        const auto stride = layout::TokenLayout(H, 0, K, !Cached).get_num_bytes();
+        const auto base = reinterpret_cast<uint8_t*>(&ub->hidden);
+        assert(stride == kDirectTokenBytes && T * stride <= sizeof(ub->hidden));
+        for (int i = 0; i < T; ++i) {
+            const auto packet = ub_metadata_buffer.get_token_buffer(i);
+            assert(packet.template get_hidden_ptr<>() == base + i * stride);
+            assert(packet.template get_topk_idx_ptr<uint8_t>() == base + i * stride + H);
+            assert(packet.template get_topk_weights_ptr<uint8_t>() ==
+                   base + i * stride + H + (Cached ? 0 : math::align(K * 8, 32)));
+        }
+        return;
+    }
     const auto native_layout = layout::TokenLayout(0, 0, K, !Cached);
     const auto base = reinterpret_cast<uint8_t*>(ub->metadata);
     const int slots = expected_resident ? T : expected_stages;
@@ -76,6 +95,11 @@ int main() {
     check<8, 32, false, 8192, 32>(4, false);
     check<64, 8, false, 194560, 14336, false>(8, false);
     check<64, 8, true, 194560, 14336, true, true>(8, false);
+    check<1, 8, false, 194560, 14336, true, false, 16, 31>(1, true);
+    check<1, 8, false, 194560, 14336, true, false, 16, 32>(1, true, true);
+    check<4, 8, true, 194560, 14336, true, false, 16, 256>(4, true, true);
+    check<5, 8, true, 194560, 14336, true, false, 16, 257>(5, true);
+    check<4, 8, false, 32768, 14336, true, false, 16, 256>(1, true);
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
