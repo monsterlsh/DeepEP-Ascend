@@ -7,6 +7,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include <pybind11/functional.h>
@@ -17,12 +18,13 @@
 #include <deep_ep/common/reduction.hpp>
 
 #include "base.hpp"
-#include "dispatch_low_latency.hpp"
+#include "low_latency_state.hpp"
 #include "../comm/api.hpp"
 #include "../utils/tensor.hpp"
 #include "../kernels/ep/api.hpp"
 #include "../kernels/ep/low_latency_policy.hpp"
 #include "../utils/event.hpp"
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
 
 namespace deep_ep {
 
@@ -30,7 +32,21 @@ class EPBuffer: public BufferBase {
     int64_t num_buffer_bytes;
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
-    std::shared_ptr<DispatchLowLatencyState> dispatch_low_latency;
+    std::shared_ptr<EPLowLatencyState> low_latency_state;
+
+    static void record_use(const torch::Tensor& tensor, const c10_npu::NPUStream& stream) {
+        c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
+    }
+
+    static pybind11::tuple defer(std::function<pybind11::object()> epilogue) {
+        auto hook = pybind11::cpp_function([epilogue = std::move(epilogue)]() mutable {
+            // Consume before launch so a saved Python callback cannot replay an old collective.
+            auto once = std::exchange(epilogue, nullptr);
+            EP_HOST_ASSERT(once and "EP epilogue already consumed");
+            return once();
+        });
+        return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(hook));
+    }
 
 public:
     std::shared_ptr<comm::Context> context;
@@ -42,7 +58,7 @@ public:
              const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
              const bool& explicitly_destroy):
         BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes),
-        dispatch_low_latency(std::make_shared<DispatchLowLatencyState>(hccl_group_name, num_buffer_bytes)) {
+        low_latency_state(std::make_shared<EPLowLatencyState>(hccl_group_name, num_buffer_bytes)) {
         EP_HOST_ASSERT(num_buffer_bytes >= 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         EP_HOST_ASSERT(num_lb_buffer_bytes >= 0 and num_lb_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         context = std::make_shared<comm::Context>(
@@ -51,7 +67,7 @@ public:
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_common_signals(&workspace.common_signals);
-        dispatch_low_latency->initialize(*context);
+        low_latency_state->initialize(*context);
         lb_storage = torch::from_blob(
             context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
             torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
@@ -69,8 +85,9 @@ public:
 
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
+        low_latency_state->require_idle();
         comm::barrier(*context, true);
-        dispatch_low_latency->close();
+        low_latency_state->close();
         ACL_CHECK(aclrtHostUnregister(host_workspace));
         ACL_CHECK(aclrtFreeHost(host_workspace));
         context->finalize();
@@ -119,6 +136,7 @@ public:
         EP_HOST_ASSERT(not destroyed);
 
         // Ascend EP has some limitations over NVIDIA version
+        EP_HOST_ASSERT(not defer_epilogue or async_with_compute_stream);
         EP_HOST_ASSERT(do_expand);
         EP_HOST_ASSERT(not do_handle_copy);
 
@@ -252,7 +270,7 @@ public:
         }
 
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
-        const auto ll_launch = dispatch_low_latency->prepare(
+        const auto ll_launch = low_latency_state->prepare_dispatch(
             *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
             num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue);
         if (ll_launch and previous_event)
@@ -268,8 +286,8 @@ public:
         }
 
         // Launch dispatch
-        dispatch_low_latency->begin(ll_launch);
-        const auto ll_failure_guard = dispatch_low_latency->failure_guard();
+        low_latency_state->begin(ll_launch);
+        const auto ll_failure_guard = low_latency_state->failure_guard();
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr(), topk_weights_ptr,
                         metadata_send_buffer.data_ptr(),
@@ -300,8 +318,8 @@ public:
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
-                         ll_launch = ll_launch, dispatch_low_latency = dispatch_low_latency]() {
-            const auto ll_failure_guard = dispatch_low_latency->failure_guard();
+                         ll_launch = ll_launch, low_latency_state = low_latency_state]() {
+            const auto ll_failure_guard = low_latency_state->failure_guard();
             // Wait GPU notify or reuse cached allocation sizes
             int num_recv_tokens = context->num_ranks * num_max_tokens_per_rank;
             int num_expanded_tokens = 0;
@@ -398,7 +416,7 @@ public:
             if (recv_sf.has_value() and use_cube_aligned_col_major_sf)
                 recv_sf = recv_sf->transpose(0, 1).contiguous().transpose(0, 1);
 
-            dispatch_low_latency->record_completion();
+            low_latency_state->record_completion();
 
             return pybind11::make_tuple(
                 recv_x, recv_sf, recv_topk_weights,
@@ -414,12 +432,8 @@ public:
         };
 
         // Defer epilogue and host sync
-        if (defer_epilogue) {
-            EP_HOST_ASSERT(async_with_compute_stream);
-            std::function<pybind11::object()> epilogue_hook = std::move(epilogue);
-            return pybind11::make_tuple(
-                pybind11::none(), std::optional<EventHandle>(EventHandle()), epilogue_hook);
-        }
+        if (defer_epilogue)
+            return defer(std::move(epilogue));
 
         // Do epilogue immediately
         const auto result = epilogue();
@@ -444,6 +458,7 @@ public:
             const bool& allocate_on_comm_stream,
             const bool& defer_epilogue) const {
         EP_HOST_ASSERT(not destroyed);
+        EP_HOST_ASSERT(not defer_epilogue or async_with_compute_stream);
         EP_HOST_ASSERT(num_experts % context->num_ranks == 0);
 
         // Check data tensor
@@ -500,24 +515,41 @@ public:
         EP_HOST_ASSERT(get_combine_buffer_size(
             context->num_ranks, num_max_tokens_per_rank, hidden, num_topk) <= num_buffer_bytes);
 
-        const auto token_layout = get_combine_token_layout(
-            hidden * static_cast<int>(sizeof(uint16_t)), num_topk);
-        const auto send_buffer = torch::empty(
-            {num_reduced_tokens, token_layout.get_num_bytes()}, x.options().dtype(torch::kByte));
-
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
-        const auto low_latency_transport = low_latency_transport_enabled() and
+        const bool mte_enabled = low_latency_transport_enabled();
+        // All peers must select the same receive arena, even when one rank has zero input tokens.
+        const bool shmem_shape = mte_enabled and num_sms == 32 and
+            mte_workload_fits(true, context->num_ranks, num_max_tokens_per_rank, num_max_tokens_per_rank,
+                              hidden, num_topk, num_experts, mte_bs_threshold_override());
+        const auto ll_launch = low_latency_state->prepare_combine(*context, x, shmem_shape);
+        if (ll_launch and previous_event)
+            previous_event->current_stream_wait();
+        const bool low_latency_transport = ll_launch or (mte_enabled and
             prefer_low_latency_transport_runtime(true, runtime->get_npu_arch(), context->num_ranks, num_combined_tokens,
                                                  num_max_tokens_per_rank, hidden, num_topk, num_experts,
-                                                 num_used_vec_cores, false, num_ub_bytes);
+                                                 num_used_vec_cores, false, num_ub_bytes));
+        torch::Tensor send_buffer;
+        if (not low_latency_transport) {
+            const auto token_layout = get_combine_token_layout(hidden * static_cast<int>(sizeof(uint16_t)), num_topk);
+            send_buffer = torch::empty({num_reduced_tokens, token_layout.get_num_bytes()}, x.options().dtype(torch::kByte));
+        }
+        // Direct JIT launches bypass Torch's allocator stream tracking.
+        const auto issue_stream = c10_npu::getCurrentNPUStream();
+        record_use(x, issue_stream);
+        record_use(src_metadata, issue_stream);
+        record_use(psum_num_recv_tokens_per_rank, issue_stream);
+        if (topk_weights)
+            record_use(*topk_weights, issue_stream);
+        low_latency_state->begin(ll_launch);
+        const auto ll_failure_guard = low_latency_state->failure_guard();
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights_ptr,
             src_metadata.data_ptr<int>(),
             psum_num_recv_tokens_per_rank.data_ptr<int>(),
-            context->buffer,
-            send_buffer.data_ptr(),
+            ll_launch ? ll_launch->buffer() : context->buffer,
+            send_buffer.defined() ? send_buffer.data_ptr() : nullptr,
             context->workspace,
             context->hccl_context->jetty_device_ptrs,
             context->rank_idx, context->num_ranks,
@@ -527,12 +559,25 @@ public:
             num_ub_bytes,
             num_used_vec_cores,
             context->num_gpu_timeout_cycles,
-            barrier_in_prologue, low_latency_transport
+            barrier_in_prologue, low_latency_transport,
+            ll_launch ? ll_launch->peer_buffers.data_ptr() : nullptr
         );
 
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
-        auto epilogue = [=, x = x, send_buffer = send_buffer, context = context]() {
+        auto epilogue = [=, x = x, send_buffer = send_buffer, context = context,
+                         ll_launch = ll_launch, low_latency_state = low_latency_state]() {
+            const auto ll_failure_guard = low_latency_state->failure_guard();
+            const auto reduce_stream = c10_npu::getCurrentNPUStream();
+            record_use(combined_topk_idx, reduce_stream);
+            if (bias_0)
+                record_use(*bias_0, reduce_stream);
+            if (bias_1)
+                record_use(*bias_1, reduce_stream);
+            if (send_buffer.defined() and reduce_stream != issue_stream) {
+                record_use(x, reduce_stream);
+                record_use(send_buffer, reduce_stream);
+            }
             // Allocate output tensors
             auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
             auto combined_topk_weights = std::optional<torch::Tensor>();
@@ -563,16 +608,13 @@ public:
                 not barrier_in_prologue
             );
 
+            low_latency_state->record_completion();
             return pybind11::make_tuple(combined_x, combined_topk_weights);
         };
 
         // Defer epilogue
-        if (defer_epilogue) {
-            EP_HOST_ASSERT(async_with_compute_stream);
-            std::function<pybind11::object()> epilogue_hook = std::move(epilogue);
-            return pybind11::make_tuple(
-                pybind11::none(), std::optional<EventHandle>(EventHandle()), epilogue_hook);
-        }
+        if (defer_epilogue)
+            return defer(std::move(epilogue));
 
         // Do epilogue immediately
         const auto result = epilogue();

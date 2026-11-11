@@ -84,6 +84,31 @@ class SummaryTests(unittest.TestCase):
         self.assertTrue(result['accepted'])
         self.assertEqual(result['path_status'], 'verified')
 
+    def test_shmem_combine_acceptance_on_every_rank(self):
+        from compat_trace import verify_kernel_records
+        from test_compat_trace import COMBINE_SHMEM, COMBINE_MTE
+
+        def write_transport(rank, symbol, claimed=None):
+            rows = records(rank, plan=('small',), verified=True)
+            combine = rows[2]['operations'][1]
+            proof = verify_kernel_records([dict(name=symbol, device_id=str(rank), stream_id='1')], 'combine')
+            combine.update(proof, expected_transport=['mte', 'shmem'])
+            if claimed:
+                combine['actual_transport'] = claimed
+                combine['kernel_parameters'][symbol]['transport'] = claimed
+            self.write(rank, rows)
+
+        for rank in range(2):
+            write_transport(rank, COMBINE_MTE)
+        self.assertTrue(summarize(self.root, require_paths=True)['accepted'])
+        self.assertFalse(summarize(self.root, require_shmem_combine=True)['accepted'])
+        write_transport(1, COMBINE_SHMEM)
+        self.assertFalse(summarize(self.root, require_paths=True)['accepted'])
+        write_transport(0, COMBINE_SHMEM)
+        self.assertTrue(summarize(self.root, require_shmem_combine=True)['accepted'])
+        write_transport(0, COMBINE_MTE, claimed='shmem')
+        self.assertFalse(summarize(self.root, require_shmem_combine=True)['accepted'])
+
     def test_ll_pipeline_is_rechecked_from_embedded_device_records(self):
         from compat_trace import verify_kernel_records
         from test_compat_trace import ll_records

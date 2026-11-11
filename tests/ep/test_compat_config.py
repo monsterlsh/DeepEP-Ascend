@@ -176,7 +176,7 @@ class ReportingTests(unittest.TestCase):
                         record = config.configure_backend(backend, env)
                         self.assertEqual(env, expected)
                         self.assertEqual(record['transport_override'], expected.get(config.TRANSPORT_ENV))
-                        self.assertEqual(record['transport_override_scope'], 'combine_mte_only')
+                        self.assertEqual(record['transport_override_scope'], 'combine_mte_and_shmem')
                         self.assertEqual(record['dispatch_path_assertion'], 'observe_complete_pipeline')
                         self.assertFalse(record['requires_official_build'])
                     inherited = {config.TRANSPORT_ENV: 'stale', 'KEEP': 'value'}

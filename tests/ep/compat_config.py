@@ -190,7 +190,7 @@ def configure_backend(backend, environ=None):
     return {
         'backend': backend,
         'transport_override': target.get(TRANSPORT_ENV),
-        'transport_override_scope': 'combine_mte_only' if backend != 'official' else 'unchanged',
+        'transport_override_scope': 'combine_mte_and_shmem' if backend != 'official' else 'unchanged',
         'dispatch_path_assertion': 'observe_complete_pipeline' if backend != 'official' else 'official_urma',
         'requires_official_build': backend == 'official',
     }

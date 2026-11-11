@@ -171,11 +171,12 @@ void load_combine_peers(__ubuf__ handle::HcommPeerInfo* peers, __gm__ void* jett
 
 template <int kNumRanks, int kNumTopk, int kHidden, int kNumMaxTokensPerRank, int kNumVecCores,
           int64_t kNumTimeoutCycles, int kNumUbBytes,
-          bool kDoBarrier = false, bool kHasTopkWeights = true, bool kLowLatencyTransport = false>
+          bool kDoBarrier = false, bool kHasTopkWeights = true, bool kLowLatencyTransport = false,
+          bool kShmemTransport = false>
 __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk_weights, __gm__ int* src_metadata,
                                         __gm__ int* psum_num_recv_tokens_per_rank, __gm__ uint8_t* combine_recv_buffer,
                                         __gm__ uint8_t* send_buffer, __gm__ void* workspace, __gm__ void* jetty_ptrs,
-                                        const int rank_idx) {
+                                        const int rank_idx, __gm__ const uint64_t* peer_buffers) {
     AscendC::InitSocState();
 
     constexpr auto kNumTokensPerTask = 8;
@@ -183,6 +184,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
     constexpr auto kNumTasksPerDoorbell = 8;
 
     EP_STATIC_ASSERT(math::is_power_of_2(kNumTasksPerDoorbell));
+    EP_STATIC_ASSERT(not kShmemTransport or kLowLatencyTransport);
 
     using UBLayout = CombineUBLayout<kNumRanks, kNumTopk, kHidden, kNumTokensPerTask, kNumStages, kNumUbBytes,
                                     kLowLatencyTransport>;
@@ -210,7 +212,8 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
 
     const auto topk_weight_u32 = reinterpret_cast<__gm__ uint32_t*>(topk_weights);
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
-    const auto combine_recv_buffer_offset = reinterpret_cast<uint64_t>(combine_recv_buffer) - reinterpret_cast<uint64_t>(workspace);
+    const auto combine_recv_buffer_offset = kUseRemoteQueue ?
+        reinterpret_cast<uint64_t>(combine_recv_buffer) - reinterpret_cast<uint64_t>(workspace) : 0;
     auto& signals = *static_cast<__gm__ layout::EPSignals*>(workspace);
 
     EP_STATIC_ASSERT(sizeof(UBLayout) <= kNumUbBytes, "Combine task stages and hidden ring exceed UB capacity");
@@ -316,6 +319,11 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
             asc_sync_notify(PIPE_V, PIPE_MTE3, event_idx);
             asc_sync_wait(PIPE_V, PIPE_MTE3, event_idx);
         }
+        auto task_recv_buffer = combine_recv_buffer;
+        if constexpr (kShmemTransport)
+            task_recv_buffer = reinterpret_cast<__gm__ uint8_t*>(peer_buffers[current_task.rank_idx]);
+        else if constexpr (kLowLatencyTransport)
+            task_recv_buffer = layout::get_sym_ptr(signals.common_signals, combine_recv_buffer, current_task.rank_idx);
         for (int token_idx = 0; token_idx < num_stage_tokens; ++ token_idx) {
             const auto meta = ub->metadata[stage_idx][token_idx];
             __gm__ uint8_t* output;
@@ -323,9 +331,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
                 const auto src_token_idx = meta[kNumTopk] - current_task.rank_idx * kNumMaxTokensPerRank;
                 const auto subslot_idx = kNumRanks < kNumTopk ? rank_idx : meta[kNumTopk + 1];
                 const auto combine_slot_idx = subslot_idx * kNumMaxTokensPerRank + src_token_idx;
-                output = combine_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes;
-                if constexpr (kLowLatencyTransport)
-                    output = layout::get_sym_ptr(signals.common_signals, output, current_task.rank_idx);
+                output = task_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes;
             } else {
                 const auto recv_slot_idx = current_task.rank_slot_idx + token_idx * kNumVecCores;
                 output = send_buffer + static_cast<int64_t>(recv_slot_idx) * kNumTokenBytes;

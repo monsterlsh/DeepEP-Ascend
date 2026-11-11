@@ -9,7 +9,7 @@
 | `--backend` | 实际要求 | 环境开关 |
 | --- | --- | --- |
 | `official` | 独立安装/加载选定的 main 基线；使用 `--expected-source-commit` 核验 | 不修改诊断开关 |
-| `candidate-disabled` | 安装/加载候选版本；名称保留供旧命令使用 | 设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1`，仅关闭 combine 的 native MTE；dispatch LL 仍可能启用。移除 `EP_MTE_BS_THRESHOLD` |
+| `candidate-disabled` | 安装/加载候选版本 | 设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1`，combine 使用 URMA，dispatch LL 仍可能启用。移除 `EP_MTE_BS_THRESHOLD` |
 | `candidate-auto` | 安装/加载候选版本 | 移除上述两个开关，验证默认策略 |
 
 测试记录实际导入的 `deep_ep` 路径、扩展二进制 SHA256、可获取的源码 commit/工作区状态、Python/Torch/torch_npu、相关运行文件及测试工具哈希。`--build-label` 只是人工标签。`--expected-source-commit` 从实际导入包所在 Git 仓核验；无可核验源码时会报错，不会把标签当作验证结果。
@@ -70,7 +70,9 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 | `--profile-paths` | 每个操作采集真实设备 kernel 证据；默认关闭并明确标记 unverified |
 | `--output-dir` | 每 rank 独占创建日志，已有文件拒绝覆盖；三个 backend 和每次复跑使用不同目录 |
 
-测试固定 H7168/K8/E128，生产规模为 EP8/16/32/64/128。候选 BF16 dispatch 的选择取决于共同 M、SHMEM 可用性和真实 UB/arena 限制；测试不再用旧的逐 rank MTE 阈值判定成功或失败。combine 仍检查当前原生策略：EP8/16/128 的 B 阈值为60/17/32，EP32/64 为 URMA。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示；这是测试数据限制，不是库容量限制。
+测试固定 H7168/K8/E128，生产规模为 EP8/16/32/64/128。候选 BF16 dispatch 的选择取决于共同 M、SHMEM 可用性和真实 UB/arena 限制。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示。
+
+combine 在 EP8、EP16、EP128 的默认阈值依次是 60、17、32。支持的设备上，共同容量 M 落在阈值内且全组具备 SHMEM 资源时，每个 rank 使用同一个 SHMEM 接收区协议，包括 B=0 的 rank。回退时每个 rank 用其原始 B 判断 native MTE 或 URMA。EP32 和 EP64 使用 URMA。当前候选 combine 的第 11 个模板参数 `kShmemTransport` 标识 SHMEM 特化。trace 从设备符号区分 `shmem`、`mte` 和 `urma`，也识别历史候选与官方符号。
 
 当前 dispatch 使用 14 个显式模板参数。第 14 项 `low_latency_transport` 为 true 时，内核直接传输 hidden 和 metadata，trace 记为 `actual_transport=mte`；为 false 时记为 `urma`。SHMEM peer 地址表在运行时传入；确认内存来自 SHMEM 还需要对应调用的 arena 选路证据。
 
@@ -121,6 +123,16 @@ python tests/ep/test_ep_auto_compat.py \
 ```
 
 上述入口由节点数与 `--num-processes` 共同决定全局 EP，不能把全局 EP 直接作为单节点进程数。再单独使用 `--edge-routes only` 验证空 rank、不同 B、masked 和重复专家；dispatch 使用共同 M，不按本 rank 的 B 推断独立选路。保留实际设备证据。
+
+在支持 SHMEM 的单节点 EP8 设备上，可用 B=M=2 强制验收 combine 的设备路径。汇总命令要求每个 rank 的每次 combine 都有 SHMEM 内核证据，回退会使该命令退出失败。
+
+```bash
+python tests/ep/test_ep_auto_compat.py \
+  --backend candidate-auto --num-processes 8 --bs 2 --capacity 2 --capacity-mode batch \
+  --dtype bf16 --cpu-sync false --alignment 1 --deferred false --deterministic false \
+  --route random --edge-routes off --profile-paths --output-dir /tmp/ep-shmem-combine-01
+python tests/ep/summarize_compat.py --input-dir /tmp/ep-shmem-combine-01 --require-shmem-combine
+```
 
 FP8 payload 和非单位 scales 用于检查通信字节、stride、padding 及缓存更新；合成专家函数用可精确表示的 FP8 值生成 BF16 输出。该用例不模拟完整模型的反量化/GEMM 性能。combine 同时检查调用者已乘权和未乘权的专家输出，权重回传不能再次改变 hidden。
 

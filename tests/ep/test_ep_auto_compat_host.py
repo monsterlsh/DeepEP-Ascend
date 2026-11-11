@@ -13,6 +13,21 @@ from compat_config import parse_args, plan_cases
 
 
 class ContractTests(unittest.TestCase):
+    def test_shmem_combine_uses_group_capacity_with_optional_native_fallback(self):
+        runtime = dict(arch=3510, num_vec_cores=64, num_ai_cores=32)
+        case = dict(rank_bs=[0, 2] * 4, M=2)
+        self.assertEqual(suite.expected_transport('combine', case, 0, 'candidate-auto', runtime),
+                         ['urma', 'shmem'])
+        self.assertEqual(suite.expected_transport('combine', case, 1, 'candidate-auto', runtime),
+                         ['mte', 'shmem'])
+        for m, expected in ((60, ['mte', 'shmem']), (61, 'mte'), (257, 'urma')):
+            self.assertEqual(suite.expected_transport('combine', case, 1, 'candidate-auto', runtime,
+                                                      capacity=m), expected)
+        for backend in ('candidate-disabled', 'official'):
+            self.assertEqual(suite.expected_transport('combine', case, 1, backend, runtime), 'urma')
+        fewer_cores = dict(runtime, num_ai_cores=16)
+        self.assertEqual(suite.expected_transport('combine', case, 1, 'candidate-auto', fewer_cores), 'mte')
+
     def test_both_versions_have_no_public_experiment_markers(self):
         for backend in ('official', 'candidate-auto', 'candidate-disabled'):
             for attribute in ('low_latency_mode', 'is_low_latency'):

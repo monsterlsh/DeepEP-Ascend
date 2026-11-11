@@ -105,7 +105,7 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues; automatic SHMEM LL dispatch with native fallback |
+| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and automatic SHMEM transport for eligible decode dispatch and combine |
 | `DecodeBuffer` | BF16 convenience wrapper over one `EPBuffer`; exposes received routing weights and leaves weighting to the expert computation |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
@@ -244,7 +244,7 @@ Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on 
 native URMA using the group size, per-rank capacity and dispatch mode.
 No additional constructor or dispatch argument is needed. Both paths return
 the standard weights, counts, handle and deferred event results. Cached
-dispatch and the existing combine implementation use the same native metadata.
+dispatch and combine use the same native routing metadata.
 
 The LL path reuses native routing and deduplicates each token by destination
 rank. MTE writes payload and metadata directly into a SHMEM buffer with the
@@ -272,17 +272,26 @@ Build with `SHMEM_ROOT=/path/to/shmem/install/shmem` to enable the backend.
 The SDK headers must match the pinned SHMEM revision
 `4dd80e2129da42bd773982c2bb3758af1ed0bba8`. The wheel records SDK header and
 library hashes in `deep_ep/shmem-sdk.json`. Without the SDK the standard build
-remains available and dispatch uses the native path. SHMEM owns one 32-GiB
-heap per process, shared by same-group arenas; each LL buffer reserves its
-configured native buffer size. Unsupported or unavailable resources select native before launch.
+uses native transport. SHMEM owns one 32-GiB heap per process. Eligible
+dispatch and combine calls on one EPBuffer share a single arena sized to its
+configured buffer capacity. Unsupported or unavailable resources select native before launch.
 Initialization or communication failure is reported, never retried with a
 different protocol.
 
-Combine is unchanged. Its existing MTE policy remains BF16/H7168/K8/E128,
-capacity at most 256, and at most 60/17/32 tokens for EP8/16/128 respectively;
-other cases use URMA. The existing `EP_DISABLE_LOW_LATENCY_TRANSPORT` and
-`EP_MTE_BS_THRESHOLD` controls apply to that native transport policy, not to
-SHMEM LL dispatch.
+For BF16 combine with hidden size 7168, top-8 routing and 128 experts, an
+eligible A5 group using 64 vector cores can write partial sums directly to
+the original token owner's SHMEM arena. The reduce epilogue reads those slots
+using the dispatch handle. This also works with a handle from native dispatch.
+Every rank uses the handle's common `num_max_tokens_per_rank` for admission,
+including ranks with zero local tokens. The initial capacity cutoffs come
+from the native combine MTE policy (EP8 up to 60, EP16 up to 17, EP128 up to
+32). Native fallback selects MTE or URMA using the local token count as before.
+
+Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to use URMA for combine, or
+`EP_MTE_BS_THRESHOLD` to override the combine cutoff on a supported EP size
+(maximum capacity 256). Set these options identically on every rank.
+Complete a deferred epilogue with `event.current_stream_wait()` before
+issuing the next operation on the same buffer or destroying it.
 
 Dispatch returns routing weights as metadata. Apply them once in the expert
 computation. Combine sums expert outputs; its optional `topk_weights` argument

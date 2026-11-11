@@ -34,7 +34,7 @@ static bool reject_peer = false, mismatch_size = false, fail_init = false, fail_
 static bool fail_uid = false, fail_attr = false, low_memory = false, fail_collective = false;
 static bool fail_finalize = false, fail_wait = false, mismatch_close = false;
 static bool remote_init_failure = false;
-static bool remote_capability_missing = false;
+static uint16_t remote_capabilities = UINT16_MAX;
 static int allocation_count = 0, barrier_count = 0;
 static size_t configured_heap = 0;
 static std::vector<void*> allocations;
@@ -101,8 +101,8 @@ int HcclAllGather(void* send, void* receive, uint64_t count, int, HcclComm, aclr
     const auto bytes = count * sizeof(uint16_t);
     std::memcpy(receive, send, bytes);
     std::memcpy(static_cast<char*>(receive) + bytes, send, bytes);
-    if (bytes == sizeof(uint16_t) and remote_capability_missing)
-        static_cast<uint16_t*>(receive)[1] = 0;
+    if (bytes == sizeof(uint16_t))
+        static_cast<uint16_t*>(receive)[1] &= remote_capabilities;
     if (bytes == 9 * sizeof(uint64_t)) {
         auto* other = reinterpret_cast<uint64_t*>(static_cast<char*>(receive) + bytes);
         if (reject_peer)
@@ -200,12 +200,13 @@ int main(int argc, char** argv) {
         auto comm = reinterpret_cast<HcclComm>(2);
         if (name == "capability_error") {
             fail_collective = true;
-            throws([&] { ShmemArena::agree_capability(comm, 2, 120, true); });
+            throws([&] { ShmemArena::agree_capabilities(comm, 2, 120, 3); });
         } else {
-            remote_capability_missing = name == "mixed_capability";
-            assert(ShmemArena::agree_capability(comm, 2, 120, true) == not remote_capability_missing);
-            assert(not ShmemArena::agree_capability(comm, 2, 120, false));
-            assert(not ShmemArena::agree_capability(comm, 2, 7200, true));
+            remote_capabilities = name == "mixed_capability" ? 1 : 3;
+            assert(ShmemArena::agree_capabilities(comm, 2, 120, 3) == remote_capabilities);
+            assert(ShmemArena::agree_capabilities(comm, 2, 120, 2) == (2 & remote_capabilities));
+            assert(ShmemArena::agree_capabilities(comm, 2, 120, 0) == 0);
+            assert(ShmemArena::agree_capabilities(comm, 2, 7200, 3) == 0);
         }
         assert(init_count == 0 and allocation_count == 0 and finalize_count == 0);
         std::cout << name << " passed\n";

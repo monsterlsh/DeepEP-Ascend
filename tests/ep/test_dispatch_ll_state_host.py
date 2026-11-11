@@ -9,7 +9,7 @@ import unittest
 
 from _host_test_helpers import ROOT, run_host_cpp
 
-HEADER = ROOT / 'csrc/buffers/dispatch_low_latency.hpp'
+HEADER = ROOT / 'csrc/buffers/low_latency_state.hpp'
 
 
 def host_test_source():
@@ -33,7 +33,7 @@ def host_test_source():
 namespace mock {
 std::vector<std::string> events;
 int stream = 0, copies = 0, allocation_count = 0;
-int arch = 3510, cores = 64, ub_bytes = 256 * 1024;
+int arch = 3510, cores = 64, vec_per_ai = 2, ub_bytes = 256 * 1024;
 int fail_allocation = -1, fail_copy = -1;
 bool event_failure = false, wait_failure = false;
 void note(const std::string& value) { events.push_back(value); }
@@ -41,7 +41,7 @@ void reset() {
     events.clear(); stream = 0; copies = allocation_count = 0;
     fail_allocation = fail_copy = -1;
     event_failure = wait_failure = false;
-    arch = 3510; cores = 64; ub_bytes = 256 * 1024;
+    arch = 3510; cores = 64; vec_per_ai = 2; ub_bytes = 256 * 1024;
 }
 }
 #define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while (0)
@@ -83,6 +83,7 @@ namespace deep_ep {
 struct FakeRuntime {
     int get_npu_arch() const { return mock::arch; }
     int get_num_vec_cores() const { return mock::cores; }
+    int get_num_vec_cores_per_ai_core() const { return mock::vec_per_ai; }
     int get_num_ubuf_bytes_per_vec_core() const { return mock::ub_bytes; }
 } runtime_value;
 auto runtime = &runtime_value;
@@ -105,7 +106,8 @@ struct Context {
 };
 class ShmemArena {
 public:
-    inline static bool supported = true, all_capable = true;
+    inline static bool supported = true;
+    inline static uint16_t peer_capabilities = 3;
     inline static bool session_failed = false;
     inline static int failure_marks = 0;
     inline static int result = 1, attempts = 0, closes = 0, agreements = 0, peer_reads = 0;
@@ -115,7 +117,7 @@ public:
     bool closed = false;
     int rank = 0;
     static bool compiled() { return supported; }
-    static bool agree_capability(void*, int, int, bool local) { ++agreements; return all_capable && local; }
+    static uint16_t agree_capabilities(void*, int, int, uint16_t local) { ++agreements; return local & peer_capabilities; }
     static std::shared_ptr<ShmemArena> try_create(const std::string& group, int rank, int world, int64_t bytes, int timeout) {
         assert(group == "group" && world == 8 && timeout == 300);
         requested_bytes = bytes; ++attempts; mock::note("arena");
@@ -136,7 +138,7 @@ public:
     void mark_failed() noexcept { session_failed = true; ++failure_marks; }
     void close() { check_available(); ++closes; closed = true; mock::note("close"); }
     static void reset() {
-        supported = all_capable = true; session_failed = false;
+        supported = true; peer_capabilities = 3; session_failed = false;
         result = 1; attempts = closes = failure_marks = agreements = peer_reads = 0;
         bad_peer = -1; peer_misalignment = 0; requested_bytes = 0;
     }
@@ -146,7 +148,7 @@ public:
 '''
     production = re.sub(r'^#(?:include|pragma).*\n', '', HEADER.read_text(), flags=re.M)
     harness = r'''
-using deep_ep::DispatchLowLatencyState;
+using deep_ep::EPLowLatencyState;
 using deep_ep::comm::ShmemArena;
 constexpr int64_t buffer_bytes = 1LL << 30;
 int cases = 0;
@@ -159,20 +161,20 @@ template<class F> void rejects(F fn, const std::string& message) {
     assert(caught);
 }
 auto input() { return torch::empty({2,128}, {}); }
-auto prepare(DispatchLowLatencyState& state, const deep_ep::comm::Context& context,
+auto prepare(EPLowLatencyState& state, const deep_ep::comm::Context& context,
              const torch::Tensor& x, bool fp8 = false) {
-    return state.prepare(context, x, 2, 128, 1, 8, 64, 256*1024, fp8, false, false);
+    return state.prepare_dispatch(context, x, 2, 128, 1, 8, 64, 256*1024, fp8, false, false);
 }
 void check_capability_and_cached_refusal() {
     for (int mode=0; mode<6; ++mode) {
         reset();
         if (mode==0) ShmemArena::supported=false;
-        if (mode==1) ShmemArena::all_capable=false;
+        if (mode==1) ShmemArena::peer_capabilities=0;
         if (mode==2) ShmemArena::result=0;
         if (mode==3) mock::arch=3500;
         if (mode==4) mock::cores=15;
         if (mode==5) mock::ub_bytes=0;
-        DispatchLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
+        EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
         state.initialize(ctx); auto x=input();
         assert(!prepare(state,ctx,x)); assert(!prepare(state,ctx,x));
         assert(ShmemArena::agreements==1);
@@ -185,10 +187,10 @@ void check_capacity_gate() {
     reset(); deep_ep::comm::Context ctx; auto x=input();
     const auto plan=deep_ep::get_dispatch_low_latency_plan(3510,8,2,128,1,8,64,256*1024,false);
     assert(plan && plan->buffer_bytes>0);
-    DispatchLowLatencyState short_buffer("group",plan->buffer_bytes-1);
+    EPLowLatencyState short_buffer("group",plan->buffer_bytes-1);
     short_buffer.initialize(ctx);
     assert(!prepare(short_buffer,ctx,x)); assert(ShmemArena::attempts==0);
-    DispatchLowLatencyState exact_buffer("group",plan->buffer_bytes);
+    EPLowLatencyState exact_buffer("group",plan->buffer_bytes);
     exact_buffer.initialize(ctx); auto launch=prepare(exact_buffer,ctx,x);
     assert(launch && ShmemArena::requested_bytes==plan->buffer_bytes);
     exact_buffer.close(); ++cases;
@@ -198,11 +200,11 @@ void check_group_capacity_and_transport_switch() {
     for (int rank = 0; rank < ctx.num_ranks; ++ rank) {
         reset();
         ctx.rank_idx = rank;
-        DispatchLowLatencyState state("group", buffer_bytes);
+        EPLowLatencyState state("group", buffer_bytes);
         state.initialize(ctx);
         const auto batch = [&](int capacity, bool cached) {
             const auto x = torch::empty({capacity - rank, 7168}, {});
-            return state.prepare(ctx, x, capacity, 7168, 8, 128, 64, 256 * 1024, false, cached, false);
+            return state.prepare_dispatch(ctx, x, capacity, 7168, 8, 128, 64, 256 * 1024, false, cached, false);
         };
         assert(not batch(17, false));
         assert(ShmemArena::attempts == 0);
@@ -231,7 +233,7 @@ void check_group_capacity_and_transport_switch() {
     ++ cases;
 }
 void check_pending_and_cross_stream() {
-    reset(); DispatchLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
+    reset(); EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
     state.initialize(ctx); auto x=input(); auto launch=prepare(state,ctx,x);
     assert(launch && ShmemArena::requested_bytes==buffer_bytes);
     assert(mock::copies==1 && ShmemArena::peer_reads==ctx.num_ranks);
@@ -245,7 +247,7 @@ void check_pending_and_cross_stream() {
     }
     const auto allocations=mock::allocation_count;
     state.begin(launch);
-    std::weak_ptr<deep_ep::DispatchLowLatencyLaunch> weak=launch;
+    std::weak_ptr<deep_ep::EPLowLatencyLaunch> weak=launch;
     launch.reset(); assert(!weak.expired());
     const auto before_reject=mock::events.size();
     rejects([&] { prepare(state,ctx,x); },"outstanding");
@@ -265,9 +267,122 @@ void check_pending_and_cross_stream() {
     state.record_completion(); state.close(); assert(ShmemArena::closes==1);
     state.close(); assert(ShmemArena::closes==1); ++cases;
 }
+void check_combine_then_dispatch() {
+    reset(); deep_ep::comm::Context ctx; auto x=input();
+    EPLowLatencyState state("group", buffer_bytes);
+    state.initialize(ctx);
+    auto native = state.prepare_combine(ctx, x, false);
+    assert(!native && ShmemArena::attempts == 0);
+    state.begin(native);
+    rejects([&] { state.prepare_combine(ctx, x, true); }, "outstanding");
+    rejects([&] { prepare(state, ctx, x); }, "outstanding");
+    rejects([&] { state.close(); }, "outstanding");
+    assert(!ShmemArena::session_failed && ShmemArena::attempts == 0);
+    mock::stream = 1;
+    state.record_completion();
+    assert(mock::events.back() == "record:1");
+
+    mock::stream = 2;
+    mock::events.clear();
+    auto first = state.prepare_combine(ctx, x, true);
+    assert(first && mock::events.front() == "wait:1->2");
+    const auto arena = first->arena;
+    const auto table = first->peer_buffers.storage;
+    state.begin(first);
+    std::weak_ptr<deep_ep::EPLowLatencyLaunch> held = first;
+    first.reset();
+    assert(!held.expired());
+    rejects([&] { prepare(state, ctx, x); }, "outstanding");
+    rejects([&] { state.close(); }, "outstanding");
+    assert(ShmemArena::closes == 0);
+    mock::stream = 3;
+    state.record_completion();
+    assert(held.expired() && mock::events.back() == "record:3");
+
+    mock::stream = 4;
+    auto dispatch = prepare(state, ctx, x);
+    assert(dispatch && mock::events.back() == "wait:3->4");
+    assert(dispatch->arena == arena && dispatch->peer_buffers.storage == table);
+    state.begin(dispatch);
+    state.record_completion();
+    mock::stream = 5;
+    native = state.prepare_combine(ctx, x, false);
+    assert(!native && mock::events.back() == "wait:4->5");
+    state.begin(native);
+    state.record_completion();
+    mock::stream = 6;
+    auto repeated = state.prepare_combine(ctx, x, true);
+    assert(repeated && mock::events.back() == "wait:5->6");
+    assert(repeated->arena == arena && repeated->peer_buffers.storage == table);
+    assert(ShmemArena::agreements == 1 && ShmemArena::attempts == 1 && mock::copies == 1);
+    state.begin(repeated);
+    state.record_completion();
+    state.close();
+    assert(ShmemArena::closes == 1);
+    ++cases;
+}
+void check_combine_admission() {
+    for (int mode = 0; mode < 7; ++mode) {
+        reset(); deep_ep::comm::Context ctx; auto x=input();
+        EPLowLatencyState state("group", buffer_bytes);
+        if (mode == 0) mock::arch = 3500;
+        if (mode == 1) mock::cores = 63;
+        if (mode == 2) mock::ub_bytes = 190 * 1024 - 1;
+        if (mode == 3) ShmemArena::peer_capabilities = 1;
+        if (mode == 4) mock::vec_per_ai = 1;
+        if (mode == 5) ShmemArena::result = 0;
+        if (mode == 6) mock::ub_bytes = 190 * 1024;
+        state.initialize(ctx);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            auto launch = state.prepare_combine(ctx, x, true);
+            assert(bool(launch) == (mode == 6));
+            state.begin(launch);
+            mock::events.clear();
+            state.record_completion();
+            if (mode == 0 || mode == 5) assert(mock::events.empty());
+        }
+        assert(ShmemArena::agreements == 1 && ShmemArena::attempts == (mode >= 5 ? 1 : 0));
+        assert(mock::copies == (mode == 6 ? 1 : 0));
+        if (mode >= 1 && mode <= 4) {
+            auto dispatch = prepare(state, ctx, x);
+            assert(dispatch && ShmemArena::attempts == 1);
+            state.begin(dispatch);
+            state.record_completion();
+            assert(!state.prepare_combine(ctx, x, true));
+        }
+        state.close();
+        ++cases;
+    }
+}
+void check_combine_failures() {
+    for (int mode = 0; mode < 4; ++mode) {
+        reset(); deep_ep::comm::Context ctx; auto x=input();
+        EPLowLatencyState state("group", buffer_bytes);
+        state.initialize(ctx);
+        auto launch = state.prepare_combine(ctx, x, mode != 0);
+        state.begin(launch);
+        if (mode == 2) mock::event_failure = true;
+        if (mode == 3) {
+            state.record_completion();
+            mock::wait_failure = true;
+            rejects([&] { state.prepare_combine(ctx, x, false); }, "event wait failure");
+        } else {
+            rejects([&] {
+                const auto guard = state.failure_guard();
+                if (mode == 2) state.record_completion();
+                else throw std::runtime_error("combine launch failed");
+            }, mode == 2 ? "event" : "combine");
+        }
+        rejects([&] { prepare(state, ctx, x); }, "failed");
+        rejects([&] { state.prepare_combine(ctx, x, false); }, "failed");
+        rejects([&] { state.close(); }, "failed");
+        assert(ShmemArena::session_failed == (mode != 0));
+        ++cases;
+    }
+}
 void check_preparation_failures() {
     for(int mode=0;mode<5;++mode) {
-        reset(); DispatchLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
+        reset(); EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
         state.initialize(ctx); auto x=input();
         if(mode==0) ShmemArena::result=-1;
         if(mode==1) mock::fail_allocation=mock::allocation_count+1;
@@ -280,16 +395,15 @@ void check_preparation_failures() {
         const auto attempts=ShmemArena::attempts;
         rejects([&] { prepare(state,ctx,x); },"failed");
         assert(ShmemArena::attempts==attempts);
-        if(mode==0) state.close();
-        else rejects([&] { state.close(); },"shared session failed");
+        rejects([&] { state.close(); },"failed");
         ++cases;
     }
 }
 void check_guard_and_completion_failures() {
     for(int mode=0;mode<2;++mode) {
-        reset(); DispatchLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
+        reset(); EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
         state.initialize(ctx); auto x=input(); auto launch=prepare(state,ctx,x); state.begin(launch);
-        std::weak_ptr<deep_ep::DispatchLowLatencyLaunch> weak=launch;
+        std::weak_ptr<deep_ep::EPLowLatencyLaunch> weak=launch;
         if(mode==1) mock::event_failure=true;
         rejects([&] {
             const auto guard=state.failure_guard();
@@ -298,9 +412,9 @@ void check_guard_and_completion_failures() {
         },mode==0 ? "dispatch" : "event");
         launch.reset(); assert(!weak.expired());
         rejects([&] { prepare(state,ctx,x); },"failed");
-        rejects([&] { state.close(); },"shared session failed"); ++cases;
+        rejects([&] { state.close(); },"failed"); ++cases;
     }
-    reset(); DispatchLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
+    reset(); EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
     state.initialize(ctx); auto x=input(); auto launch=prepare(state,ctx,x);
     state.begin(launch); state.record_completion(); mock::wait_failure=true;
     rejects([&] { prepare(state,ctx,x); },"event wait failure");
@@ -310,7 +424,7 @@ void check_guard_and_completion_failures() {
 void check_shared_session_failure() {
     for(bool fallback : {false,true}) {
         reset(); deep_ep::comm::Context ctx;
-        DispatchLowLatencyState first("group",buffer_bytes),second("group",buffer_bytes);
+        EPLowLatencyState first("group",buffer_bytes),second("group",buffer_bytes);
         first.initialize(ctx); second.initialize(ctx); auto x=input();
         auto a=prepare(first,ctx,x),b=prepare(second,ctx,x);
         assert(a && b && a->arena!=b->arena && a->peer_buffers.storage!=b->peer_buffers.storage);
@@ -326,6 +440,7 @@ void check_shared_session_failure() {
 int main() {
     check_capability_and_cached_refusal(); check_capacity_gate(); check_pending_and_cross_stream();
     check_group_capacity_and_transport_switch();
+    check_combine_then_dispatch(); check_combine_admission(); check_combine_failures();
     check_preparation_failures(); check_guard_and_completion_failures(); check_shared_session_failure();
     std::cout << "PASS " << cases << " CPU State source cases\n";
 }
@@ -336,7 +451,7 @@ int main() {
 class DispatchLLStateHostTests(unittest.TestCase):
     def test_actual_state_transitions(self):
         output = run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'))
-        self.assertIn('PASS 19 CPU State source cases', output)
+        self.assertIn('PASS 31 CPU State source cases', output)
 
 
 if __name__ == '__main__':

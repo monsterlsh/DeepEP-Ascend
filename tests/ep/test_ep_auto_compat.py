@@ -206,12 +206,12 @@ def expected_transport(operation, case, rank, backend, runtime, *, original_b=No
     m = case['M'] if capacity is None else capacity
     world = len(case['rank_bs'])
     threshold = {8: 60, 16: 17, 128: 32}.get(world, 0)
-    eligible = (runtime['arch'] == 3510 and runtime['num_vec_cores'] == 64
-                and 0 < b <= m <= 256
-                and b <= threshold)
-    # Target acceptance machines must provide >=190 KiB UB. The actual template
-    # name/parameters remain the evidence; an unexpected fallback is a failure.
-    return 'mte' if eligible else 'urma'
+    supported = runtime['arch'] == 3510 and runtime['num_vec_cores'] == 64 and 0 < m <= 256
+    native = 'mte' if supported and 0 < b <= min(threshold, m) else 'urma'
+    # SHMEM selection uses the common handle capacity, including on empty ranks.
+    if supported and m <= threshold and runtime['num_ai_cores'] == 32:
+        return [native, 'shmem']
+    return native
 
 
 def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **kwargs):
@@ -243,7 +243,7 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **
                                   original_b=original_b, capacity=capacity)
     if operation == 'dispatch' and backend != 'official':
         metadata['path_policy'] = 'observed_pipeline; no historical MTE threshold assertion'
-    if expected == 'mte':
+    if expected == 'mte' or isinstance(expected, list):
         metadata['min_num_ub_bytes'] = 190 * 1024
     if original_b is not None:
         metadata.update(B=original_b, M=capacity)

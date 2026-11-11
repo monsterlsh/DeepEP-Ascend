@@ -49,6 +49,14 @@ inline int mte_bs_threshold_override() {
     return threshold;
 }
 
+inline bool mte_workload_fits(bool is_combine, int num_ranks, int num_tokens, int capacity,
+                              int hidden, int num_topk, int num_experts, int bs_threshold_override) {
+    const auto threshold = mte_threshold_bs(is_combine, num_ranks);
+    return threshold > 0 and hidden == 7168 and num_topk == 8 and num_experts == 128 and
+           num_tokens > 0 and num_tokens <= capacity and capacity <= 256 and
+           num_tokens <= (bs_threshold_override >= 0 ? bs_threshold_override : threshold);
+}
+
 // Host policy: hard hardware/capacity guards + fixed per-operation threshold.
 inline bool prefer_low_latency_transport(bool is_combine, int arch, int num_ranks,
                                          int num_tokens, int num_max_tokens_per_rank,
@@ -56,13 +64,9 @@ inline bool prefer_low_latency_transport(bool is_combine, int arch, int num_rank
                                          int num_vec_cores, bool use_fp8,
                                          int num_ub_bytes = 190 * 1024,
                                          int bs_threshold_override = -1) {
-    const auto threshold = mte_threshold_bs(is_combine, num_ranks);
-    // A threshold override must not enable unsupported hardware, shapes or ops.
-    if (threshold == 0 or arch != 3510 or use_fp8 or hidden != 7168 or num_topk != 8 or num_experts != 128 or
-        num_vec_cores != 64 or num_ub_bytes < 190 * 1024 or num_tokens <= 0 or
-        num_tokens > num_max_tokens_per_rank or num_max_tokens_per_rank > 256)
-        return false;
-    return num_tokens <= (bs_threshold_override >= 0 ? bs_threshold_override : threshold);
+    return arch == 3510 and not use_fp8 and num_vec_cores == 64 and num_ub_bytes >= 190 * 1024 and
+           mte_workload_fits(is_combine, num_ranks, num_tokens, num_max_tokens_per_rank,
+                             hidden, num_topk, num_experts, bs_threshold_override);
 }
 
 // Runtime decision entry: wraps the policy with the environment override.

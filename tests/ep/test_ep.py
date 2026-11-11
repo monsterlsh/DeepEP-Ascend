@@ -43,6 +43,37 @@ def launch(buffer: deep_ep.EPBuffer, name: str, defer_epilogue: int, **params):
     return result
 
 
+def check_deferred_decode_combine(buffer):
+    # The shared dispatch capacity selects the transport even on ranks with no source tokens.
+    batch = buffer.rank_idx % 3
+    x = torch.full((batch, 7168), 1 + buffer.rank_idx % 7, dtype=torch.bfloat16, device='npu')
+    topk_idx = (torch.arange(8, dtype=torch.int64, device='npu') * 16).repeat(batch, 1)
+    recv, _, _, handle, ready = buffer.dispatch(
+        x, topk_idx=topk_idx, num_experts=128, num_max_tokens_per_rank=2, num_sms=32,
+        do_expand=True, do_cpu_sync=False, async_with_compute_stream=True)
+    ready.wait()
+
+    def submit(offset):
+        return buffer.combine(recv, handle, bias=torch.full_like(x, offset),
+                              async_with_compute_stream=True, defer_epilogue=True)
+
+    first = submit(3)
+    consumer = torch.npu.Stream()
+    with torch.npu.stream(consumer):
+        first_x, first_weights = first.wait()
+        assert first.wait() is None
+        # Reuse the handle, then finish the second epilogue on the original stream.
+        second = submit(5)
+    # Exercise allocator reuse on the first bias's creation stream before waiting for the consumer.
+    scratch = torch.full_like(x, 91)
+    second_x, second_weights = second.wait()
+    assert first_weights is None and second_weights is None
+    assert second.wait() is None
+    torch.testing.assert_close(first_x.cpu(), x.cpu() * 8 + 3, atol=0, rtol=0)
+    torch.testing.assert_close(second_x.cpu(), x.cpu() * 8 + 5, atol=0, rtol=0)
+    del scratch
+
+
 # noinspection PyShadowingNames
 def test_dispatch_combine(buffer: deep_ep.EPBuffer, args: argparse.Namespace):
     assert not args.allow_hybrid_mode
@@ -533,6 +564,9 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
                    once_in_node=True)
 
     # Test once
+    if (not args.skip_check and args.num_tokens >= 2 and num_ranks in (8, 16, 128)
+            and (args.hidden, args.num_topk, args.num_experts) == (7168, 8, 128)):
+        check_deferred_decode_combine(buffer)
     test_dispatch_combine(buffer, args)
 
     # Pressure tests

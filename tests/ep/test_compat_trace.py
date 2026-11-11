@@ -37,6 +37,9 @@ LL_PAYLOAD = 'void dispatch_server_dedup_kernel<0>(...)'
 LL_ORIGIN_MAP = 'void deep_ep::dispatch_ll_origin_map_impl<16, 2, 8>(...)'
 LL_COPY = 'void deep_ep::dispatch_ll_copy_payload_impl<16, 2, 8, 14336, 0, 64, 221184, false>(...)'
 
+# Synthetic demangled symbol for the SHMEM combine device specialization.
+COMBINE_SHMEM = 'deep_ep::combine_impl<16, 8, 7168, 2, 64, 100000000000L, 221184, true, true, true, true>(...)'
+
 
 def ll_records():
     return [dict(name=name, device_id='0', stream_id='1', start_us=index * 10, duration_us=2)
@@ -44,6 +47,24 @@ def ll_records():
 
 
 class KernelParserTests(unittest.TestCase):
+    def test_shmem_combine_requires_both_transport_arguments(self):
+        native = COMBINE_SHMEM.replace('true, true>(...)', 'true, false>(...)')
+        urma = COMBINE_SHMEM.replace('true, true>(...)', 'false, false>(...)')
+        for name, transport in ((COMBINE_SHMEM, 'shmem'), (native, 'mte'), (urma, 'urma')):
+            proof = trace.verify_kernel_records([dict(name=name)], 'combine',
+                                                expected_transport=[transport, 'shmem'])
+            self.assertEqual(proof['actual_transport'], transport)
+        for malformed in (COMBINE_SHMEM.replace('true, true>(...)', 'false, true>(...)'),
+                          COMBINE_SHMEM.replace('>(...)', ', false>(...)'),
+                          COMBINE_SHMEM.replace('true>(...)', '1>(...)')):
+            with self.subTest(name=malformed), self.assertRaises(trace.TraceVerificationError):
+                trace.parse_kernel(malformed, 'combine')
+        for name, backend, expected in ((COMBINE_SHMEM, 'official', 'shmem'),
+                                        (native, 'candidate', 'shmem'),
+                                        (COMBINE_URMA, 'candidate', ['mte', 'shmem'])):
+            with self.assertRaises(trace.TraceVerificationError):
+                trace.verify_kernel_records([dict(name=name)], 'combine', backend, expected)
+
     def test_dispatch_template_versions(self):
         arguments = '16, 128, 8, 1, false, false, 64, 14336, 0, 2, 221184, 100000000000L, true'
         official = f'void deep_ep::dispatch_impl<{arguments}>(...)'

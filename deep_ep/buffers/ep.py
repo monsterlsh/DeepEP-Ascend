@@ -199,7 +199,7 @@ class EPBuffer(BufferBase):
         LB kernels, RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
         workspace and must be allocation-aligned.
 
-        Eligible dispatches allocate a separate SHMEM arena on first use.
+        Eligible dispatch and combine calls share a separate SHMEM arena allocated on first use.
         Other configurations use the native communication buffer.
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
@@ -363,7 +363,7 @@ class EPBuffer(BufferBase):
             num_sms: the number of AI cores to use (0 selects a default in Python).
                 Cached dispatch always uses the core count from `handle`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
-            previous_event: compatibility parameter; ignored on Ascend.
+            previous_event: on the SHMEM path, the current stream waits for this event before dispatch.
             async_with_compute_stream: return an event for the current-stream work.
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             handle: an optional cached `EPHandle` from a previous dispatch; if set, the host will reuse
@@ -550,7 +550,7 @@ class EPBuffer(BufferBase):
                 `torch.bfloat16` final bias to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
-            previous_event: compatibility parameter; ignored on Ascend.
+            previous_event: on the SHMEM path, the current stream waits for this event before combine.
             async_with_compute_stream: return an event for the current-stream work.
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             defer_epilogue: whether to defer the reduce epilogue until `event.current_stream_wait()` is called.

@@ -176,13 +176,16 @@ public:
 #endif
     }
 
-    static bool agree_capability(HcclComm comm, int world, int timeout, bool local_ready) {
+    static uint16_t agree_capabilities(HcclComm comm, int world, int timeout, uint16_t local) {
         if (world <= 0 or timeout <= 0)
             throw std::invalid_argument("SHMEM capability check requires a valid group and timeout");
-        local_ready = local_ready and timeout <= kMaxTimeoutSecs;
-        const auto capabilities = gather(static_cast<uint16_t>(local_ready), comm, world, std::min(timeout, kMaxTimeoutSecs),
+        if (timeout > kMaxTimeoutSecs)
+            local = 0;
+        const auto capabilities = gather(local, comm, world, std::min(timeout, kMaxTimeoutSecs),
                                          c10_npu::getCurrentNPUStream());
-        return std::all_of(capabilities.begin(), capabilities.end(), [](const auto ready) { return ready == 1; });
+        for (const auto peer: capabilities)
+            local &= peer;
+        return local;
     }
 
     static std::shared_ptr<ShmemArena> try_create(const std::string& group, int rank, int world,

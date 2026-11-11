@@ -31,22 +31,26 @@ static void* launch_combine(void* x,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
                             const bool& do_barrier = false,
-                            const bool& low_latency_transport = false) {
+                            const bool& low_latency_transport = false,
+                            void* peer_buffers = nullptr) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
+    const bool shmem_transport = peer_buffers != nullptr;
+    EP_HOST_ASSERT(not shmem_transport or low_latency_transport);
 
     // Compile
-    const auto kernel = jit->compile(low_latency_transport ? "combine_mte" : "combine", std::format(R"(
+    const auto kernel_name = shmem_transport ? "combine_shmem" : (low_latency_transport ? "combine_mte" : "combine");
+    const auto kernel = jit->compile(kernel_name, std::format(R"(
 #include <deep_ep/impls/ep/combine.hpp>
 
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_topk, hidden, num_max_tokens_per_rank, num_vec_cores,
-        num_timeout_cycles, num_ub_bytes, do_barrier, topk_weights != nullptr, low_latency_transport));
+        num_timeout_cycles, num_ub_bytes, do_barrier, topk_weights != nullptr, low_latency_transport, shmem_transport));
 
     // Launch
     jit->launch(
@@ -59,7 +63,8 @@ static void __instantiate_kernel() {{
         send_buffer,
         workspace,
         jetty_ptrs,
-        rank_idx);
+        rank_idx,
+        peer_buffers);
     return buffer;
 }
 

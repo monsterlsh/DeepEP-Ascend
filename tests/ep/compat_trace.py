@@ -36,6 +36,17 @@ def _operation(value):
     return value
 
 
+def allowed_transports(operation, expected):
+    """A list denotes alternatives when runtime SHMEM resources are optional."""
+    possible = ('mte', 'urma', 'll') if _operation(operation) == 'dispatch' else ('mte', 'urma', 'shmem')
+    if expected is None:
+        return possible
+    choices = expected if isinstance(expected, list) else [expected]
+    _require(bool(choices) and all(value in possible for value in choices),
+             f"Invalid expected {operation} transport: {expected}")
+    return choices
+
+
 def _is_main(name, operation):
     # An epilogue or a generic Python label is never a main-kernel symbol.
     return re.search(r"(?<![A-Za-z_])" + operation + r"_impl(?:I|<)", name) is not None
@@ -138,6 +149,12 @@ def parse_kernel(name, operation, backend='candidate'):
                      f"Unknown candidate dispatch template layout: {name}")
             _require(not layout_only or (low_latency and result['barrier_in_prologue']),
                      f"Layout-only dispatch requires MTE metadata and a completion barrier: {name}")
+        else:
+            _require(len(values) in (10, 11), f"Unknown candidate combine template layout: {name}")
+            if len(values) == 11:
+                result['shmem_transport'] = boolean(10, 'shmem_transport')
+                _require(not result['shmem_transport'] or low_latency,
+                         f"SHMEM combine requires low-latency transport: {name}")
     else:
         # Official dispatch has three integral derived defaults after arg 12;
         # candidate dispatch inserted a bool at arg 13. Official combine has 9
@@ -153,6 +170,8 @@ def parse_kernel(name, operation, backend='candidate'):
     result.update(low_latency_transport=low_latency,
                   layout_only=layout_only,
                   transport='metadata_mte' if layout_only else ('mte' if low_latency else 'urma'))
+    if result.get('shmem_transport'):
+        result['transport'] = 'shmem'
     return result
 
 
@@ -236,8 +255,7 @@ def read_chrome_trace(path, operation):
 def verify_kernel_records(records, operation, backend='candidate', expected_transport=None):
     """Verify native transport or a complete LL pipeline; missing stages fail."""
     operation, backend = _operation(operation), _backend(backend)
-    _require(expected_transport in (None, 'mte', 'urma', 'll'),
-             f"Invalid expected transport: {expected_transport}")
+    choices = allowed_transports(operation, expected_transport)
     _require(bool(records), f"No {operation} main device kernel was captured")
     names = sorted({record['name'] for record in records})
     parameters = {name: parse_kernel(name, operation, backend) for name in names if _is_main(name, operation)}
@@ -273,7 +291,7 @@ def verify_kernel_records(records, operation, backend='candidate', expected_tran
             actual = 'll'
         else:
             _require(not any(stages.values()), 'LL stages without a native metadata-only dispatch')
-    _require(expected_transport is None or actual == expected_transport,
+    _require(actual in choices,
              f"{operation}: expected {expected_transport}, captured {actual}")
     return dict(actual_transport=actual, kernel_names=names,
                 kernel_parameters=parameters, device_kernel_count=len(records),
@@ -399,8 +417,7 @@ class TraceCollector:
     @contextmanager
     def capture(self, label, operation, expected_transport=None, metadata=None):
         operation = _operation(operation)
-        _require(expected_transport in (None, 'mte', 'urma', 'll'),
-                 f"Invalid expected transport: {expected_transport}")
+        allowed_transports(operation, expected_transport)
         record = dict(label=str(label), operation=operation, backend=self.backend,
                       status='unverified', profiling_enabled=self.enabled,
                       expected_transport=expected_transport, actual_transport=None,
