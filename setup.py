@@ -44,21 +44,19 @@ def get_shmem_build_config():
         return {'enabled': False}
     root = root.resolve()
     hashes = {}
-    for name, expected in shmem_header_hashes.items():
+    # The RMA header is required and recorded, but has no pinned digest.
+    for name in (*shmem_header_hashes, 'host/data_plane/shmem_host_rma.h'):
         path = root / 'include' / name
         if not path.is_file():
             raise RuntimeError(f'SHMEM SDK header missing: {path}')
         hashes[name] = hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
-        if hashes[name] != expected:
+        if name in shmem_header_hashes and hashes[name] != shmem_header_hashes[name]:
             raise RuntimeError(f'SHMEM SDK header does not match {shmem_revision}: {path}')
-    for name in ('host/data_plane/shmem_host_rma.h',):
-        path = root / 'include' / name
-        if not path.is_file():
-            raise RuntimeError(f'SHMEM SDK header missing: {path}')
-        hashes[name] = hashlib.sha256(path.read_bytes().replace(b'\r\n', b'\n')).hexdigest()
-    library = next((root / name / 'libshmem.so' for name in ('lib', 'lib64')
-                    if (root / name / 'libshmem.so').is_file()), None)
-    if library is None:
+    for lib_dir in ('lib', 'lib64'):
+        library = root / lib_dir / 'libshmem.so'
+        if library.is_file():
+            break
+    else:
         raise RuntimeError(f'SHMEM SDK library missing under {root}: lib/libshmem.so or lib64/libshmem.so')
     return {
         'enabled': True,
@@ -228,14 +226,16 @@ if __name__ == '__main__':
         language='c++',
     )
 
+    # Older setuptools versions do not expand recursive package-data globs.
+    headers = [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*')
+               if path.suffix in ('.hpp', '.h')]
+
     # noinspection bad-argument-type
     setuptools.setup(
         name='deep_ep',
         version=get_package_version(),
         packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
-        # Older setuptools versions do not expand recursive package-data globs.
-        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*')
-                                 if path.suffix in ('.hpp', '.h')]},
+        package_data={'deep_ep': headers},
         ext_modules=[ext_module],
         cmdclass={'build_ext': BuildExtension, 'build_py': CustomBuildPy},
     )

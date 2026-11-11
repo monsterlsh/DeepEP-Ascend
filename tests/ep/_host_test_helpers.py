@@ -1,11 +1,31 @@
-"""Shared CPU doubles for Python contract tests; no NPU execution or validation."""
+"""Helpers for running buffer and kernel tests on the host."""
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def run_host_cpp(source, *, include_dirs=(), headers=None):
+    """Build and run a C++ test in an isolated directory and return its stdout."""
+    with tempfile.TemporaryDirectory() as directory:
+        temporary = Path(directory)
+        for name, content in (headers or {}).items():
+            path = temporary / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding='utf-8')
+        cpp, exe = temporary / 'test.cpp', temporary / 'test.exe'
+        cpp.write_text(source, encoding='utf-8')
+        command = [os.environ.get('CXX', 'g++'), '-std=c++20', '-O2', '-Wall', '-Wextra']
+        for path in (temporary, *include_dirs):
+            command.extend(['-I', str(path)])
+        subprocess.run([*command, str(cpp), '-o', str(exe)], check=True)
+        return subprocess.run([str(exe)], check=True, stdout=subprocess.PIPE, text=True).stdout
 
 
 class Tensor:
@@ -72,6 +92,7 @@ def fake_modules():
         setattr(modules['deep_ep.comm'], name, lambda *args: None)
     modules['deep_ep.buffers.allocator'].BufferAllocator = type('BufferAllocator', (), {})
     modules['deep_ep.utils.math'].align = lambda a, b: (a + b - 1) // b * b
+    modules['deep_ep.utils.math'].ceil_div = lambda a, b: (a + b - 1) // b
     modules['deep_ep.utils.semantic'].value_or = lambda x, default: default if x is None else x
     return modules, torch, native
 

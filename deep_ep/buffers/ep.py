@@ -163,10 +163,8 @@ class EPHandle:
 class EPBuffer(BufferBase):
     """Expert-parallel dispatch/combine on Ascend, using the expanded layout.
 
-    The native runtime selects a small-batch MTE transport where supported,
-    using the same communication allocation, layouts, handles and epilogues.
-    Dispatch transports routing weights as metadata; combine never multiplies
-    them into the expert outputs. Apply model weights in the expert computation.
+    Dispatch returns routing weights as metadata. Apply model weights in the
+    expert computation before combine sums the expert outputs.
 
     Stream usage:
         All operations run on the current stream.
@@ -201,10 +199,8 @@ class EPBuffer(BufferBase):
         LB kernels, RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
         workspace and must be allocation-aligned.
 
-        The default path automatically selects its internal transport without
-        changing the public API. SHMEM LL dispatch allocates a separate internal
-        arena on first use; unsupported configurations use the native buffer.
-
+        Eligible dispatches allocate a separate SHMEM arena on first use.
+        Other configurations use the native communication buffer.
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
         num_lb_bytes = lb_allocation_plan_or_num_bytes if lb_allocation_plan is None else lb_allocation_plan.num_bytes

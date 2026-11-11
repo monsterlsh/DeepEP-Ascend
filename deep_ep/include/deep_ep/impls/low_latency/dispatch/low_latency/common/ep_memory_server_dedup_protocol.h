@@ -2,11 +2,11 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstddef>
 #include <cstdint>
 
 namespace DispatchDedup {
+
 constexpr uint32_t kEpServerDedupRanksPerServer = 8U;
 constexpr uint32_t kEpServerDedupAlignmentBytes = 32U;
 constexpr uint32_t kEpServerDedupMaxTopK = 32U;
@@ -44,4 +44,5 @@ static_assert(offsetof(EpServerDedupPacketHeader, type) == 12U, "packet role off
 static_assert(sizeof(EpServerDedupReadIndexBlock) == 8U, "read index block ABI");
 static_assert(offsetof(EpServerDedupReadIndexBlock, weightBits) == 4U, "weight bits offset");
 static_assert(sizeof(EpServerDedupDirectTask) == 16U, "source direct task ABI");
+
 }  // namespace DispatchDedup

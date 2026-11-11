@@ -2,11 +2,11 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_input.h>
 
 namespace DispatchDedup {
+
 #if DISPATCH_DEDUP_ASCENDC_AICORE_COMPILE
 #define DISPATCH_DEDUP_EP_DATA_INLINE FORCE_INLINE_AICORE
 #else
@@ -60,8 +60,8 @@ DISPATCH_DEDUP_EP_DATA_INLINE EpServerDedupDataLayout DispatchServerDedupDataLay
     layout.dispatchOffset = DispatchDedupAlign(layout.sourceOffset + layout.sourceBytes, 512U);
     layout.dispatchBytes = uint64_t(experts) * bs * layout.tokenStride;
     layout.relayOffset = DispatchDedupAlign(layout.dispatchOffset + layout.dispatchBytes, 512U);
-    // Historical Combine reservation, unused by Dispatch. The new pull Combine
-    // must define its stage/result allocation before consuming the five tables.
+    // Preserve the relay region in the dispatch window size. Combine lays
+    // out its result packets and staged expert rows separately.
     layout.relayBytes = uint64_t(8U) * bs * topK * layout.returnStride;
     layout.requiredBytes = layout.relayOffset + layout.relayBytes;
     return layout;
@@ -81,4 +81,5 @@ DISPATCH_DEDUP_EP_DATA_INLINE uint64_t DispatchServerDedupDispatchOffset(const E
 }
 
 #undef DISPATCH_DEDUP_EP_DATA_INLINE
+
 }  // namespace DispatchDedup

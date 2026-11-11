@@ -2,11 +2,12 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/common/ep_server_order.h>
 
 namespace CombineDedup {
+
 // Dispatch and Combine share the same large-world half ordering.
 using EpServerOrder::ServerDedupHalfOrder;
 
@@ -30,4 +31,5 @@ __aicore__ inline void ServerDedupRankMask(AscendC::LocalTensor<uint8_t> mask, A
 __aicore__ inline uint32_t ServerDedupFirstOwned(uint32_t core, uint32_t owner, uint32_t cores) {
     return (core + cores - owner) % cores;
 }
+
 }  // namespace CombineDedup

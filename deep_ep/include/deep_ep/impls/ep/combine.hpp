@@ -100,9 +100,9 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumTokensPerTask * warpSize) void load
         if (valid_token and lane_idx < ub_layout_t::kNumTopkWeightElems) {
             const auto weight = lane_idx < kNumTopk and slot_idx >= 0 ? topk_weights[slot_idx] : 0;
             if constexpr (kLowLatencyTransport) {
-                // Keep weights as a separate payload; they never multiply x.
-                reinterpret_cast<__ubuf__ uint32_t*>(ub->metadata[stage_idx][token_idx])[
-                    ub_layout_t::kNumUbWeightOffset + lane_idx] = weight;
+                const auto weights = reinterpret_cast<__ubuf__ uint32_t*>(
+                    ub->metadata[stage_idx][token_idx] + ub_layout_t::kNumUbWeightOffset);
+                weights[lane_idx] = weight;
             } else {
                 const auto is_local = task.rank_idx == rank_idx;
                 const auto slot_group_idx = kNumRanks < kNumTopk ? rank_idx : master_topk_idx;
@@ -190,6 +190,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
     constexpr auto kNumTokenBytes = UBLayout::kNumTokenBytes;
     constexpr auto kNumWQEBBsPerToken = UBLayout::kNumWQEBBsPerToken;
     constexpr auto kNumWQEBBsPerTask = UBLayout::kNumWQEBBsPerTask;
+    constexpr bool kUseRemoteQueue = kNumRanks > 1 and not kLowLatencyTransport;
     constexpr auto kOutputCacheMode = kLowLatencyTransport ?
         asc_store_l2_cache_mode::NOTALLOC_CLEAN : asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM;
 
@@ -218,7 +219,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
     comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, false>(signals.common_signals, vec_core_idx);
 
     handle::HcommJetty jetty(&ub->jetty_info, nullptr, kLowLatencyTransport ? nullptr : jetty_ptrs, vec_core_idx);
-    if constexpr (kNumRanks > 1 and not kLowLatencyTransport) {
+    if constexpr (kUseRemoteQueue) {
         asc_vf_call<load_combine_peers<kNumRanks>>(
             dim3(math::align(kNumRanks, warpSize), 1, 1), ub->peer_infos, jetty_ptrs, rank_idx);
         asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
@@ -266,10 +267,9 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
         return CombineTask{task_rank_idx, num_task_tokens, rank_slot_idx};
     };
 
-    const auto sq_base_addr = kNumRanks > 1 and not kLowLatencyTransport ?
-        reinterpret_cast<__gm__ uint8_t*>(ub->jetty_info.sq_base_addr) : nullptr;
-    const auto sq_head = kNumRanks > 1 and not kLowLatencyTransport ? static_cast<uint32_t>(ub->jetty_info.packed_head) : 0;
-    if constexpr (kNumRanks > 1 and not kLowLatencyTransport) {
+    const auto sq_base_addr = kUseRemoteQueue ? reinterpret_cast<__gm__ uint8_t*>(ub->jetty_info.sq_base_addr) : nullptr;
+    const auto sq_head = kUseRemoteQueue ? static_cast<uint32_t>(ub->jetty_info.packed_head) : 0;
+    if constexpr (kUseRemoteQueue) {
         EP_DEVICE_ASSERT(sq_head % kSQEBBAlignment == 0);
         EP_DEVICE_ASSERT(num_remote_tasks == 0 or
                          static_cast<int64_t>(num_remote_tasks) * kNumWQEBBsPerTask + kSQEBBAlignment <= handle::kSQDepth);
@@ -285,9 +285,8 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
         const auto issue_wqe = not kLowLatencyTransport and task.rank_idx != rank_idx;
         fetched_tasks[stage_idx] = task;
         const auto task_sqebb_idx = next_remote_sqebb_idx;
-        asc_vf_call<load_meta_issue_wqe<kNumRanks, kNumTopk, kNumMaxTokensPerRank,
-                                                 kNumVecCores, kNumTokensPerTask, UBLayout, kHasTopkWeights,
-                                                 kLowLatencyTransport>>(
+        asc_vf_call<load_meta_issue_wqe<kNumRanks, kNumTopk, kNumMaxTokensPerRank, kNumVecCores,
+                                       kNumTokensPerTask, UBLayout, kHasTopkWeights, kLowLatencyTransport>>(
             dim3(kNumTokensPerTask * warpSize, 1, 1),
             ub, src_metadata, x, send_buffer, combine_recv_buffer, topk_weight_u32,
             combine_recv_buffer_offset, task, task_sqebb_idx, stage_idx, rank_idx, issue_wqe
@@ -310,31 +309,28 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
         const auto current_sq_end = fetched_sq_ends[stage_idx];
         const auto num_stage_tokens = current_task.num_tokens;
         const auto is_local = current_task.rank_idx == rank_idx;
+        const auto event_idx = static_cast<event_t>(stage_idx);
 
-        asc_sync_wait(PIPE_V, PIPE_S, static_cast<event_t>(stage_idx));
+        asc_sync_wait(PIPE_V, PIPE_S, event_idx);
         if constexpr (kLowLatencyTransport and kHasTopkWeights) {
-            asc_sync_notify(PIPE_V, PIPE_MTE3, static_cast<event_t>(stage_idx));
-            asc_sync_wait(PIPE_V, PIPE_MTE3, static_cast<event_t>(stage_idx));
+            asc_sync_notify(PIPE_V, PIPE_MTE3, event_idx);
+            asc_sync_wait(PIPE_V, PIPE_MTE3, event_idx);
         }
         for (int token_idx = 0; token_idx < num_stage_tokens; ++ token_idx) {
             const auto meta = ub->metadata[stage_idx][token_idx];
-            const auto recv_slot_idx = current_task.rank_slot_idx + token_idx * kNumVecCores;
-            const auto src_token_idx = meta[kNumTopk] -
-                (kLowLatencyTransport ? current_task.rank_idx : rank_idx) * kNumMaxTokensPerRank;
-            const auto subslot_idx = kNumRanks < kNumTopk ? rank_idx : meta[kNumTopk + 1];
-            const auto combine_slot_idx = subslot_idx * kNumMaxTokensPerRank + src_token_idx;
-            auto output_addr = is_local ?
-                reinterpret_cast<__gm__ bfloat16_t*>(
-                    combine_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes) :
-                reinterpret_cast<__gm__ bfloat16_t*>(send_buffer + static_cast<int64_t>(recv_slot_idx) * kNumTokenBytes);
-            if constexpr (kLowLatencyTransport) {
-                // Use the official reduce-buffer slot in the existing symmetric arena.
-                // Metadata, local reduction order and the reduce epilogue are unchanged.
-                output_addr = reinterpret_cast<__gm__ bfloat16_t*>(layout::get_sym_ptr(
-                    signals.common_signals,
-                    combine_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes,
-                    current_task.rank_idx));
+            __gm__ uint8_t* output;
+            if (is_local or kLowLatencyTransport) {
+                const auto src_token_idx = meta[kNumTopk] - current_task.rank_idx * kNumMaxTokensPerRank;
+                const auto subslot_idx = kNumRanks < kNumTopk ? rank_idx : meta[kNumTopk + 1];
+                const auto combine_slot_idx = subslot_idx * kNumMaxTokensPerRank + src_token_idx;
+                output = combine_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes;
+                if constexpr (kLowLatencyTransport)
+                    output = layout::get_sym_ptr(signals.common_signals, output, current_task.rank_idx);
+            } else {
+                const auto recv_slot_idx = current_task.rank_slot_idx + token_idx * kNumVecCores;
+                output = send_buffer + static_cast<int64_t>(recv_slot_idx) * kNumTokenBytes;
             }
+            const auto output_addr = reinterpret_cast<__gm__ bfloat16_t*>(output);
             const auto num_slots = meta[UBLayout::kNumSlotsMetadataIdx];
             const auto first_slot_idx = num_slots > 0 ? meta[0] : -1;
             if (num_slots >= 2) {
@@ -353,7 +349,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
             }
             if constexpr (kLowLatencyTransport and kHasTopkWeights) {
                 asc_copy_ub2gm_align(
-                    reinterpret_cast<__gm__ uint8_t*>(output_addr) + UBLayout::kNumHiddenBytes,
+                    output + UBLayout::kNumHiddenBytes,
                     reinterpret_cast<__ubuf__ uint8_t*>(meta + UBLayout::kNumUbWeightOffset),
                     1, UBLayout::kNumTopkWeightBytes,
                     kOutputCacheMode, 0, 0);
@@ -361,16 +357,15 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
         }
 
         if constexpr (kLowLatencyTransport and kHasTopkWeights) {
-            // This stage's metadata also holds MTE3 weight payloads. Finish reading
-            // them before the next SIMT metadata load reuses that stage.
-            asc_sync_notify(PIPE_MTE3, PIPE_V, static_cast<event_t>(stage_idx));
-            asc_sync_wait(PIPE_MTE3, PIPE_V, static_cast<event_t>(stage_idx));
+            // MTE3 must finish reading weights before SIMT reuses this metadata stage.
+            asc_sync_notify(PIPE_MTE3, PIPE_V, event_idx);
+            asc_sync_wait(PIPE_MTE3, PIPE_V, event_idx);
         }
         issue_load_meta_wqe(stage_idx, task_iter_idx + kNumStages);
 
         if (not kLowLatencyTransport and not is_local and (++ num_issued_remote_tasks % kNumTasksPerDoorbell == 0)) {
-            asc_sync_notify(PIPE_MTE3, PIPE_S, static_cast<event_t>(stage_idx));
-            asc_sync_wait(PIPE_MTE3, PIPE_S, static_cast<event_t>(stage_idx));
+            asc_sync_notify(PIPE_MTE3, PIPE_S, event_idx);
+            asc_sync_wait(PIPE_MTE3, PIPE_S, event_idx);
             jetty.set_sq_head(current_sq_end);
             jetty.ring_doorbell();
         }

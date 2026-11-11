@@ -2,8 +2,8 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
 #include <deep_ep/impls/low_latency/combine/low_latency/ep_memory_server_dedup_buffer_layout.h>
@@ -13,12 +13,11 @@
 #include <deep_ep/impls/low_latency/combine/low_latency/combine_server_dedup_select.h>
 
 namespace CombineDedup {
+
 using namespace AscendC;
 
 // Local stage, readiness, DIRECT/partial return and source-token aggregation.
 class CombineMemoryServerDedupKernel {
-    friend struct CombineModuleTestAccess;
-
 public:
     __aicore__ inline void Init(GM_ADDR commArgs, GM_ADDR expertOut, GM_ADDR assistInfoForCombine, GM_ADDR sendCounts, GM_ADDR tokenType,
                                 GM_ADDR relayReadIndex, GM_ADDR sourceMask, GM_ADDR yOut, uint32_t bs, uint32_t h, uint32_t topK,
@@ -69,10 +68,10 @@ public:
             return;
         }
 
-        blocks_ = (h_ * 2U + 479U) / 480U;
+        blocks_ = EpCombinePayloadBlockCount(h_);
         laneBytes_ = blocks_ * 480U;
         resultStride_ = blocks_ * 512U;
-        window_ = (uint64_t(magic) % 2U) * DispatchDedup::kEpServerDedupWindowBytes;
+        window_ = DispatchDedup::DispatchServerDedupWindowOffset(magic);
         control_ = window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_CONTROL_OFFSET;
         stageStride_ = (uint64_t(h_) * 2U + 511U) / 512U * 512U;
         stageBase_ = window_ + COMBINE_DEDUP_EP_SERVER_DEDUP_SHARED_DATA_OFFSET + uint64_t(bs) * topK * resultStride_;
@@ -425,4 +424,5 @@ private:
     LocalTensor<float> preparePublish_, prepareInput_, prepareWork_, prepareSum_, prepareZero_;
     LocalTensor<float> readyInput_, readyWork_, readySum_, readyZero_, notifyUb_;
 };
+
 }  // namespace CombineDedup

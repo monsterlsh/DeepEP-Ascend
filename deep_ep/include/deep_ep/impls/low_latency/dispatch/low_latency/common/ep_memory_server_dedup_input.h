@@ -2,11 +2,12 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstdint>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
 
 namespace DispatchDedup {
+
 // Wire FP8 does not imply internal quantization. Values also form the tiling ABI.
 enum class EpServerDedupInputMode : uint8_t {
     Plain16 = 0,
@@ -39,4 +40,5 @@ inline bool DispatchDedupResolveInputMode(int64_t quantMode, int64_t dtype, bool
     }
     return false;
 }
+
 }  // namespace DispatchDedup

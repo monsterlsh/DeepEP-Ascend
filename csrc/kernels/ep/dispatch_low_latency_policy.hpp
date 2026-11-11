@@ -15,21 +15,13 @@ struct DispatchLowLatencyPlan {
 };
 
 constexpr bool dispatch_direct_ub_fits(int64_t workspace_bytes, int64_t tokens_per_core,
-                                      int64_t hidden_bytes, int64_t num_topk, int64_t ub_bytes,
-                                      bool cached_mode) {
+                                       int64_t hidden_bytes, int64_t num_topk, int64_t ub_bytes,
+                                       bool cached_mode) {
     const auto metadata_bytes = get_dispatch_token_bytes(0, 0, static_cast<int>(num_topk), cached_mode);
     const auto hidden_stage_bytes = math::align<int64_t>(hidden_bytes, kNumUbAlignmentBytes);
-    const auto available_metadata_bytes = ub_bytes - workspace_bytes - hidden_stage_bytes;
-    if (available_metadata_bytes < 4 * metadata_bytes)
-        return false;
-    const int64_t tokens_per_metadata_stage = available_metadata_bytes / metadata_bytes >= 64 ? 64 : 4;
-    const auto metadata_stage_bytes = tokens_per_metadata_stage * metadata_bytes;
-    const auto metadata_stages = math::min<int64_t>(8, math::min<int64_t>(
-        math::ceil_div(tokens_per_core, tokens_per_metadata_stage), available_metadata_bytes / metadata_stage_bytes));
-    const auto hidden_stages = math::min<int64_t>(8,
-        (ub_bytes - workspace_bytes - metadata_stages * metadata_stage_bytes) / hidden_stage_bytes);
-    return metadata_stages > 0 and hidden_stages > 0 and
-        workspace_bytes + metadata_stages * metadata_stage_bytes + hidden_stages * hidden_stage_bytes <= ub_bytes;
+    const auto stages = get_dispatch_buffer_stages(
+        ub_bytes - workspace_bytes, hidden_stage_bytes, metadata_bytes, tokens_per_core);
+    return stages.num_metadata_stages > 0 and stages.num_hidden_stages > 0;
 }
 
 inline std::optional<DispatchLowLatencyPlan> get_dispatch_low_latency_plan(
@@ -63,10 +55,6 @@ inline std::optional<DispatchLowLatencyPlan> get_dispatch_low_latency_plan(
         not dispatch_direct_ub_fits(workspace_bytes, tokens_per_core, hidden_bytes, num_topk, num_ub_bytes, true))
         return std::nullopt;
     return DispatchLowLatencyPlan{total_capacity * (hidden_bytes + metadata_bytes)};
-}
-
-inline bool prefer_dispatch_low_latency(int, int, int, int, int) {
-    return true;
 }
 
 }  // namespace deep_ep

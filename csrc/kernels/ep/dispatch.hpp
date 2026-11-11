@@ -51,15 +51,14 @@ static void launch_dispatch(void* x, void* sf,
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(16 <= num_vec_cores);
 
-    // Compile
-    // Layout-only dispatch uses the native MTE metadata path and preserves the
-    // native logical slot / SGE plan. The LL kernel supplies hidden data later.
+    // Layout-only dispatch issues the MTE metadata pass. The LL kernel supplies the payload.
     const auto use_mte = low_latency_transport or layout_only;
-    // Optional device uint64[num_ranks] table of SHMEM receive-buffer bases.
-    // Workspace/signals remain in the native HCCL allocation. A null table
-    // preserves the native UBMEM mapping, including the URMA fallback path.
+    // peer_buffers holds the SHMEM receive addresses. A null table selects native UBMEM.
     EP_HOST_ASSERT(peer_buffers == nullptr or use_mte);
-    const auto kernel = jit->compile(layout_only ? "dispatch_layout" : (use_mte ? "dispatch_mte" : "dispatch"), std::format(R"(
+
+    // Compile
+    const auto kernel_name = layout_only ? "dispatch_layout" : (use_mte ? "dispatch_mte" : "dispatch");
+    const auto kernel = jit->compile(kernel_name, std::format(R"(
 #include <deep_ep/impls/ep/dispatch.hpp>
 
 using namespace deep_ep;

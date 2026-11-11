@@ -1,20 +1,22 @@
 #pragma once
 
-#include <acl/acl.h>
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
-
-#include <algorithm>
-#include <atomic>
-#include <cstring>
-#include <mutex>
+#include <string_view>
+#include <type_traits>
 #include <vector>
+
+#include <acl/acl.h>
 #include <hccl/hccl.h>
 #include <hccl/hccl_comm.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
+
 #ifdef DEEPEP_WITH_SHMEM
 #include <host/init/shmem_host_init.h>
 #include <host/mem/shmem_host_heap.h>
@@ -25,10 +27,13 @@
 namespace deep_ep::comm {
 
 class ShmemArena {
+    static constexpr int kMaxTimeoutSecs = 3600;
+
 #ifdef DEEPEP_WITH_SHMEM
     static constexpr size_t kHeapBytes = size_t{32} << 30;
     static constexpr size_t kMemoryReserveBytes = size_t{1} << 30;
     static constexpr size_t kAllocationReserveBytes = size_t{2} << 20;
+    static constexpr size_t kAlignmentBytes = 512;
 
     struct Session {
         std::mutex mutex;
@@ -44,10 +49,15 @@ class ShmemArena {
     struct Admission {
         uint64_t bytes, sequence, live, used, world, timeout;
         uint64_t initialized, ready, poisoned;
+
+        bool operator==(const Admission&) const = default;
     };
 
+    enum class Phase: uint64_t { Attributes, Initialize, Allocate, Barrier, Close, Finalize };
+
     struct Status {
-        uint64_t phase, ready;
+        Phase phase;
+        uint64_t ready;
     };
 
     static Session& session() {
@@ -67,7 +77,7 @@ class ShmemArena {
 
     template <typename T>
     static std::vector<T> gather(const T& value, HcclComm comm, int world, int timeout, aclrtStream stream) {
-        static_assert(sizeof(T) % sizeof(uint16_t) == 0);
+        static_assert(std::is_trivially_copyable_v<T> and sizeof(T) % sizeof(uint16_t) == 0);
         const auto recv_bytes = sizeof(T) * static_cast<size_t>(world);
         std::vector<T> result(world);
         void* device = nullptr;
@@ -79,10 +89,9 @@ class ShmemArena {
             check(copied, "bootstrap host copy");
         }
         const auto launched = HcclAllGather(send, device, sizeof(T) / sizeof(uint16_t),
-                                          HCCL_DATA_TYPE_UINT16, comm, stream);
+                                            HCCL_DATA_TYPE_UINT16, comm, stream);
         const auto waited = aclrtSynchronizeStreamWithTimeout(stream, timeout * 1000);
-        if (waited != 0)
-            check(waited, "bootstrap stream wait; allocation retained until process exit");
+        check(waited, "bootstrap stream wait; allocation retained until process exit");
         if (launched != 0) {
             aclrtFree(device);
             check(launched, "bootstrap all-gather");
@@ -94,19 +103,53 @@ class ShmemArena {
     }
 
 #ifdef DEEPEP_WITH_SHMEM
-    static void agree(bool ready, uint64_t phase, HcclComm comm, int world, int timeout, aclrtStream stream) {
-        for (const auto& item: gather(Status{phase, ready}, comm, world, timeout, stream))
-            if (item.phase != phase || !item.ready) {
+    static void agree(bool ready, Phase phase, HcclComm comm, int world, int timeout, aclrtStream stream) {
+        for (const auto& item: gather(Status{phase, ready}, comm, world, timeout, stream)) {
+            if (item.phase != phase or not item.ready) {
                 session().poisoned = true;
                 throw std::runtime_error("SHMEM collective initialization/cleanup failed; restart the distributed job");
             }
+        }
+    }
+
+    static bool initialize_session(const std::string& group, int rank, int world, int timeout,
+                                   aclrtContext context, HcclComm comm, aclrtStream stream) {
+        auto& state = session();
+        struct Bootstrap {
+            aclshmemx_uniqueid_t uid{};
+            uint64_t ready = 1;
+        } bootstrap;
+        if (rank == 0)
+            bootstrap.ready = aclshmemx_get_uniqueid(&bootstrap.uid) == 0;
+        const auto ids = gather(bootstrap, comm, world, timeout, stream);
+        if (not ids[0].ready)
+            return false;
+        auto uid = ids[0].uid;
+        aclshmemx_init_attr_t attr{};
+        const auto attr_status = aclshmemx_set_attr_uniqueid_args(rank, world, kHeapBytes, &uid, &attr);
+        const auto attrs = gather(Status{Phase::Attributes, attr_status == 0}, comm, world, timeout, stream);
+        if (std::any_of(attrs.begin(), attrs.end(), [](const auto& item) { return not item.ready; }))
+            return false;
+        attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
+        attr.option_attr.shm_init_timeout = timeout;
+        attr.option_attr.shm_create_timeout = timeout;
+        attr.option_attr.control_operation_timeout = timeout;
+        state.group = group;
+        state.context = context;
+        state.rank = rank;
+        state.world = world;
+        state.poisoned = true;
+        const auto initialized = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attr);
+        agree(initialized == 0, Phase::Initialize, comm, world, timeout, stream);
+        state.initialized = true;
+        return true;
     }
 
     void check_context() const {
         auto& state = session();
         aclrtContext current = nullptr;
         check(aclrtGetCurrentContext(&current), "current context");
-        if (closed || state.poisoned || state.failed.load() || !state.initialized || current != state.context)
+        if (closed or state.poisoned or state.failed.load() or not state.initialized or current != state.context)
             throw std::runtime_error("SHMEM arena is closed, unavailable or used on a different NPU context");
     }
 
@@ -134,16 +177,16 @@ public:
     }
 
     static bool agree_capability(HcclComm comm, int world, int timeout, bool local_ready) {
-        if (world <= 0 || timeout <= 0)
+        if (world <= 0 or timeout <= 0)
             throw std::invalid_argument("SHMEM capability check requires a valid group and timeout");
-        local_ready = local_ready && timeout <= 3600;
-        const auto capabilities = gather(static_cast<uint16_t>(local_ready), comm, world, std::min(timeout, 3600),
+        local_ready = local_ready and timeout <= kMaxTimeoutSecs;
+        const auto capabilities = gather(static_cast<uint16_t>(local_ready), comm, world, std::min(timeout, kMaxTimeoutSecs),
                                          c10_npu::getCurrentNPUStream());
         return std::all_of(capabilities.begin(), capabilities.end(), [](const auto ready) { return ready == 1; });
     }
 
     static std::shared_ptr<ShmemArena> try_create(const std::string& group, int rank, int world,
-                                                size_t bytes, int timeout) {
+                                                 size_t bytes, int timeout) {
 #ifdef DEEPEP_WITH_SHMEM
         auto& state = session();
         std::lock_guard<std::mutex> guard(state.mutex);
@@ -154,80 +197,55 @@ public:
         check(HcclGetRankSize(comm, &comm_world), "HCCL size");
         if (comm_world == 0)
             throw std::runtime_error("SHMEM bootstrap requires a nonempty HCCL group");
-        auto stream = c10_npu::getCurrentNPUStream();
+        const auto stream = c10_npu::getCurrentNPUStream();
         aclrtContext context = nullptr;
         const auto context_status = aclrtGetCurrentContext(&context);
         const auto* soc = aclrtGetSocName();
-        const auto valid_timeout = timeout > 0 && timeout <= 3600;
+        const auto valid_timeout = timeout > 0 and timeout <= kMaxTimeoutSecs;
         const auto wait_timeout = valid_timeout ? timeout : 120;
-        const auto valid_size = bytes > 0 && bytes <= kHeapBytes - kAllocationReserveBytes - 511;
-        const auto charge = valid_size ? ((bytes + 511) & ~size_t{511}) + kAllocationReserveBytes : kHeapBytes;
-        bool ready = context_status == 0 && context != nullptr && valid_size && valid_timeout &&
-                     rank == static_cast<int>(comm_rank) && world == static_cast<int>(comm_world) &&
-                     soc != nullptr && std::string(soc).rfind("Ascend950", 0) == 0 && !state.poisoned && !state.failed.load();
+        const auto valid_size = bytes > 0 and bytes <= kHeapBytes - kAllocationReserveBytes - (kAlignmentBytes - 1);
+        const auto charge = valid_size ? (bytes + kAlignmentBytes - 1) / kAlignmentBytes * kAlignmentBytes + kAllocationReserveBytes
+                                       : kHeapBytes;
+        bool ready = context_status == 0 and context != nullptr and valid_size and valid_timeout and
+                     rank == static_cast<int>(comm_rank) and world == static_cast<int>(comm_world) and
+                     soc != nullptr and std::string_view(soc).starts_with("Ascend950") and not state.poisoned and not state.failed.load();
         if (state.initialized) {
-            ready = ready && state.group == group && state.rank == rank && state.world == world &&
-                    state.context == context && charge <= kHeapBytes - state.used;
+            ready = ready and state.group == group and state.rank == rank and state.world == world and
+                    state.context == context and charge <= kHeapBytes - state.used;
         } else {
             size_t free_bytes = 0, total_bytes = 0;
-            ready = ready && aclshmemx_init_status() == ACLSHMEM_STATUS_NOT_INITIALIZED &&
-                    aclrtGetMemInfo(ACL_HBM_MEM, &free_bytes, &total_bytes) == 0 &&
+            ready = ready and aclshmemx_init_status() == ACLSHMEM_STATUS_NOT_INITIALIZED and
+                    aclrtGetMemInfo(ACL_HBM_MEM, &free_bytes, &total_bytes) == 0 and
                     free_bytes >= kHeapBytes + kMemoryReserveBytes;
         }
         const Admission request{bytes, state.sequence, state.live, state.used, static_cast<uint64_t>(world),
-                                static_cast<uint64_t>(timeout), state.initialized, ready, state.poisoned || state.failed.load()};
+                                static_cast<uint64_t>(timeout), state.initialized, ready, state.poisoned or state.failed.load()};
         const auto admissions = gather(request, comm, comm_world, wait_timeout, stream);
-        for (const auto& item: admissions)
+        for (const auto& item: admissions) {
             if (item.poisoned)
                 throw std::runtime_error("SHMEM session was left incomplete; restart the distributed job");
-        for (const auto& item: admissions)
-            if (!item.ready || item.bytes != request.bytes || item.sequence != request.sequence ||
-                item.live != request.live || item.used != request.used || item.world != request.world ||
-                item.timeout != request.timeout || item.initialized != request.initialized)
+        }
+        for (const auto& item: admissions) {
+            if (not item.ready or item != request)
                 return nullptr;
+        }
 
         auto arena = std::shared_ptr<ShmemArena>(new ShmemArena());
         arena->peers.resize(world);
-        if (!state.initialized) {
-            struct Bootstrap {
-                aclshmemx_uniqueid_t uid{};
-                uint64_t ready = 1;
-            } bootstrap;
-            if (rank == 0)
-                bootstrap.ready = aclshmemx_get_uniqueid(&bootstrap.uid) == 0;
-            const auto ids = gather(bootstrap, comm, world, timeout, stream);
-            if (!ids[0].ready)
-                return nullptr;
-            auto uid = ids[0].uid;
-            aclshmemx_init_attr_t attr{};
-            const auto attr_status = aclshmemx_set_attr_uniqueid_args(rank, world, kHeapBytes, &uid, &attr);
-            const auto attrs = gather(Status{0, attr_status == 0}, comm, world, timeout, stream);
-            if (std::any_of(attrs.begin(), attrs.end(), [](const auto& item) { return !item.ready; }))
-                return nullptr;
-            attr.option_attr.data_op_engine_type = ACLSHMEM_DATA_OP_MTE;
-            attr.option_attr.shm_init_timeout = timeout;
-            attr.option_attr.shm_create_timeout = timeout;
-            attr.option_attr.control_operation_timeout = timeout;
-            state.group = group;
-            state.context = context;
-            state.rank = rank;
-            state.world = world;
-            state.poisoned = true;
-            const auto initialized = aclshmemx_init_attr(ACLSHMEMX_INIT_WITH_UNIQUEID, &attr);
-            agree(initialized == 0, 1, comm, world, timeout, stream);
-            state.initialized = true;
-        }
+        if (not state.initialized and not initialize_session(group, rank, world, timeout, context, comm, stream))
+            return nullptr;
+
         state.poisoned = true;
-        arena->pointer = aclshmem_align(512, bytes);
+        arena->pointer = aclshmem_align(kAlignmentBytes, bytes);
         bool allocated = arena->pointer != nullptr;
         if (allocated) {
             allocated = aclrtMemset(arena->pointer, bytes, 0, bytes) == 0;
-            for (int peer = 0; peer < world; ++peer) {
+            for (int peer = 0; peer < world; ++ peer) {
                 arena->peers[peer] = aclshmem_ptr(arena->pointer, peer);
-                allocated = allocated && arena->peers[peer] != nullptr;
+                allocated = allocated and arena->peers[peer] != nullptr;
             }
         }
-        agree(allocated, 2, comm, world, timeout, stream);
+        agree(allocated, Phase::Allocate, comm, world, timeout, stream);
         arena->comm = comm;
         arena->world = world;
         arena->timeout = timeout;
@@ -273,7 +291,7 @@ public:
 
     void* peer_ptr(int peer) const {
 #ifdef DEEPEP_WITH_SHMEM
-        if (closed || peer < 0 || peer >= world)
+        if (closed or peer < 0 or peer >= world)
             throw std::out_of_range("SHMEM peer index or closed arena");
         return peers[peer];
 #else
@@ -297,7 +315,7 @@ public:
         check_context();
         state.poisoned = true;
         const auto waited = aclrtSynchronizeStreamWithTimeout(stream, timeout * 1000);
-        agree(waited == 0, 3, comm, world, timeout, stream);
+        agree(waited == 0, Phase::Barrier, comm, world, timeout, stream);
         aclshmem_barrier_all();
         state.poisoned = false;
 #else
@@ -312,15 +330,16 @@ public:
         if (closed)
             return;
         check_context();
-        auto stream = c10_npu::getCurrentNPUStream();
+        const auto stream = c10_npu::getCurrentNPUStream();
         const Admission request{id, state.sequence, state.live, state.used, static_cast<uint64_t>(world),
                                 static_cast<uint64_t>(timeout), state.initialized, 1, state.poisoned};
         state.poisoned = true;
-        for (const auto& item: gather(request, comm, world, timeout, stream))
-            if (std::memcmp(&item, &request, sizeof(request)) != 0)
+        for (const auto& item: gather(request, comm, world, timeout, stream)) {
+            if (item != request)
                 throw std::runtime_error("SHMEM arenas must be closed in the same order on every rank");
+        }
         const auto waited = aclrtSynchronizeDevice();
-        agree(waited == 0, 4, comm, world, timeout, stream);
+        agree(waited == 0, Phase::Close, comm, world, timeout, stream);
         aclshmem_barrier_all();
         aclshmem_free(pointer);
         pointer = nullptr;
@@ -329,7 +348,7 @@ public:
         state.used -= charge;
         if (state.live == 0) {
             const auto finalized = aclshmem_finalize();
-            agree(finalized == 0, 5, comm, world, timeout, stream);
+            agree(finalized == 0, Phase::Finalize, comm, world, timeout, stream);
             state.initialized = false;
             state.group.clear();
             state.context = nullptr;
@@ -342,7 +361,7 @@ public:
 
     ~ShmemArena() {
 #ifdef DEEPEP_WITH_SHMEM
-        if (!closed) {
+        if (not closed) {
             auto& state = session();
             std::lock_guard<std::mutex> guard(state.mutex);
             state.poisoned = true;
@@ -351,4 +370,4 @@ public:
     }
 };
 
-}
+}  // namespace deep_ep::comm

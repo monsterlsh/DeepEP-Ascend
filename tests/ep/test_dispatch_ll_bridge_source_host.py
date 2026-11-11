@@ -3,14 +3,12 @@
 This validates byte/slot mapping and rejects malformed provenance. It does not
 validate Ascend compilation, memory ordering, DMA semantics or SHMEM transport.
 """
-from pathlib import Path
-import hashlib
-import json
-import re
-import subprocess
 
-ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / '.workbuddy' / 'dispatch-only-bridge-20261110'
+import re
+import unittest
+
+from _host_test_helpers import ROOT, run_host_cpp
+
 FILES = [
     "deep_ep/include/deep_ep/common/compiled.hpp",
     "deep_ep/include/deep_ep/common/math.hpp",
@@ -23,11 +21,7 @@ def body(path):
     return re.sub(r"^#(?:include|pragma).*\n", "", (ROOT / path).read_text(), flags=re.M)
 
 
-import unittest
-
-
-def run_source_check():
-    OUT.mkdir(parents=True, exist_ok=True)
+def host_test_source():
     prefix = r'''
     #include <algorithm>
     #include <cassert>
@@ -139,26 +133,14 @@ def run_source_check():
         std::cout << "PASS " << passed << " CPU bridge source cases\n";
     }
     '''
-    cpp = OUT / "bridge_audit.cpp"
-    exe = OUT / "bridge_audit.exe"
-    cpp.write_text(source)
-    compile_result = subprocess.run(["g++", "-std=c++20", "-O2", "-Wall", "-Wextra", str(cpp), "-o", str(exe)], text=True, capture_output=True)
-    if compile_result.returncode:
-        raise RuntimeError(compile_result.stdout + compile_result.stderr)
-    run = subprocess.run([str(exe)], text=True, capture_output=True)
-    result = {"cpu_only": True, "source_cases": 10, "returncode": run.returncode,
-              "stdout": run.stdout, "stderr": run.stderr,
-              "source_sha256": {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest() for p in FILES},
-              "limits": ["No Ascend compiler or NPU execution", "DMA/event intrinsics are CPU stubs", "Map insertion exercised serially; device atomic/fence behavior untested"]}
-    (OUT / "checks.json").write_text(json.dumps(result, indent=2) + "\n")
-    return result
+    return source
 
 
 class DispatchLLBridgeSourceTests(unittest.TestCase):
     def test_source_execution(self):
-        result = run_source_check()
-        self.assertEqual(result["returncode"], 0, result)
+        output = run_host_cpp(host_test_source())
+        self.assertIn('PASS 10 CPU bridge source cases', output)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

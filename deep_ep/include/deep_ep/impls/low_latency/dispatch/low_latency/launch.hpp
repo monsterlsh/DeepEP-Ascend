@@ -7,6 +7,7 @@
 #include <type_traits>
 
 namespace deepep {
+
 struct EpServerDedupKernelArgs {
     uint8_t* commArgs;  // Persistent device configuration owned by BufferRuntime.
     uint8_t* x;

@@ -6,7 +6,7 @@ Routing weights are returned as metadata; combine only sums expert outputs.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -17,14 +17,13 @@ from ..utils.event import EventOverlap
 
 @dataclass(frozen=True)
 class DecodeHandle:
-    """Routing state owned by a DecodeBuffer; pass unchanged to combine.
+    """Routing state returned by DecodeBuffer.dispatch and consumed by combine.
 
-    Outputs are grouped by local expert. ``expert_recv_counts`` is an int64
-    device tensor; only the leading sum(counts) rows are valid. CPU counts are
-    populated only when dispatch requests ``do_cpu_sync=True``. The public
-    ``recv_topk_weights`` tensor contains the weight of each expanded expert
-    row; the expert computation applies it if the model requires weighting.
-    ``backend`` is always ``'ep'``; native transport selection is internal.
+    Outputs are grouped by local expert. The sum of the int64 device tensor
+    ``expert_recv_counts`` gives the number of valid leading rows. Dispatch
+    also populates CPU counts when called with ``do_cpu_sync=True``.
+    ``recv_topk_weights`` contains one weight per expanded expert row.
+    ``backend`` is always ``'ep'``.
     """
 
     expert_recv_counts: torch.Tensor
@@ -56,14 +55,19 @@ class DecodeBuffer:
                  *, num_sms: int = 32,
                  use_huge1g_page: bool = True, num_cpu_timeout_secs: int = 300,
                  num_gpu_timeout_secs: int = 100):
-        if (type(num_max_tokens_per_rank) is not int or num_max_tokens_per_rank <= 0
-                or hidden <= 0 or hidden % 128 or not 1 <= num_topk <= 32
-                or not group.size() <= num_experts <= 1024 or num_experts % group.size()
-                or num_topk > num_experts
-                or num_sms < 0 or num_cpu_timeout_secs <= 0 or num_gpu_timeout_secs <= 0):
-            raise ValueError('Invalid decode capacity, model shape, cores or timeout')
+        if type(num_max_tokens_per_rank) is not int or num_max_tokens_per_rank <= 0:
+            raise ValueError('num_max_tokens_per_rank must be a positive integer')
+        num_ranks = group.size()
+        if hidden <= 0 or hidden % 128:
+            raise ValueError('hidden must be a positive multiple of 128')
+        if not num_ranks <= num_experts <= 1024 or num_experts % num_ranks:
+            raise ValueError('num_experts must be divisible by the group size and between the group size and 1024')
+        if not 1 <= num_topk <= min(32, num_experts):
+            raise ValueError('num_topk must be between 1 and min(32, num_experts)')
+        if num_sms < 0 or num_cpu_timeout_secs <= 0 or num_gpu_timeout_secs <= 0:
+            raise ValueError('num_sms must be nonnegative and timeouts must be positive')
         self.group = group
-        self.num_ranks = group.size()
+        self.num_ranks = num_ranks
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.hidden = hidden
         self.num_topk = num_topk
@@ -89,7 +93,7 @@ class DecodeBuffer:
             raise ValueError('Use the NPU on which this DecodeBuffer was constructed')
 
     def _check_tensor(self, tensor, shape, dtype, name) -> None:
-        if (not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != tuple(shape)
+        if (not isinstance(tensor, torch.Tensor) or tensor.shape != shape
                 or tensor.dtype != dtype or tensor.device != self.device or not tensor.is_contiguous()):
             raise ValueError(f'{name} must be a contiguous {shape} {dtype} tensor on {self.device}')
 
@@ -99,8 +103,8 @@ class DecodeBuffer:
             self._last_event.current_stream_wait()
 
     def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
-                 *, do_cpu_sync: bool = False):
-        """Return ``(expert_x, handle, event)``; no backend-specific layout handling.
+                 *, do_cpu_sync: bool = False) -> Tuple[torch.Tensor, DecodeHandle, EventOverlap]:
+        """Dispatch tokens and return ``(expert_x, handle, event)``.
 
         Inputs: BF16 [B,H], int64 [B,K] valid unique expert IDs, FP32 [B,K]
         weights. All ranks must use identical B/H/K/E and options. The call does
@@ -113,12 +117,12 @@ class DecodeBuffer:
         self._check_alive()
         if not isinstance(x, torch.Tensor) or x.ndim != 2:
             raise ValueError('x must have shape [B,H]')
-        bs = x.shape[0]
-        if not 0 < bs <= self.num_max_tokens_per_rank:
+        num_tokens = x.shape[0]
+        if not 0 < num_tokens <= self.num_max_tokens_per_rank:
             raise ValueError('Require 0 < B <= num_max_tokens_per_rank')
-        self._check_tensor(x, (bs, self.hidden), torch.bfloat16, 'x')
-        self._check_tensor(topk_idx, (bs, self.num_topk), torch.int64, 'topk_idx')
-        self._check_tensor(topk_weights, (bs, self.num_topk), torch.float32, 'topk_weights')
+        self._check_tensor(x, (num_tokens, self.hidden), torch.bfloat16, 'x')
+        self._check_tensor(topk_idx, (num_tokens, self.num_topk), torch.int64, 'topk_idx')
+        self._check_tensor(topk_weights, (num_tokens, self.num_topk), torch.float32, 'topk_weights')
         self._begin()
         try:
             recv, _, weights, handle, event = self._buffer.dispatch(
@@ -141,7 +145,7 @@ class DecodeBuffer:
             raise
         return recv, result, event
 
-    def combine(self, x: torch.Tensor, handle: DecodeHandle):
+    def combine(self, x: torch.Tensor, handle: DecodeHandle) -> Tuple[torch.Tensor, EventOverlap]:
         """Return ``(combined_x, event)`` by summing expert outputs unchanged.
 
         ``x`` is BF16 with the dispatch output's shape/order. Apply any routing

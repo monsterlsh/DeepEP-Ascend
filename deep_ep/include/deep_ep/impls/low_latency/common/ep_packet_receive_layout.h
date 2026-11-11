@@ -2,11 +2,10 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstdint>
 
-namespace DispatchDedup {
-namespace PacketReceiveLayout {
+namespace DispatchDedup::PacketReceiveLayout {
+
 // A transport layout hint, independent of application-level packet types.
 // Only the first float of the first Flag block carries the hint.
 constexpr uint32_t kMarkerOffset = 480U;
@@ -17,10 +16,9 @@ enum class State { Pending, Compact, KeepFlags };
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__ inline
 #endif
-    constexpr State
-    Decode(float sum, uint32_t blocks) {
+constexpr State Decode(float sum, uint32_t blocks) {
     return sum == float(blocks * 8U) ? State::Compact
                                      : (sum == float(blocks * 8U) + (kKeepFlags - kCompact) ? State::KeepFlags : State::Pending);
 }
-}  // namespace PacketReceiveLayout
-}  // namespace DispatchDedup
+
+}  // namespace DispatchDedup::PacketReceiveLayout

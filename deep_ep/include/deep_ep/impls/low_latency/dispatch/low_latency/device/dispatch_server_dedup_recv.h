@@ -2,9 +2,9 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
 #include <adv_api/reduce/sum.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_timeout.h>
 #include <deep_ep/impls/low_latency/common/ep_packet_receive_layout.h>
@@ -12,6 +12,7 @@
 #include <deep_ep/impls/low_latency/dispatch/low_latency/device/dispatch_server_dedup_receive_packet.h>
 
 namespace DispatchDedup {
+
 using namespace AscendC;
 
 template <class XType, bool WireFp8, bool E4M3, bool Prequantized = false>
@@ -309,7 +310,6 @@ private:
     TPipe* pipe_ = nullptr;
     bool enableDedup_ = false;
     uint64_t windowOffset_ = 0;
-    static constexpr uint32_t recvCoreNum_ = kEpServerDedupRecvCoreNum;
     uint32_t bs_ = 0U, k_ = 0U, experts_ = 0U, localExperts_ = 0U, receiver_ = 0U;
     uint32_t hiddenBytes_ = 0U, laneStride_ = 0U, lanes_ = 0U;
     EpServerDedupDataLayout data_{};
@@ -319,4 +319,5 @@ private:
     GlobalTensor<uint32_t> tokenType_, destinationIndex_, relayReadIndex_, nativeSourceIds_;
     bool hasNativeSourceIds_ = false;
 };
+
 }  // namespace DispatchDedup

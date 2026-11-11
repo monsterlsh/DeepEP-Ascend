@@ -2,10 +2,10 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstdint>
 
 namespace EpServerOrder {
+
 // Preconditions: servers > 0, ownServer < servers, ordinal < servers.
 // Rotate each half from the next relative position. At 16+ servers, both
 // dedup and direct paths alternate own/other half; smaller worlds retain
@@ -14,8 +14,7 @@ namespace EpServerOrder {
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__
 #endif
-    inline uint32_t
-    ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal) {
+inline uint32_t ServerDedupHalfOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal) {
     const uint32_t split = servers / 2U;
     const bool lower = ownServer < split;
     const uint32_t ownBase = lower ? 0U : split;
@@ -41,8 +40,8 @@ __aicore__
 #if defined(__CCE__) && defined(__CCE_IS_AICORE__)
 __aicore__
 #endif
-    inline uint32_t
-    ServerDedupDispatchDirectOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal) {
+inline uint32_t ServerDedupDispatchDirectOrder(uint32_t servers, uint32_t ownServer, uint32_t ordinal) {
     return servers >= 16U ? ServerDedupHalfOrder(servers, ownServer, ordinal) : (ownServer + ordinal) % servers;
 }
+
 }  // namespace EpServerOrder

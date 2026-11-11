@@ -1,16 +1,9 @@
-"""Legacy explicit experimental adapter for the Ascend decode kernels.
+"""Experimental dispatch/combine adapter used by tests/ep/_low_latency_fixture.py.
 
-The default EPBuffer integrates native transport selection with the standard
-metadata and epilogues. This retained private adapter is exercised through
-tests/ep/_low_latency_fixture.py; it is not selected by the public EPBuffer API.
-Its internal handles must stay inside that fixture, which returns opaque test
-handles and rejects native/foreign handles. DecodeBuffer uses native EPBuffer.
-Context timeout values do not bound LL packet/count polling (EXP-TIMEOUT-01).
-
-All ranks must use identical B/M/H/K/E and call order. Routing entries must be
-valid expert IDs (no masked -1 entries), with no duplicate expert per token.
-Dispatch still transports weight metadata. Combine only sums expert outputs;
-any routing weights must already have been applied by the expert computation.
+All ranks must use the same shape, capacity and call order. Routes must contain
+distinct, valid expert IDs per token. Dispatch transports weights as metadata.
+Apply model weights to the expert outputs before combine sums them.
+Packet and count polling can outlast the context timeout.
 """
 
 import threading
@@ -20,7 +13,10 @@ import torch
 # noinspection PyUnresolvedReferences
 import deep_ep._C as _C
 
+from .ep import EPHandle
 from ..utils.event import EventHandle, EventOverlap
+from ..utils.math import ceil_div
+from ..utils.semantic import value_or
 
 
 class LowLatencyState:
@@ -42,7 +38,7 @@ class LowLatencyState:
             raise ValueError('Use the NPU on which this EPBuffer was constructed')
 
     def _check_tensor(self, value, shape, dtypes, name) -> None:
-        if (not isinstance(value, torch.Tensor) or tuple(value.shape) != tuple(shape)
+        if (not isinstance(value, torch.Tensor) or value.shape != shape
                 or value.dtype not in dtypes or value.device != self.device or not value.is_contiguous()):
             raise ValueError(f'{name} must be a contiguous {shape} tensor on {self.device}, dtype {dtypes}')
 
@@ -87,8 +83,6 @@ class LowLatencyState:
                  previous_event, async_with_compute_stream, allocate_on_comm_stream, handle,
                  do_handle_copy, do_cpu_sync, do_expand, do_zero_padding,
                  use_tma_aligned_col_major_sf, defer_epilogue):
-        from .ep import EPHandle
-
         self._check_alive(buffer)
         self._check_schedule(num_sms, num_qps, allocate_on_comm_stream, defer_epilogue)
         if (handle is not None or cumulative_local_expert_recv_stats is not None
@@ -103,7 +97,7 @@ class LowLatencyState:
             raise ValueError('topk_idx must be an int64 [B,K] tensor')
         num_tokens, hidden = values.shape
         num_topk = topk_idx.shape[1]
-        capacity = buffer.num_max_tokens_per_rank if num_max_tokens_per_rank is None else num_max_tokens_per_rank
+        capacity = value_or(num_max_tokens_per_rank, buffer.num_max_tokens_per_rank)
         if type(capacity) is not int or not 0 < num_tokens <= capacity <= 256:
             raise ValueError('Low latency requires 0 < B <= num_max_tokens_per_rank <= 256')
         if type(num_experts) is not int or num_experts <= 0:
@@ -111,8 +105,9 @@ class LowLatencyState:
         self._check_tensor(values, (num_tokens, hidden), (torch.bfloat16, torch.float16, torch.float8_e4m3fn), 'x')
         self._check_tensor(topk_idx, (num_tokens, num_topk), (torch.int64,), 'topk_idx')
         self._check_tensor(topk_weights, (num_tokens, num_topk), (torch.float32,), 'topk_weights')
+        num_scales = ceil_div(hidden, 128)
         if values.dtype == torch.float8_e4m3fn:
-            self._check_tensor(scales, (num_tokens, (hidden + 127) // 128), (torch.int32, torch.float32), 'scales')
+            self._check_tensor(scales, (num_tokens, num_scales), (torch.int32, torch.float32), 'scales')
         elif scales is not None:
             raise ValueError('scales are only accepted with FP8 inputs')
         dtype = str(values.dtype).removeprefix('torch.')
@@ -130,7 +125,7 @@ class LowLatencyState:
             tensors = dict(
                 input=values, indices=topk_idx.to(torch.int32), weights=topk_weights, scales=scales,
                 output=alloc((num_capacity_rows, hidden), dtype=values.dtype, device=self.device),
-                output_scales=(alloc((num_capacity_rows, (hidden + 127) // 128), dtype=scales.dtype, device=self.device)
+                output_scales=(alloc((num_capacity_rows, num_scales), dtype=scales.dtype, device=self.device)
                                if scales is not None else None),
                 expert_recv_counts=torch.empty((num_experts // buffer.num_ranks,), dtype=torch.int64, device=self.device),
                 send_counts=torch.empty((num_experts,), dtype=torch.int32, device=self.device),
@@ -146,8 +141,11 @@ class LowLatencyState:
                 _C.dispatch_low_latency(
                     buffer.runtime, tensors, num_tokens, hidden, num_topk, num_experts, num_capacity_rows, dtype)
                 counts = tensors['expert_recv_counts']
-                count_list = counts.cpu().tolist() if do_cpu_sync is not False else []
-                num_expanded_tokens = sum(count_list) if do_cpu_sync is not False else num_capacity_rows
+                count_list = []
+                num_expanded_tokens = num_capacity_rows
+                if do_cpu_sync is not False:
+                    count_list = counts.cpu().tolist()
+                    num_expanded_tokens = sum(count_list)
                 out = tensors['output'][:num_expanded_tokens]
                 out_scales = tensors['output_scales'][:num_expanded_tokens] if scales is not None else None
                 result = EPHandle(

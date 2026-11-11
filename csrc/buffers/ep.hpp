@@ -251,8 +251,8 @@ public:
             EP_HOST_ASSERT(dst_gsge_idx.device() == x.device());
         }
 
-        const auto ll_launch = dispatch_low_latency->prepare(*context, x, num_max_tokens_per_rank,
-            hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes, sf.has_value());
+        const auto ll_launch = dispatch_low_latency->prepare(
+            *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes, sf.has_value());
         if (ll_launch and previous_event)
             previous_event->current_stream_wait();
         const auto dispatch_buffer = ll_launch ? ll_launch->buffer() : context->buffer;
@@ -299,7 +299,7 @@ public:
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
-                        ll_launch = ll_launch, dispatch_low_latency = dispatch_low_latency]() {
+                         ll_launch = ll_launch, dispatch_low_latency = dispatch_low_latency]() {
             const auto ll_failure_guard = dispatch_low_latency->failure_guard();
             // Wait GPU notify or reuse cached allocation sizes
             int num_recv_tokens = context->num_ranks * num_max_tokens_per_rank;

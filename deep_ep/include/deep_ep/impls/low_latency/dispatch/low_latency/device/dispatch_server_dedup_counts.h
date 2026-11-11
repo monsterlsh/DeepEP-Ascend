@@ -2,13 +2,14 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
 #include <adv_api/reduce/sum.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_timeout.h>
 
 namespace DispatchDedup {
+
 using namespace AscendC;
 
 // Adapted from Memory's CalAndSendCntByRankAndExpert / WaitDispatch / cumsum
@@ -25,7 +26,6 @@ public:
         epRankId_ = args_->rank;
         epWorldSize_ = args_->rankSize;
         aivId_ = GetBlockIdx();
-        axisBS_ = bs;
         axisK_ = topK;
         expertIdsCnt_ = bs * topK;
         rscvStatusNum_ = experts;
@@ -100,7 +100,7 @@ private:
     uint64_t stateOffset_ = 0;
     int64_t originalOverflowMode_ = 0;
     uint32_t epRankId_ = 0, epWorldSize_ = 0, aivId_ = 0;
-    uint32_t axisBS_ = 0, axisK_ = 0, expertIdsCnt_ = 0;
+    uint32_t axisK_ = 0, expertIdsCnt_ = 0;
     uint32_t rscvStatusNum_ = 0, moeExpertNumPerRank_ = 0, expertTokenNumsType_ = 0;
     uint32_t statusCntAlign_ = 0;
     uint32_t startStatusIndex_ = 0, endStatusIndex_ = 0, recStatusNumPerCore_ = 0;

@@ -1,18 +1,14 @@
 """CPU source execution of the new padding/route-normalization device header."""
-from pathlib import Path
-import hashlib
-import json
-import re
-import subprocess
 
-ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / '.workbuddy' / 'dispatch-only-bridge-20261110'
-HEADER = ROOT / "deep_ep/include/deep_ep/impls/ep/dispatch_low_latency_prepare.hpp"
+import re
 import unittest
 
+from _host_test_helpers import ROOT, run_host_cpp
 
-def run_source_check():
-    OUT.mkdir(parents=True, exist_ok=True)
+HEADER = ROOT / "deep_ep/include/deep_ep/impls/ep/dispatch_low_latency_prepare.hpp"
+
+
+def host_test_source():
     source = r'''
     #include <algorithm>
     #include <cassert>
@@ -20,9 +16,7 @@ def run_source_check():
     #include <cstring>
     #include <iostream>
     #include <vector>
-    #define __global__
-    #define __vector__
-    #define __gm__
+    #include <deep_ep/common/math.hpp>
     using GM_ADDR = uint8_t*;
     constexpr int EVENT_ID0 = 0;
     namespace AscendC {
@@ -96,24 +90,14 @@ def run_source_check():
         std::cout << "PASS 5 CPU prepare source cases\n";
     }
     '''
-    cpp, exe = OUT / "prepare_audit.cpp", OUT / "prepare_audit.exe"
-    cpp.write_text(source)
-    compile_result = subprocess.run(["g++", "-std=c++20", "-O2", "-Wall", "-Wextra", str(cpp), "-o", str(exe)], text=True, capture_output=True)
-    if compile_result.returncode:
-        raise RuntimeError(compile_result.stdout + compile_result.stderr)
-    run = subprocess.run([str(exe)], text=True, capture_output=True)
-    result = {"cpu_only": True, "source_cases": 5, "returncode": run.returncode, "stdout": run.stdout,
-              "stderr": run.stderr, "header_sha256": hashlib.sha256(HEADER.read_bytes()).hexdigest(),
-              "limits": ["CPU Tensor/DMA/event stubs; no Ascend compiler or NPU", "Does not prove device pipeline ordering"]}
-    (OUT / "prepare-checks.json").write_text(json.dumps(result, indent=2) + "\n")
-    return result
+    return source
 
 
 class DispatchLLPrepareSourceTests(unittest.TestCase):
     def test_source_execution(self):
-        result = run_source_check()
-        self.assertEqual(result["returncode"], 0, result)
+        output = run_host_cpp(host_test_source(), include_dirs=(ROOT / 'deep_ep/include',))
+        self.assertIn('PASS 5 CPU prepare source cases', output)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

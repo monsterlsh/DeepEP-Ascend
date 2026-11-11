@@ -3,13 +3,15 @@
 Routing examples are independent oracles, not execution of the SIMT planner.
 These checks do not establish device memory ordering or SHMEM completion.
 """
-from pathlib import Path
-import subprocess
-import tempfile
+
 import unittest
 
+from _host_test_helpers import ROOT, run_host_cpp
 
-ROOT = Path(__file__).resolve().parents[2]
+
+def run_layout_check(source):
+    run_host_cpp(source, include_dirs=(ROOT / 'deep_ep/include',),
+                 headers={'utils/debug/asc_assert.h': '#pragma once\n#include <cassert>\n'})
 
 
 class DirectDispatchHostTests(unittest.TestCase):
@@ -102,19 +104,7 @@ int main() {
     check<4, 8, false, 32768, 14336, true, false, 16, 256>(1, true);
 }
 '''
-        with tempfile.TemporaryDirectory() as directory:
-            temporary = Path(directory)
-            stub = temporary / 'utils' / 'debug' / 'asc_assert.h'
-            stub.parent.mkdir(parents=True)
-            stub.write_text('#pragma once\n#include <cassert>\n')
-            cpp, exe = temporary / 'stages.cpp', temporary / 'stages.exe'
-            cpp.write_text(source)
-            built = subprocess.run(['g++', '-std=c++20', '-O2', '-Wall', '-Wextra',
-                                    '-I', str(temporary), '-I', str(ROOT / 'deep_ep/include'),
-                                    str(cpp), '-o', str(exe)], capture_output=True, text=True)
-            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-            result = subprocess.run([str(exe)], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        run_layout_check(source)
 
     def test_native_addresses_and_cached_stride(self):
         source = r'''
@@ -241,20 +231,7 @@ int main() {
     std::cout << "native address, route holes, empty rank, masked entries and cached weight examples passed\n";
 }
 '''
-        with tempfile.TemporaryDirectory() as directory:
-            temporary = Path(directory)
-            stub = temporary / 'utils' / 'debug' / 'asc_assert.h'
-            stub.parent.mkdir(parents=True)
-            stub.write_text('#pragma once\n#include <cassert>\n')
-            cpp = temporary / 'direct.cpp'
-            exe = temporary / 'direct.exe'
-            cpp.write_text(source)
-            command = ['g++', '-std=c++20', '-O2', '-Wall', '-Wextra', '-I', str(temporary),
-                       '-I', str(ROOT / 'deep_ep/include'), str(cpp), '-o', str(exe)]
-            built = subprocess.run(command, capture_output=True, text=True)
-            self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
-            result = subprocess.run([str(exe)], capture_output=True, text=True)
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        run_layout_check(source)
 
 
 if __name__ == '__main__':

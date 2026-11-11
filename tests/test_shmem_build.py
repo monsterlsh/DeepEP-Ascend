@@ -91,10 +91,7 @@ class ShmemBuildTest(unittest.TestCase):
             self.assertNotEqual(original, self.config()['library_sha256'])
 
     def test_host_session(self):
-        compiler = shutil.which('g++') or shutil.which('clang++')
-        fallback = Path('C:/Program Files/Mingw-w64/mingw64-14.2/bin/g++.exe')
-        if compiler is None and fallback.is_file():
-            compiler = str(fallback)
+        compiler = os.environ.get('CXX') or shutil.which('g++') or shutil.which('clang++')
         if compiler is None:
             self.skipTest('host C++ compiler unavailable')
         headers = ('acl/acl.h', 'hccl/hccl.h', 'hccl/hccl_comm.h',

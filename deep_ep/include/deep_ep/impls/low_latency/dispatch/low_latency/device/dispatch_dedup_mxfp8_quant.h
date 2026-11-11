@@ -2,10 +2,10 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
 
 namespace DispatchDedupMxfp8Quant {
+
 using namespace AscendC;
 
 constexpr int kPairCount = 2;

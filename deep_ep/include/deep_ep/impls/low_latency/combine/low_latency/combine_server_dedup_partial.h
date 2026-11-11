@@ -2,8 +2,8 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
 #include <deep_ep/impls/low_latency/combine/low_latency/ep_memory_server_dedup_buffer_layout.h>
@@ -11,6 +11,7 @@
 #include <deep_ep/impls/low_latency/combine/low_latency/combine_server_dedup_select.h>
 
 namespace CombineDedup {
+
 using namespace AscendC;
 
 // Expert outputs carry any caller-applied routing weights; M4 only sums them.
@@ -31,7 +32,7 @@ public:
         localExperts_ = experts / uint32_t(args->rankSize);
         dtype_ = dtype;
         window_ = window;
-        blocks_ = (h * 2U + 479U) / 480U;
+        blocks_ = EpCombinePayloadBlockCount(h);
         packetBytes_ = blocks_ * 512U;
         inputBytes_ = layout.inputBytes;
         stageStride_ = EpCombineAlign(h * 2U, 512U);
@@ -250,4 +251,5 @@ private:
     uint32_t inputSequence_ = 0, scanRows_ = 0;
     uint64_t stageStride_ = 0, stageBase_ = 0, window_ = 0;
 };
+
 }  // namespace CombineDedup

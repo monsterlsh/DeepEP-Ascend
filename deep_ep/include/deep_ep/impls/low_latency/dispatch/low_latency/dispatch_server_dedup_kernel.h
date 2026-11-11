@@ -2,13 +2,13 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <deep_ep/impls/low_latency/dispatch/low_latency/device/dispatch_server_dedup_magic.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/device/dispatch_server_dedup_counts.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/device/dispatch_server_dedup_send.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/device/dispatch_server_dedup_recv.h>
 
 namespace DispatchDedup {
+
 template <class XType, bool WireFp8, bool E4M3, bool Prequantized = false>
 class DispatchMemoryServerDedupKernel {
 public:
@@ -17,16 +17,15 @@ public:
                                 GM_ADDR destinationIndexOut, GM_ADDR relayReadIndexOut, GM_ADDR sourceMaskOut, GM_ADDR expertScalesOut,
                                 uint32_t bs, uint32_t h, uint32_t topK, uint32_t experts, uint32_t expertTokenNumsType, TPipe* pipe,
                                 GM_ADDR inputScales = nullptr, bool enableDedup = true, GM_ADDR nativeSourceIds = nullptr) {
-        args_ = reinterpret_cast<const __gm__ DispatchDedup::CommArgs*>(commArgs);
+        const auto* args = reinterpret_cast<const __gm__ CommArgs*>(commArgs);
         core_ = GetBlockIdx();
-        pipe_ = pipe;
-        const uint32_t magic = RotateDispatchServerDedupMagic(args_, core_, pipe);
+        const uint32_t magic = RotateDispatchServerDedupMagic(args, core_, pipe);
         counts_.Init(commArgs, expertIds, expertTokenNumsOut, sendCountsOut, bs, topK, experts, expertTokenNumsType, magic, pipe);
         if (core_ < kEpServerDedupSendCoreNum)
-            sender_.Init(args_, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts, pipe, magic, inputScales,
+            sender_.Init(args, x, expertIds, expertScales, sourceMaskOut, expertScalesOut, bs, h, topK, experts, pipe, magic, inputScales,
                          enableDedup);
         else
-            receiver_.Init(args_, expandXOut, dynamicScalesOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut, bs, h, topK, experts,
+            receiver_.Init(args, expandXOut, dynamicScalesOut, tokenTypeOut, destinationIndexOut, relayReadIndexOut, bs, h, topK, experts,
                            pipe, magic, enableDedup, nativeSourceIds);
     }
 
@@ -35,7 +34,6 @@ public:
 
         if (core_ < kEpServerDedupSendCoreNum) {
             sender_.Process(counts_.ScratchPool(), counts_.ReservedBytes());
-
         } else {
             counts_.RecvCnt();
             counts_.CalcCumsum();
@@ -47,17 +45,13 @@ public:
         }
 
         counts_.Finish();
-
-        // No shared work follows local completion. Same-stream kernel completion
-        // orders the next launch after all cores finish their writes and cleanup.
     }
 
 private:
     ServerDedupCounts counts_;
     ServerDedupSender<XType, WireFp8, E4M3, Prequantized> sender_;
     ServerDedupReceiver<XType, WireFp8, E4M3, Prequantized> receiver_;
-    const __gm__ DispatchDedup::CommArgs* args_ = nullptr;
-    TPipe* pipe_ = nullptr;
     uint32_t core_ = 0;
 };
+
 }  // namespace DispatchDedup

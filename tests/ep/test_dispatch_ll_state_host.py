@@ -3,20 +3,16 @@
 This exercises ownership/error/event state transitions, not NPU behavior. Device
 submission failures, Torch allocation, SHMEM and events are mocked; no runtime is imported.
 """
-from pathlib import Path
-import hashlib
-import json
+
 import re
-import subprocess
 import unittest
 
+from _host_test_helpers import ROOT, run_host_cpp
 
-ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / '.workbuddy' / 'dispatch-direct-20261111'
 HEADER = ROOT / 'csrc/buffers/dispatch_low_latency.hpp'
 
 
-def run_state_check():
+def host_test_source():
     prefix = r'''
 #include <cassert>
 #include <cstdint>
@@ -296,30 +292,13 @@ int main() {
     std::cout << "PASS " << cases << " CPU State source cases\n";
 }
 '''
-    OUT.mkdir(parents=True, exist_ok=True)
-    cpp, exe = OUT / 'state_audit.cpp', OUT / 'state_audit.exe'
-    cpp.write_text(prefix + production + harness)
-    compiled = subprocess.run(['g++', '-std=c++20', '-O2', '-Wall', '-Wextra',
-                               '-I' + str(ROOT), '-I' + str(ROOT / 'deep_ep/include'),
-                               str(cpp), '-o', str(exe)], capture_output=True, text=True)
-    if compiled.returncode:
-        raise RuntimeError(compiled.stdout + compiled.stderr)
-    run = subprocess.run([str(exe)], text=True, capture_output=True)
-    result = {'cpu_only': True, 'source_cases': int(re.search(r'PASS (\d+) CPU State', run.stdout)[1]) if run.returncode == 0 else 0, 'returncode': run.returncode,
-              'stdout': run.stdout, 'stderr': run.stderr,
-              'header_sha256': hashlib.sha256(HEADER.read_bytes()).hexdigest(),
-              'policy_sha256': hashlib.sha256((ROOT / 'csrc/kernels/ep/dispatch_low_latency_policy.hpp').read_bytes()).hexdigest(),
-              'limits': ['Actual State class and policy; Torch/SHMEM/Event dependencies mocked',
-                         'No CANN compile, NPU execution or actual asynchronous DMA']}
-    (OUT / 'state-checks.json').write_text(json.dumps(result, indent=2) + '\n')
-    return result
+    return prefix + production + harness
 
 
 class DispatchLLStateHostTests(unittest.TestCase):
     def test_actual_state_transitions(self):
-        result = run_state_check()
-        self.assertEqual(result['returncode'], 0, result)
-        self.assertEqual(result['source_cases'], 18, result)
+        output = run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'))
+        self.assertIn('PASS 18 CPU State source cases', output)
 
 
 if __name__ == '__main__':

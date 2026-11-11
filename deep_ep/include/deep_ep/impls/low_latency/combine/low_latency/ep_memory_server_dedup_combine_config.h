@@ -2,7 +2,6 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstdint>
 
 // Independent of Dispatch. Rebuild Host and kernel together on all ranks.
@@ -11,6 +10,7 @@
 #endif
 
 namespace CombineDedup {
+
 constexpr uint32_t kEpServerDedupCombineSendCoreNum = COMBINE_DEDUP_EP_SERVER_DEDUP_COMBINE_SEND_CORE_NUM;
 static_assert(kEpServerDedupCombineSendCoreNum >= 16U && kEpServerDedupCombineSendCoreNum <= 56U &&
                   kEpServerDedupCombineSendCoreNum % 4U == 0U,
@@ -41,9 +41,15 @@ constexpr uint32_t kEpServerDedupCombineFixedUbBytes = kEpServerDedupCombineTabl
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineAlign(uint32_t n, uint32_t a) {
     return (n + a - 1U) / a * a;
 }
+
+COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombinePayloadBlockCount(uint32_t hidden) {
+    return (hidden * 2U + 479U) / 480U;
+}
+
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineRowUbBytes(uint32_t tokens) {
     return 3U * EpCombineAlign(tokens == 0U ? 4U : tokens * 4U, 256U) + EpCombineAlign((tokens + 7U) / 8U + 32U, 256U);
 }
+
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombinePayloadLaneCount(uint32_t tokens, uint32_t h) {
     if (h == 0U || h > kEpServerDedupCombineUbBytes / 2U || tokens > kEpServerDedupCombineMaxTokenNum) {
         return 0U;
@@ -52,10 +58,11 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombinePayloadLaneCount(uint32_t t
     // M3 vector packing reads every 480B payload block, including its tail.
     // M1 uses the same input lanes and drains them before M3. Output lanes
     // remain distinct until their MTE3 consumers have completed.
-    const uint32_t blocks = (h * 2U + 479U) / 480U;
+    const uint32_t blocks = EpCombinePayloadBlockCount(h);
     const uint32_t lanes = available / (blocks * (480U + 512U));
     return lanes > 8U ? 8U : lanes;
 }
+
 // Control buffers retain independent storage throughout per-core stage reuse.
 constexpr uint32_t kEpServerDedupCombineResidentUbBytes = kEpServerDedupCombineFixedUbBytes - kEpServerDedupCombineTableRows * 12U;
 constexpr uint32_t kEpServerDedupCombineM4TableRows = 32U;
@@ -64,29 +71,35 @@ constexpr uint32_t kEpServerDedupCombineM4TableRows = 32U;
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM4ScanBytes(uint32_t rows) {
     return rows * 12U + 2U * EpCombineAlign(rows * 4U, 256U) + 3U * EpCombineAlign((rows + 7U) / 8U, 32U);
 }
+
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM4ScanRows(uint32_t h, uint32_t k) {
-    const uint32_t available = 384U + EpCombineAlign(kEpServerDedupCombineM4TableRows * k * 8U, 32U) + ((h * 2U + 479U) / 480U) * 480U;
+    const uint32_t available = 384U + EpCombineAlign(kEpServerDedupCombineM4TableRows * k * 8U, 32U) + EpCombinePayloadBlockCount(h) * 480U;
     uint32_t rows = 32U;
     while (rows < 512U && EpCombineM4ScanBytes(rows * 2U) <= available)
         rows *= 2U;
     return rows;
 }
+
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM4TaskBytes(uint32_t tokens) {
     return EpCombineAlign(((tokens + kEpServerDedupCombineRecvCoreNum - 1U) / kEpServerDedupCombineRecvCoreNum) * 4U, 32U);
 }
+
 // M5 input events use IDs 0..6; MTE2_V(7) is reserved for probe.
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5TokenCount(uint32_t bs) {
     return bs / kEpServerDedupCombineRecvCoreNum + (bs % kEpServerDedupCombineRecvCoreNum != 0U);
 }
+
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5FlagBytes(uint32_t h, uint32_t k) {
     // CANN 9.1 dav_3510 ReduceSum(mask=1, stride=1) loads a full 256B
     // vector at every 32B step. Reserve its final vector beyond the flags.
-    return k * ((h * 2U + 479U) / 480U) * 32U + 256U;
+    return k * EpCombinePayloadBlockCount(h) * 32U + 256U;
 }
+
 COMBINE_DEDUP_EP_COMBINE_CONSTEXPR uint32_t EpCombineM5WorkBytes(uint32_t h, uint32_t k) {
     // The intermediate B floats are reduced with full 256B vector loads.
-    return EpCombineAlign(k * ((h * 2U + 479U) / 480U) * 4U, 256U);
+    return EpCombineAlign(k * EpCombinePayloadBlockCount(h) * 4U, 256U);
 }
+
 // Offsets are relative to the scratch after resident control buffers. Only
 // phase metadata changes meaning; output slots stay live across M4 -> M5.
 struct EpCombineM45WorkspaceLayout {
@@ -105,13 +118,13 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR EpCombineM45WorkspaceLayout EpCombineM45Layou
         return result;
     const uint64_t owned = EpCombineM5TokenCount(bs);
     const uint64_t partial = EpCombineM4TaskBytes(tokens) + 384U + EpCombineAlign(kEpServerDedupCombineM4TableRows * k * 8U, 32U) +
-                             ((h * 2U + 479U) / 480U) * 480U;
+                             EpCombinePayloadBlockCount(h) * 480U;
     const uint64_t final = 2U * ((owned * 4U + 31U) / 32U * 32U) + EpCombineM5FlagBytes(h, k) + EpCombineM5WorkBytes(h, k) + 32U;
     const uint64_t phase = partial > final ? partial : final;
     const uint32_t compute = EpCombineAlign(h * 4U, 256U);
     const uint64_t fixed = kEpServerDedupCombineResidentUbBytes + 2U * compute + phase;
-    const uint32_t input = ((h * 2U + 479U) / 480U) * 480U;
-    const uint32_t output = ((h * 2U + 479U) / 480U) * 512U;
+    const uint32_t input = EpCombinePayloadBlockCount(h) * 480U;
+    const uint32_t output = EpCombinePayloadBlockCount(h) * 512U;
     if (fixed + input + output > ubBytes)
         return result;
     result.arenaBytes = ubBytes;
@@ -132,6 +145,7 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR EpCombineM45WorkspaceLayout EpCombineM45Layou
     result.totalBytes = kEpServerDedupCombineResidentUbBytes + result.outputOffset + result.outputLanes * output;
     return result;
 }
+
 // M5 reuses all space after its own metadata except the retained physical
 // output slots. Each input remembers which M4 sends must retire before overwrite.
 struct EpCombineM5WorkspaceLayout {
@@ -175,8 +189,10 @@ COMBINE_DEDUP_EP_COMBINE_CONSTEXPR EpCombineM5WorkspaceLayout EpCombineM5Layout(
     }
     return result;
 }
+
 // Keep the existing H admission bound despite freeing the product buffer.
 // It also bounds K*N so each token's flag clear fits CANN's 12-bit blockCount.
-static_assert(32U * ((2U * (kEpServerDedupCombineRecvUbBytes / 12U) + 479U) / 480U) <= 4095U, "M5 flag clear blockCount budget");
+static_assert(32U * EpCombinePayloadBlockCount(kEpServerDedupCombineRecvUbBytes / 12U) <= 4095U, "M5 flag clear blockCount budget");
 #undef COMBINE_DEDUP_EP_COMBINE_CONSTEXPR
+
 }  // namespace CombineDedup

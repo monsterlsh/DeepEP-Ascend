@@ -55,18 +55,17 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
 template <typename ub_layout_t, int kNumHiddenBytes, int kNumSFPacks, int kNumTopk,
           int kNumMaxTokensPerVecCore, int kNumUbBytes, bool kCachedMode>
 struct UBLayoutWithBuffer {
-    static constexpr int kNumMetadataTokenBytes = layout::TokenLayout(0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes();
+    static constexpr int kNumMetadataTokenBytes =
+        layout::TokenLayout(0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes();
     static constexpr int kNumHiddenMTEStageBytes = math::align(kNumHiddenBytes, kNumUbAlignmentBytes);
-    static constexpr int kNumAvailableMetadataBytes = kNumUbBytes - static_cast<int>(sizeof(ub_layout_t)) - kNumHiddenMTEStageBytes;
-    EP_STATIC_ASSERT(kNumAvailableMetadataBytes >= 4 * kNumMetadataTokenBytes, "Insufficient dispatch UB buffer space");
-    static constexpr int kNumTokensPerMetadataMTE = kNumAvailableMetadataBytes / kNumMetadataTokenBytes >= 64 ? 64 : 4;
+    static constexpr auto kStages = get_dispatch_buffer_stages(
+        kNumUbBytes - static_cast<int64_t>(sizeof(ub_layout_t)), kNumHiddenMTEStageBytes, kNumMetadataTokenBytes,
+        kNumMaxTokensPerVecCore);
+    EP_STATIC_ASSERT(kStages.num_metadata_stages > 0 and kStages.num_hidden_stages > 0, "Insufficient dispatch UB buffer space");
+    static constexpr int kNumTokensPerMetadataMTE = kStages.tokens_per_metadata_stage;
     static constexpr int kNumMetadataMTEStageBytes = kNumTokensPerMetadataMTE * kNumMetadataTokenBytes;
-    static constexpr int kNumMetadataMTEStages = math::min(
-        math::min(8, math::ceil_div(kNumMaxTokensPerVecCore, kNumTokensPerMetadataMTE)),
-        kNumAvailableMetadataBytes / kNumMetadataMTEStageBytes);
-    static constexpr int kNumHiddenMTEStages = math::min(8,
-        (kNumUbBytes - static_cast<int>(sizeof(ub_layout_t)) - kNumMetadataMTEStages * kNumMetadataMTEStageBytes) /
-            kNumHiddenMTEStageBytes);
+    static constexpr int kNumMetadataMTEStages = kStages.num_metadata_stages;
+    static constexpr int kNumHiddenMTEStages = kStages.num_hidden_stages;
 
     ub_layout_t workspace;
     alignas(kNumUbAlignmentBytes) uint8_t metadata[kNumMetadataMTEStages][kNumMetadataMTEStageBytes];
@@ -296,13 +295,12 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     if (thread_idx == 0)
         ub_layout->local_copy_ready = 1;
 
-    // The MTE transport keeps the same logical slot/SGE plan, so a later cached
-    // dispatch can still use URMA. It does not materialize or advance any SQEs.
+    // Keep the routing plan for cached dispatch. Only URMA needs SQ descriptors.
     if constexpr (not kLowLatencyTransport) {
         // Load descriptors while the scalar pipeline copies local payloads.
         if (thread_idx < kNumRanks and thread_idx != rank_idx)
-            handle::HcommPeerInfo::load_peer_info(ub_layout->peer_info + thread_idx, jetty_ptrs,
-                                  thread_idx < rank_idx ? thread_idx : thread_idx - 1);
+            handle::HcommPeerInfo::load_peer_info(
+                ub_layout->peer_info + thread_idx, jetty_ptrs, thread_idx < rank_idx ? thread_idx : thread_idx - 1);
         if (warp_idx == 1 and kNumRanks > 1) {
             handle::HcommJettyInfo::load_jetty_info(&ub_layout->jetty_info, jetty_ptrs, vec_core_idx, lane_idx);
             // Check SQ capacity before releasing other warps to write WQEBBs.
@@ -431,7 +429,6 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
             // TODO(Kexing): `syncthreads` and notify doorbell
             // NOTES: if you do `syncthreads`, please make sure the `i` iteration count is same
         }
-
     }
 
     while (ub_layout->metadata_ready != 1)
@@ -451,7 +448,6 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
                     asc_stcg(dst + word_idx, src[word_idx]);
             }
         }
-
     }
 
     if constexpr (kCachedMode)
@@ -728,8 +724,11 @@ __global__ __vector__ void dispatch_impl(
             asc_copy_gm2ub_align(
                 ub_metadata.template get_hidden_ptr<__ubuf__ uint8_t>(),
                 math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
-                static_cast<uint16_t>(num_tokens_in_stage), kNumHiddenBytes, 0, 0, false,
-                asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, static_cast<uint64_t>(kNumHiddenBytes), ub_token_bytes);
+                /* n_burst= */ static_cast<uint16_t>(num_tokens_in_stage), /* len_burst= */ kNumHiddenBytes,
+                /* left_padding_num= */ 0, /* right_padding_num= */ 0, /* enable_constant_pad= */ false,
+                /* l2_cache_mode= */ asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                /* src_stride= */ static_cast<uint64_t>(kNumHiddenBytes), /* dst_stride= */ ub_token_bytes
+            );
         }
         if constexpr (kNumSFPacks > 0) {
             const auto gm_sf = math::advance_ptr<__gm__ sf_pack_t>(
@@ -824,9 +823,10 @@ __global__ __vector__ void dispatch_impl(
             asc_copy_ub2gm_align(
                 metadata_send_buffer + static_cast<int64_t>(first_token_idx) * num_metadata_bytes,
                 ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE).template get_base_ptr<__ubuf__ uint8_t>(),
-                static_cast<uint16_t>(num_tokens_in_stage), num_metadata_bytes,
-                asc_store_l2_cache_mode::NOTALLOC_CLEAN,
-                static_cast<uint64_t>(num_metadata_bytes), num_metadata_bytes);
+                /* n_burst= */ static_cast<uint16_t>(num_tokens_in_stage), /* len_burst= */ num_metadata_bytes,
+                /* l2_cache_mode= */ asc_store_l2_cache_mode::NOTALLOC_CLEAN,
+                /* dst_stride= */ static_cast<uint64_t>(num_metadata_bytes), /* src_stride= */ num_metadata_bytes
+            );
         }
         asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
         const auto next_batch_idx = batch_idx + kNumMetadataMTEStages;
@@ -867,14 +867,12 @@ __global__ __vector__ void dispatch_impl(
         asc_sync_notify(PIPE_MTE3, PIPE_S, EVENT_ID0);
         asc_sync_wait(PIPE_MTE3, PIPE_S, EVENT_ID0);
     } else if constexpr (kLowLatencyTransport) {
-        // Resident metadata keeps its token index; other paths reuse staging slots after their GM copies.
-        // Each lane holds one token and its metadata until every destination has
-        // consumed both MTE3 reads. No packet arena or receive layout is changed.
+        // Resident metadata is indexed by token. Streamed metadata reuses each
+        // stage once MTE3 finishes copying the token to all destinations.
         constexpr auto kNumMTEStages = math::min(
             math::min(kNumHiddenMTEStages, kNumMetadataMTEStages * kNumTokensPerMetadataMTE),
             kNumMaxTokensPerVecCore);
-        constexpr auto kMetadataBytes = static_cast<uint32_t>(
-            layout::TokenLayout(0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes());
+        constexpr auto kMetadataBytes = static_cast<uint32_t>(ub_layout_with_buffer_t::kNumMetadataTokenBytes);
         EP_STATIC_ASSERT(kNumMTEStages > 0 and kNumMTEStages <= 8, "Insufficient direct dispatch events");
         EP_STATIC_ASSERT(kNumMTEStages * kMetadataBytes <= sizeof(ub->metadata), "Direct metadata stages exceed UB capacity");
         EP_STATIC_ASSERT(not kKeepMetadataInUB or static_cast<int64_t>(kNumMaxTokensPerVecCore) * kMetadataBytes <= sizeof(ub->metadata),
@@ -911,8 +909,7 @@ __global__ __vector__ void dispatch_impl(
             asc_sync_notify(PIPE_MTE2, PIPE_MTE3, event_idx);
             asc_sync_wait(PIPE_MTE2, PIPE_MTE3, event_idx);
 
-            // The official planner already deduplicates routes by destination
-            // rank, including duplicate experts and masked top-k entries.
+            // The routing plan contains one slot per destination rank.
             for (int k = 0; k < kNumTopk; ++ k) {
                 const auto entry_idx = i * kNumTopk + k;
                 const auto dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
@@ -988,8 +985,7 @@ __global__ __vector__ void dispatch_impl(
         }
     }
 
-    // Both transports enter the same collective sequence. MTE stores are already
-    // complete; URMA requires the additional jetty drain before publishing ready.
+    // Drain URMA writes before publishing completion at the barrier.
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
             kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores,

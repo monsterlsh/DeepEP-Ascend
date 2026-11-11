@@ -2,14 +2,15 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_data_layout.h>
 
 namespace DispatchDedup {
+
 using namespace AscendC;
 
-// R05-01/R05-02: stable physical slot positions and a compact pending list.
+// Keep physical slot positions stable as the list of pending tasks shrinks.
 // The caller supplies the complete, ready prefix in localExpert/source order.
 // Both tables remain in UB until this core has finished clearing its slots.
 class ServerDedupReceiveTasks {
@@ -77,4 +78,5 @@ private:
     TBuf<> tokenPosBuf_, pendingIdxBuf_;
     LocalTensor<uint32_t> tokenPos_, pendingIdx_;
 };
+
 }  // namespace DispatchDedup

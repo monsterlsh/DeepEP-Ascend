@@ -2,8 +2,8 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/device/dispatch_dedup_mxfp8_quant.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_data_layout.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
@@ -11,10 +11,11 @@
 #include <deep_ep/impls/low_latency/common/ep_packet_receive_layout.h>
 
 namespace DispatchDedup {
+
 using namespace AscendC;
 
-// R02-01/R05-04 source path: first hops precede the cached DIRECT tasks on
-// each core, sharing one packet sequence and ring of in-flight send buffers.
+// Each core sends first hops before its cached direct tasks. Both use the
+// same packet sequence and ring of in-flight send buffers.
 template <class XType, bool WireFp8, bool E4M3, bool Prequantized = false>
 class ServerDedupSender {
     static_assert(!Prequantized || WireFp8, "prequantized input requires FP8 wire");
@@ -428,4 +429,5 @@ private:
     LocalTensor<float> routeWeights_, sourceWeights_;
     LocalTensor<uint32_t> sourceMasks_, directTasks_, serverState_, firstHopMasks_;
 };
+
 }  // namespace DispatchDedup

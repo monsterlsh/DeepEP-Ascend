@@ -2,11 +2,11 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstddef>
 #include <cstdint>
 
 namespace DispatchDedup {
+
 // Shared Host/AICore wire layout. Host validates before narrowing.
 // Magic is persistent device state, not tiling or a Host launch value.
 struct EpServerDedupTilingData {

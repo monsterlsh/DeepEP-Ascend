@@ -2,12 +2,13 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_data_layout.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
 
 namespace DispatchDedup {
+
 using namespace AscendC;
 
 // Immediate events use different HardEvents from the fixed data lane IDs.
@@ -85,4 +86,5 @@ __aicore__ inline void BuildServerDedupMetadata(LocalTensor<uint32_t> type, Loca
 __aicore__ inline void PrepareServerDedupForward(ServerDedupPacketTail tail) {
     tail.Header().SetValue(3U, uint32_t(EpServerDedupTokenType::Terminal));
 }
+
 }  // namespace DispatchDedup

@@ -13,6 +13,7 @@
  */
 
 namespace DispatchDedup {
+
 constexpr int DISPATCH_DEDUP_SUCCESS = 0;
 constexpr int DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL = -3;
 constexpr int DISPATCH_DEDUP_FLAG_BUFF_BYTES = 4 * 1024 * 1024;

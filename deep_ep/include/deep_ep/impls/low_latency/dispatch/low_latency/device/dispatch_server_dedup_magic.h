@@ -2,11 +2,12 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
 
 namespace DispatchDedup {
+
 // All 64 AIVs call exactly once per launch, including cores with no count work.
 // The initial Host clear seeds 0; launches use 1, 0, 1, 0, ... without overflow.
 // Each core owns a 512-byte slot in the LOCAL symmetric allocation's fixed
@@ -36,4 +37,5 @@ __aicore__ inline uint32_t RotateDispatchServerDedupMagic(const __gm__ CommArgs*
     pipe->Reset();
     return magic;
 }
+
 }  // namespace DispatchDedup

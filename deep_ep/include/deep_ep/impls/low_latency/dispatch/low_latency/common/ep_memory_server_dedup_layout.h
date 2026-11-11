@@ -2,12 +2,19 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+
+#include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
+#include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
+#include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_data_layout.h>
+#include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
 
 namespace DispatchDedup {
+
 struct EpMemoryServerDedupLayout {
     uint64_t globalBs = 0;
     uint64_t localExpertNum = 0;
@@ -39,53 +46,23 @@ struct EpServerDedupAllocation {
     int32_t deviceId = -1;
 };
 
-// Host-only layout validation; the device entry uses the compile-time core split.
-int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                   EpMemoryServerDedupLayout* out, bool quantized = false);
-int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                   EpMemoryServerDedupLayout* out, EpServerDedupInputMode mode);
-int ValidateDispatchServerDedupAllocations(const EpServerDedupAllocation* allocations, std::size_t count, int32_t deviceId);
-
-}  // namespace DispatchDedup
-
-#include <algorithm>
-#include <limits>
-
-#include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
-#include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_protocol.h>
-#include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_count_layout.h>
-#include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
-
-namespace DispatchDedup {
-namespace {
-bool MultiplyBytes(uint64_t lhs, uint64_t rhs, uint64_t* out) {
-    const uint64_t limit = std::numeric_limits<std::size_t>::max();
-    if (lhs != 0 && rhs > limit / lhs) {
-        return false;
-    }
-    *out = lhs * rhs;
-    return true;
-}
-
-}  // namespace
-
 inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
                                           EpMemoryServerDedupLayout* out, EpServerDedupInputMode mode) {
     if (out == nullptr) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
     }
     *out = EpMemoryServerDedupLayout{};
     if ((mode != EpServerDedupInputMode::Plain16 && mode != EpServerDedupInputMode::Quantize16 &&
          mode != EpServerDedupInputMode::PrequantizedFp8Packs) ||
-        rankSize < 8 || rankSize > DispatchDedup::DISPATCH_DEDUP_MAX_RANK_SIZE || rankSize % kEpServerDedupRanksPerServer != 0 || bs <= 0 ||
+        rankSize < 8 || rankSize > DISPATCH_DEDUP_MAX_RANK_SIZE || rankSize % kEpServerDedupRanksPerServer != 0 || bs <= 0 ||
         h <= 0 || h > UINT32_MAX || topK <= 0 || topK > kEpServerDedupMaxTopK || moeExpertNum <= 0 ||
         moeExpertNum > kEpServerDedupMaxExperts || topK > moeExpertNum || moeExpertNum % rankSize != 0 || bs > UINT32_MAX / topK) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
     }
 
     const uint32_t countCores = bs < kEpServerDedupAllCoreCountBsThreshold ? kEpServerDedupCoreNum : kEpServerDedupRecvCoreNum;
     if (DispatchServerDedupCountSendUbBytes(uint64_t(bs) * topK, uint32_t(moeExpertNum), countCores) > kEpServerDedupCountUbBytes) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
     }
 
     const bool wireFp8 = mode != EpServerDedupInputMode::Plain16;
@@ -97,39 +74,45 @@ inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t 
     next.countStateBytes = DispatchServerDedupCountLayout(uint32_t(moeExpertNum)).stateBytes;
     next.data = DispatchServerDedupDataLayout(uint32_t(bs), uint32_t(h), uint32_t(topK), uint32_t(moeExpertNum), mode);
     if (next.countStateBytes > kEpServerDedupControlBytes || next.data.requiredBytes > kEpServerDedupWindowUsableBytes) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
     }
     next.relayReadIndexRowStrideBytes = static_cast<uint64_t>(topK) * 8U;
     uint64_t rowBytes = 0;
     uint64_t routeCount = 0;
-    if (!MultiplyBytes(next.globalBs, std::min<uint64_t>(topK, next.localExpertNum), &next.capacityRows) ||
-        !MultiplyBytes(h, prequantized ? 1U : 2U, &rowBytes) || !MultiplyBytes(bs, rowBytes, &next.xBytes) ||
-        !MultiplyBytes(bs, prequantized ? next.data.scaleBytes : 0U, &next.inputScalesBytes) || !MultiplyBytes(bs, topK, &routeCount) ||
-        !MultiplyBytes(routeCount, sizeof(int32_t), &next.expertIdsBytes) || !MultiplyBytes(routeCount, sizeof(float), &next.weightBytes) ||
-        !MultiplyBytes(next.capacityRows, wireFp8 ? uint64_t(h) : rowBytes, &next.expandXBytes) ||
-        !MultiplyBytes(next.capacityRows, next.data.scaleBytes, &next.dynamicScalesBytes) ||
-        !MultiplyBytes(next.localExpertNum, sizeof(int64_t), &next.expertTokenNumsBytes) ||
-        !MultiplyBytes(moeExpertNum, sizeof(int32_t), &next.sendCountsBytes) ||
-        !MultiplyBytes(next.capacityRows, sizeof(uint32_t), &next.tokenTypeBytes) ||
-        !MultiplyBytes(next.capacityRows, 3U * sizeof(uint32_t), &next.destinationIndexBytes) ||
-        !MultiplyBytes(bs, sizeof(uint32_t), &next.sourceMaskBytes) ||
+    const auto multiply_bytes = [](uint64_t lhs, uint64_t rhs, uint64_t& out) {
+        if (lhs != 0 and rhs > std::numeric_limits<std::size_t>::max() / lhs)
+            return false;
+        out = lhs * rhs;
+        return true;
+    };
+    if (not multiply_bytes(next.globalBs, std::min<uint64_t>(topK, next.localExpertNum), next.capacityRows) or
+        not multiply_bytes(h, prequantized ? 1U : 2U, rowBytes) or not multiply_bytes(bs, rowBytes, next.xBytes) or
+        not multiply_bytes(bs, prequantized ? next.data.scaleBytes : 0U, next.inputScalesBytes) or not multiply_bytes(bs, topK, routeCount) or
+        not multiply_bytes(routeCount, sizeof(int32_t), next.expertIdsBytes) or not multiply_bytes(routeCount, sizeof(float), next.weightBytes) or
+        not multiply_bytes(next.capacityRows, wireFp8 ? uint64_t(h) : rowBytes, next.expandXBytes) or
+        not multiply_bytes(next.capacityRows, next.data.scaleBytes, next.dynamicScalesBytes) or
+        not multiply_bytes(next.localExpertNum, sizeof(int64_t), next.expertTokenNumsBytes) or
+        not multiply_bytes(moeExpertNum, sizeof(int32_t), next.sendCountsBytes) or
+        not multiply_bytes(next.capacityRows, sizeof(uint32_t), next.tokenTypeBytes) or
+        not multiply_bytes(next.capacityRows, 3U * sizeof(uint32_t), next.destinationIndexBytes) or
+        not multiply_bytes(bs, sizeof(uint32_t), next.sourceMaskBytes) or
         // Sparse first-hop indices use the full Dispatch output-row capacity.
-        !MultiplyBytes(next.capacityRows, next.relayReadIndexRowStrideBytes, &next.relayReadIndexBytes)) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        not multiply_bytes(next.capacityRows, next.relayReadIndexRowStrideBytes, next.relayReadIndexBytes)) {
+        return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
     }
     *out = next;
-    return DispatchDedup::DISPATCH_DEDUP_SUCCESS;
+    return DISPATCH_DEDUP_SUCCESS;
 }
 
 inline int BuildDispatchServerDedupLayout(int64_t rankSize, int64_t bs, int64_t h, int64_t topK, int64_t moeExpertNum,
-                                          EpMemoryServerDedupLayout* out, bool quantized) {
+                                          EpMemoryServerDedupLayout* out, bool quantized = false) {
     return BuildDispatchServerDedupLayout(rankSize, bs, h, topK, moeExpertNum, out,
                                           quantized ? EpServerDedupInputMode::Quantize16 : EpServerDedupInputMode::Plain16);
 }
 
 inline int ValidateDispatchServerDedupAllocations(const EpServerDedupAllocation* allocations, std::size_t count, int32_t deviceId) {
     if (allocations == nullptr || count == 0 || deviceId < 0) {
-        return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+        return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
     }
     for (std::size_t i = 0; i < count; ++i) {
         const auto& allocation = allocations[i];
@@ -137,23 +120,20 @@ inline int ValidateDispatchServerDedupAllocations(const EpServerDedupAllocation*
         if (allocation.data == nullptr || allocation.requiredBytes == 0 || allocation.bytes < allocation.requiredBytes ||
             allocation.deviceId != deviceId || allocation.alignment == 0 || (allocation.alignment & (allocation.alignment - 1U)) != 0 ||
             begin % allocation.alignment != 0 || allocation.bytes > std::numeric_limits<uintptr_t>::max() - begin) {
-            return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+            return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
         }
         const uintptr_t end = begin + allocation.bytes;
         for (std::size_t j = 0; j < i; ++j) {
             const uintptr_t otherBegin = reinterpret_cast<uintptr_t>(allocations[j].data);
             const uintptr_t otherEnd = otherBegin + allocations[j].bytes;
             if (begin < otherEnd && otherBegin < end) {
-                return DispatchDedup::DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
+                return DISPATCH_DEDUP_ERROR_PARA_CHECK_FAIL;
             }
         }
     }
-    return DispatchDedup::DISPATCH_DEDUP_SUCCESS;
+    return DISPATCH_DEDUP_SUCCESS;
 }
 
-}  // namespace DispatchDedup
-
-namespace DispatchDedup {
 // Matches each input mode, including quantization scratch or packed scale staging.
 inline bool DispatchDedupPacketUbFits(const EpMemoryServerDedupLayout& layout, int64_t b, int64_t k, int64_t num_experts,
                                       int64_t world_size, bool native_source_ids = false) {
@@ -179,4 +159,5 @@ inline bool DispatchDedupPacketUbFits(const EpMemoryServerDedupLayout& layout, i
     return layout.data.blockCount > 0 && layout.data.blockCount <= UINT8_MAX && sender + serverStateExtra <= kEpServerDedupCountUbBytes &&
            receiver <= kEpServerDedupCountUbBytes;
 }
+
 }  // namespace DispatchDedup

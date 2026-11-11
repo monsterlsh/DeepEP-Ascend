@@ -2,21 +2,22 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/comm_args.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
+#include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_mode.h>
 
 // Count participation threshold is independent of the compile-time send/receive split.
 #ifndef DISPATCH_SERVER_DEDUP_ALL_CORE_COUNT_BS_THRESHOLD
 #define DISPATCH_SERVER_DEDUP_ALL_CORE_COUNT_BS_THRESHOLD 512U
 #endif
-#include <deep_ep/impls/low_latency/dispatch/low_latency/common/ep_memory_server_dedup_mode.h>
 
-namespace DispatchDedup {
-constexpr uint32_t kEpServerDedupCoreNum = 64U;
 #ifndef DISPATCH_SERVER_DEDUP_SEND_CORE_NUM
 #define DISPATCH_SERVER_DEDUP_SEND_CORE_NUM 32U
 #endif
+
+namespace DispatchDedup {
+
+constexpr uint32_t kEpServerDedupCoreNum = 64U;
 constexpr uint32_t kEpServerDedupSendCoreNum = DISPATCH_SERVER_DEDUP_SEND_CORE_NUM;
 static_assert(kEpServerDedupSendCoreNum >= 16U && kEpServerDedupSendCoreNum <= 48U && kEpServerDedupSendCoreNum % 4U == 0U,
               "DISPATCH_SERVER_DEDUP_SEND_CORE_NUM must be 16..48 in steps of 4");
@@ -93,4 +94,5 @@ DISPATCH_DEDUP_EP_DEDUP_INLINE uint64_t DispatchServerDedupCountSendUbBytes(uint
 }
 
 #undef DISPATCH_DEDUP_EP_DEDUP_INLINE
+
 }  // namespace DispatchDedup

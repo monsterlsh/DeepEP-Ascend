@@ -2,12 +2,13 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <kernel_operator.h>
+
 #include <deep_ep/impls/low_latency/combine/low_latency/ep_memory_server_dedup_combine_config.h>
 #include <deep_ep/impls/low_latency/dispatch/low_latency/common/dispatch_dedup_types.h>
 
 namespace CombineDedup {
+
 using namespace AscendC;
 
 // M5/M6 sum expert contributions without applying routing weights.
@@ -105,7 +106,7 @@ private:
         const uint32_t base = bs / participants, extra = bs % participants;
         count_ = base + (participant < extra ? 1U : 0U);
         begin_ = participant * base + (participant < extra ? participant : extra);
-        blocks_ = (h * 2U + 479U) / 480U;
+        blocks_ = EpCombinePayloadBlockCount(h);
         packetBytes_ = blocks_ * 512U;
         // The shared Host budget uses the largest contiguous Recv-core segment.
         const uint32_t owned = EpCombineM5TokenCount(bs);
@@ -236,4 +237,5 @@ private:
     uint32_t inputLanes_ = 0U, outputLanes_ = 0U, inputSequence_ = 0U;
     uint32_t sharedOutputLanes_ = 0U, retiredOutputs_ = 0U;
 };
+
 }  // namespace CombineDedup

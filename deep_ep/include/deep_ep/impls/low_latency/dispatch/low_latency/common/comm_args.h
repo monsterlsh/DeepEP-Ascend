@@ -34,6 +34,7 @@ using GM_ADDR = uint8_t*;
 #endif
 
 namespace DispatchDedup {
+
 constexpr int DISPATCH_DEDUP_MAX_RANK_SIZE = 256;
 
 // Private host/device ABI for the UBMEM low-latency kernels. Both sides are

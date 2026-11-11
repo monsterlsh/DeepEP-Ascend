@@ -2,12 +2,12 @@
 
 // Copyright (c) 2026, Lu Lu
 
-
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
 
 namespace CombineDedup {
+
 constexpr uint32_t kEpServerDedupCombineCoreNum = 64;
 
 // Independent Host/AICore wire contract. Host validates before narrowing.
@@ -34,4 +34,5 @@ static_assert(offsetof(EpServerDedupCombineTilingData, numMaxTokensPerRank) == 1
 static_assert(offsetof(EpServerDedupCombineTilingData, quantMode) == 14, "quantMode offset");
 static_assert(offsetof(EpServerDedupCombineTilingData, reserved) == 15, "reserved zero offset");
 static_assert(offsetof(EpServerDedupCombineTilingData, recvUbBytes) == 16, "receive UB budget offset");
+
 }  // namespace CombineDedup
