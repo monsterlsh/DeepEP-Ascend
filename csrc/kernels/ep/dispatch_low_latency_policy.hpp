@@ -14,6 +14,25 @@ struct DispatchLowLatencyPlan {
     int64_t buffer_bytes;
 };
 
+constexpr int get_dispatch_low_latency_threshold(int num_ranks, bool cached_mode, bool barrier_in_prologue) {
+    if (barrier_in_prologue) {
+        switch (num_ranks) {
+            case 8:  return 256;
+            case 16: return cached_mode ? 16 : 32;
+            case 32: return cached_mode ? 32 : 64;
+            case 64: return 16;
+            default: return 0;
+        }
+    }
+    switch (num_ranks) {
+        case 8:  return cached_mode ? 8 : 16;
+        case 16:
+        case 32: return cached_mode ? 0 : 16;
+        case 64: return cached_mode ? 0 : 8;
+        default: return 0;
+    }
+}
+
 constexpr bool dispatch_direct_ub_fits(int64_t workspace_bytes, int64_t tokens_per_core,
                                        int64_t hidden_bytes, int64_t num_topk, int64_t ub_bytes,
                                        bool cached_mode) {

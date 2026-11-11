@@ -251,8 +251,10 @@ public:
             EP_HOST_ASSERT(dst_gsge_idx.device() == x.device());
         }
 
+        const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
         const auto ll_launch = dispatch_low_latency->prepare(
-            *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes, sf.has_value());
+            *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
+            num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue);
         if (ll_launch and previous_event)
             previous_event->current_stream_wait();
         const auto dispatch_buffer = ll_launch ? ll_launch->buffer() : context->buffer;
@@ -266,7 +268,6 @@ public:
         }
 
         // Launch dispatch
-        const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
         dispatch_low_latency->begin(ll_launch);
         const auto ll_failure_guard = dispatch_low_latency->failure_guard();
         launch_dispatch(x.data_ptr(), sf_ptr,

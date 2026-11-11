@@ -87,7 +87,8 @@ public:
 
     std::shared_ptr<DispatchLowLatencyLaunch> prepare(
             const comm::Context& context, const torch::Tensor& x, int capacity, int hidden,
-            int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes, bool use_fp8) {
+            int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes, bool use_fp8,
+            bool cached_mode, bool barrier_in_prologue) {
         if (failed)
             throw std::runtime_error("Low-latency dispatch failed; restart the distributed job");
         if (pending)
@@ -97,6 +98,8 @@ public:
             arena->check_available();
         if (last_event)
             last_event->current_stream_wait();
+        if (capacity > get_dispatch_low_latency_threshold(context.num_ranks, cached_mode, barrier_in_prologue))
+            return nullptr;
         const auto plan = get_dispatch_low_latency_plan(
             runtime->get_npu_arch(), context.num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, use_fp8);
         if (not plan or not group_capable or num_buffer_bytes < plan->buffer_bytes)

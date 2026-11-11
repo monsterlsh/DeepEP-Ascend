@@ -35,9 +35,29 @@ void check_workspace_size() {
 
 int main() {
     using deep_ep::get_dispatch_low_latency_plan;
+    using deep_ep::get_dispatch_low_latency_threshold;
     const auto plan = [](int p, int m, int h, int k, int e, int v = 64, int ub = 190 * 1024) {
         return get_dispatch_low_latency_plan(3510, p, m, h, k, e, v, ub, false);
     };
+    const int thresholds[][5] = {
+        {8, 256, 256, 16, 8},
+        {16, 32, 16, 16, 0},
+        {32, 64, 32, 16, 0},
+        {64, 16, 16, 8, 0},
+    };
+    for (const auto& [ranks, fresh_prologue, cached_prologue, fresh_epilogue, cached_epilogue]: thresholds) {
+        assert(get_dispatch_low_latency_threshold(ranks, false, true) == fresh_prologue);
+        assert(get_dispatch_low_latency_threshold(ranks, true, true) == cached_prologue);
+        assert(get_dispatch_low_latency_threshold(ranks, false, false) == fresh_epilogue);
+        assert(get_dispatch_low_latency_threshold(ranks, true, false) == cached_epilogue);
+    }
+    for (int ranks: {1, 4, 7, 9, 24, 128, 256}) {
+        for (bool cached: {false, true}) {
+            for (bool prologue: {false, true})
+                assert(get_dispatch_low_latency_threshold(ranks, cached, prologue) == 0);
+        }
+    }
+
     check_workspace_size<128, 8, 1, 8>();
     check_workspace_size<512, 128, 64, 32>();
     check_workspace_size<255, 255, 3, 1>();

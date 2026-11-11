@@ -240,8 +240,8 @@ Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on 
 
 ## Automatic decode transport in EPBuffer
 
-`EPBuffer.dispatch` uses a low-latency direct-push path when SHMEM,
-hardware and layout requirements are met, and the native URMA path otherwise.
+`EPBuffer.dispatch` selects between SHMEM low-latency (LL) direct push and
+native URMA using the group size, per-rank capacity and dispatch mode.
 No additional constructor or dispatch argument is needed. Both paths return
 the standard weights, counts, handle and deferred event results. Cached
 dispatch and the existing combine implementation use the same native metadata.
@@ -251,10 +251,22 @@ rank. MTE writes payload and metadata directly into a SHMEM buffer with the
 native receive layout; the original epilogue produces the outputs. There is
 no intermediate expert-expanded payload or layout conversion.
 
-BF16 on A5 is admitted by the native UB, buffer and integer limits, without
-fixed H/K/E or batch-size gates. FP8 and unsupported layouts retain the native
-implementation. All ranks use the same M/H/K/E and collective order. Actual
-token counts may differ, including zero; routes and weights are unchanged.
+For BF16 on A5, the table gives the largest `num_max_tokens_per_rank` eligible
+for LL. All ranks use the same capacity even when their actual token counts
+differ. Fresh dispatch builds a handle and cached dispatch reuses one.
+The cutoffs come from BF16 measurements with hidden size 7168, top-8 routing
+and 128 experts.
+
+| EP | Prologue barrier, fresh | Prologue barrier, cached | Epilogue barrier (default), fresh | Epilogue barrier (default), cached |
+|---|---:|---:|---:|---:|
+| 8 | 256 | 256 | 16 | 8 |
+| 16 | 32 | 16 | 16 | — |
+| 32 | 64 | 32 | 16 | — |
+| 64 | 16 | 16 | 8 | — |
+
+A dash, an unlisted EP size or a capacity above the limit selects URMA. LL
+also requires sufficient UB and buffer space and a supported layout. FP8 uses
+URMA. The barrier placement applies to both ordinary and deferred epilogues.
 
 Build with `SHMEM_ROOT=/path/to/shmem/install/shmem` to enable the backend.
 The SDK headers must match the pinned SHMEM revision
@@ -265,11 +277,6 @@ heap per process, shared by same-group arenas; each LL buffer reserves its
 configured native buffer size. Unsupported or unavailable resources select native before launch.
 Initialization or communication failure is reported, never retried with a
 different protocol.
-
-LL is initially preferred for all admitted shapes. Performance crossover
-points can be added in `prefer_dispatch_low_latency` without changing the API.
-Device correctness and performance validation remain outstanding; offline
-compilation and historical MTE measurements do not validate this path on NPUs.
 
 Combine is unchanged. Its existing MTE policy remains BF16/H7168/K8/E128,
 capacity at most 256, and at most 60/17/32 tokens for EP8/16/128 respectively;

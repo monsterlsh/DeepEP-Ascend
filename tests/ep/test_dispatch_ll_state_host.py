@@ -161,7 +161,7 @@ template<class F> void rejects(F fn, const std::string& message) {
 auto input() { return torch::empty({2,128}, {}); }
 auto prepare(DispatchLowLatencyState& state, const deep_ep::comm::Context& context,
              const torch::Tensor& x, bool fp8 = false) {
-    return state.prepare(context, x, 2, 128, 1, 8, 64, 256*1024, fp8);
+    return state.prepare(context, x, 2, 128, 1, 8, 64, 256*1024, fp8, false, false);
 }
 void check_capability_and_cached_refusal() {
     for (int mode=0; mode<6; ++mode) {
@@ -192,6 +192,43 @@ void check_capacity_gate() {
     exact_buffer.initialize(ctx); auto launch=prepare(exact_buffer,ctx,x);
     assert(launch && ShmemArena::requested_bytes==plan->buffer_bytes);
     exact_buffer.close(); ++cases;
+}
+void check_group_capacity_and_transport_switch() {
+    deep_ep::comm::Context ctx;
+    for (int rank = 0; rank < ctx.num_ranks; ++ rank) {
+        reset();
+        ctx.rank_idx = rank;
+        DispatchLowLatencyState state("group", buffer_bytes);
+        state.initialize(ctx);
+        const auto batch = [&](int capacity, bool cached) {
+            const auto x = torch::empty({capacity - rank, 7168}, {});
+            return state.prepare(ctx, x, capacity, 7168, 8, 128, 64, 256 * 1024, false, cached, false);
+        };
+        assert(not batch(17, false));
+        assert(ShmemArena::attempts == 0);
+        const auto fresh = batch(16, false);
+        assert(fresh and ShmemArena::attempts == 1);
+        state.begin(fresh);
+        state.record_completion();
+
+        mock::stream = 1;
+        const auto native = batch(16, true);
+        assert(not native and mock::events.back() == "wait:0->1");
+        state.begin(native);
+        state.record_completion();
+
+        mock::stream = 2;
+        const auto smaller = batch(8, false);
+        assert(smaller and mock::events.back() == "wait:1->2");
+        state.begin(smaller);
+        state.record_completion();
+        const auto cached = batch(8, true);
+        assert(cached and cached->arena == fresh->arena and ShmemArena::attempts == 1);
+        state.begin(cached);
+        state.record_completion();
+        state.close();
+    }
+    ++ cases;
 }
 void check_pending_and_cross_stream() {
     reset(); DispatchLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
@@ -288,6 +325,7 @@ void check_shared_session_failure() {
 }
 int main() {
     check_capability_and_cached_refusal(); check_capacity_gate(); check_pending_and_cross_stream();
+    check_group_capacity_and_transport_switch();
     check_preparation_failures(); check_guard_and_completion_failures(); check_shared_session_failure();
     std::cout << "PASS " << cases << " CPU State source cases\n";
 }
@@ -298,7 +336,7 @@ int main() {
 class DispatchLLStateHostTests(unittest.TestCase):
     def test_actual_state_transitions(self):
         output = run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'))
-        self.assertIn('PASS 18 CPU State source cases', output)
+        self.assertIn('PASS 19 CPU State source cases', output)
 
 
 if __name__ == '__main__':
