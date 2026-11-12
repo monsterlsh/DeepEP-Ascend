@@ -8,7 +8,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from compat_trace import verify_kernel_records
 from summarize_compat import main, summarize
+from test_compat_trace import COMBINE_MTE, COMBINE_SHMEM, COMBINE_URMA, DISPATCH_MTE, DISPATCH_URMA
 
 
 def metadata(world=2):
@@ -23,14 +25,12 @@ def metadata(world=2):
 
 
 def operation(rank, case_id, kind):
-    name = f"{kind}_impl<device kernel>"
+    name = DISPATCH_MTE if kind == 'dispatch' else COMBINE_MTE
+    proof = verify_kernel_records([dict(name=name, device_id=str(rank), stream_id='1')], kind)
     return dict(label='fresh' if kind == 'dispatch' else 'return', operation=kind,
                 backend='candidate', status='verified', profiling_enabled=True,
-                expected_transport='mte', actual_transport='mte',
+                expected_transport='mte', **proof,
                 metadata=dict(rank=rank, case_id=case_id),
-                kernel_names=[name], kernel_parameters={name: dict(transport='mte')},
-                device_kernel_count=1,
-                device_kernels=[dict(name=name, device_id=str(rank), stream_id='1')],
                 evidence_format='kernel_details_csv', file_sha256={'remote/kernel_details.csv': 'd' * 64})
 
 
@@ -83,11 +83,9 @@ class SummaryTests(unittest.TestCase):
         result = summarize(self.root, require_paths=True)
         self.assertTrue(result['accepted'])
         self.assertEqual(result['path_status'], 'verified')
+        self.assertFalse(summarize(self.root, require_shmem_combine=True)['accepted'])
 
     def test_shmem_combine_acceptance_on_every_rank(self):
-        from compat_trace import verify_kernel_records
-        from test_compat_trace import COMBINE_SHMEM, COMBINE_MTE
-
         def write_transport(rank, symbol, claimed=None):
             rows = records(rank, plan=('small',), verified=True)
             combine = rows[2]['operations'][1]
@@ -96,6 +94,11 @@ class SummaryTests(unittest.TestCase):
             if claimed:
                 combine['actual_transport'] = claimed
                 combine['kernel_parameters'][symbol]['transport'] = claimed
+            bias = operation(rank, 'small', 'combine')
+            bias['label'] = 'with_bias'
+            bias.update(verify_kernel_records([dict(name=COMBINE_URMA, device_id=str(rank), stream_id='1')], 'combine'),
+                        expected_transport='urma')
+            rows[2]['operations'].append(bias)
             self.write(rank, rows)
 
         for rank in range(2):
@@ -106,28 +109,51 @@ class SummaryTests(unittest.TestCase):
         self.assertFalse(summarize(self.root, require_paths=True)['accepted'])
         write_transport(0, COMBINE_SHMEM)
         self.assertTrue(summarize(self.root, require_shmem_combine=True)['accepted'])
+        self.assertTrue(summarize(self.root, require_shmem_combine=True, require_mte_dispatch=True)['accepted'])
         write_transport(0, COMBINE_MTE, claimed='shmem')
         self.assertFalse(summarize(self.root, require_shmem_combine=True)['accepted'])
 
-    def test_ll_pipeline_is_rechecked_from_embedded_device_records(self):
-        from compat_trace import verify_kernel_records
-        from test_compat_trace import ll_records
-        for rank in range(2):
-            rows = records(rank, verified=True)
-            for row in rows:
-                for item in row.get('operations', []):
-                    if item['operation'] == 'dispatch':
-                        item.update(verify_kernel_records(ll_records(), 'dispatch', expected_transport='ll'))
-                        item['expected_transport'] = None
+    def test_mte_dispatch_requires_every_eligible_call_on_all_ranks(self):
+        def write_dispatch(rank, symbol, expected, label='fresh'):
+            rows = records(rank, plan=('small',), verified=True)
+            dispatch = rows[2]['operations'][0]
+            device_kernel = dict(name=symbol, device_id=str(rank), stream_id='1')
+            dispatch.update(verify_kernel_records([device_kernel], 'dispatch'),
+                            expected_transport=expected, label=label)
+            stats = deepcopy(dispatch)
+            stats.update(verify_kernel_records([dict(device_kernel, name=DISPATCH_URMA)], 'dispatch'),
+                         expected_transport='urma', label='with_stats')
+            rows[2]['operations'].append(stats)
             self.write(rank, rows)
-        self.assertTrue(summarize(self.root, require_paths=True)['accepted'])
-        # A complete-looking label and counts cannot cover a missing copy stage.
-        rows[2]['operations'][0]['device_kernels'].pop()
-        rows[2]['operations'][0]['device_kernel_count'] -= 1
-        self.write(1, rows)
-        result = summarize(self.root, require_paths=True)
+
+        for rank in range(2):
+            write_dispatch(rank, DISPATCH_URMA, 'urma')
+        result = summarize(self.root, require_mte_dispatch=True)
         self.assertFalse(result['accepted'])
-        self.assertEqual(result['path_status'], 'unverified')
+        self.assertEqual(result['missing_eligible_operations'], ['dispatch'])
+
+        alternatives = ['urma', 'mte']
+        write_dispatch(0, DISPATCH_MTE, alternatives)
+        write_dispatch(1, DISPATCH_URMA, alternatives)
+        self.assertTrue(summarize(self.root, require_paths=True)['accepted'])
+        self.assertFalse(summarize(self.root, require_mte_dispatch=True)['accepted'])
+        write_dispatch(1, DISPATCH_MTE, alternatives, label='cached')
+        self.assertFalse(summarize(self.root, require_mte_dispatch=True)['accepted'])
+        write_dispatch(1, DISPATCH_MTE, alternatives)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(['--input-dir', str(self.root), '--require-mte-dispatch']), 0)
+        self.assertTrue(json.loads(output.getvalue())['require_paths'])
+        self.assertFalse(summarize(self.root, require_mte_dispatch=True, require_shmem_combine=True)['accepted'])
+
+    def test_dispatch_path_rechecks_the_embedded_symbol(self):
+        self.full(verified=True)
+        rows = records(1, verified=True)
+        dispatch = rows[2]['operations'][0]
+        dispatch['actual_transport'] = dispatch['expected_transport'] = 'urma'
+        dispatch['kernel_parameters'][DISPATCH_MTE]['transport'] = 'urma'
+        self.write(1, rows)
+        self.assertFalse(summarize(self.root, require_paths=True)['accepted'])
 
     def test_missing_rank_is_incomplete(self):
         self.write(0)

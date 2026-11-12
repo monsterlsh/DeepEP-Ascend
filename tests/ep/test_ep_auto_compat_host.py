@@ -13,20 +13,39 @@ from compat_config import parse_args, plan_cases
 
 
 class ContractTests(unittest.TestCase):
-    def test_shmem_combine_uses_group_capacity_with_optional_native_fallback(self):
+    def test_measured_shapes_and_mixed_combine_ranks(self):
         runtime = dict(arch=3510, num_vec_cores=64, num_ai_cores=32)
-        case = dict(rank_bs=[0, 2] * 4, M=2)
-        self.assertEqual(suite.expected_transport('combine', case, 0, 'candidate-auto', runtime),
-                         ['urma', 'shmem'])
-        self.assertEqual(suite.expected_transport('combine', case, 1, 'candidate-auto', runtime),
-                         ['mte', 'shmem'])
-        for m, expected in ((60, ['mte', 'shmem']), (61, 'mte'), (257, 'urma')):
-            self.assertEqual(suite.expected_transport('combine', case, 1, 'candidate-auto', runtime,
-                                                      capacity=m), expected)
-        for backend in ('candidate-disabled', 'official'):
-            self.assertEqual(suite.expected_transport('combine', case, 1, backend, runtime), 'urma')
-        fewer_cores = dict(runtime, num_ai_cores=16)
-        self.assertEqual(suite.expected_transport('combine', case, 1, 'candidate-auto', fewer_cores), 'mte')
+        args = parse_args(['--bs', '16', '32', '64', '--rank-load', 'decode', '--capacity-mode', 'batch',
+                           '--alignment', '128', '--cpu-sync', 'false', '--deferred', 'true',
+                           '--deterministic', 'false', '--barrier-in-prologue', 'true', '--route', 'random',
+                           '--edge-routes', 'off'])
+        case16, case32, case64 = plan_cases(args, world=16)
+        self.assertEqual(suite.expected_transport('combine', case16, 0, 'candidate-auto', runtime), ['urma', 'shmem'])
+        self.assertEqual(suite.expected_transport('combine', case32, 15, 'candidate-auto', runtime), ['urma', 'mte'])
+        self.assertEqual(suite.expected_transport('combine', case32, 14, 'candidate-auto', runtime), 'urma')
+        self.assertEqual(suite.expected_transport('dispatch', case32, 0, 'candidate-auto', runtime), ['urma', 'mte'])
+        self.assertEqual(suite.expected_transport('dispatch', case32, 0, 'candidate-auto', runtime, cached=True), 'urma')
+        self.assertEqual(suite.expected_transport('dispatch', case64, 0, 'candidate-auto', runtime), 'urma')
+        case = plan_cases(args, world=8)[2]
+        for rank in range(8):
+            self.assertEqual(suite.expected_transport('combine', case, rank, 'candidate-auto', runtime),
+                             ['urma', 'mte'] if rank >= 4 else 'urma')
+
+    def test_unmeasured_shapes_options_and_backends_fall_back(self):
+        runtime = dict(arch=3510, num_vec_cores=64, num_ai_cores=32)
+        case = dict(rank_bs=[2, 1, 1, 1, 1, 1, 1, 1], M=2, alignment=128, dtype='bf16', cpu_sync=False,
+                    deterministic=False, deferred=True, barrier_in_prologue=False)
+        for op in ('dispatch', 'combine'):
+            for changes in (dict(M=3), dict(rank_bs=[2] * 8), dict(rank_bs=[2] + [1] * 63),
+                            dict(rank_bs=[2] + [1] * 127), dict(alignment=1), dict(cpu_sync=True),
+                            dict(deferred=False), dict(deterministic=True), dict(dtype='fp8')):
+                with self.subTest(op=op, changes=changes):
+                    self.assertEqual(suite.expected_transport(op, dict(case, **changes), 0, 'candidate-auto', runtime),
+                                     'urma')
+            for options in (dict(has_weights=False), dict(has_stats=True), dict(has_bias=True)):
+                self.assertEqual(suite.expected_transport(op, case, 0, 'candidate-auto', runtime, **options), 'urma')
+            for backend in ('candidate-disabled', 'official'):
+                self.assertEqual(suite.expected_transport(op, case, 0, backend, runtime), 'urma')
 
     def test_both_versions_have_no_public_experiment_markers(self):
         for backend in ('official', 'candidate-auto', 'candidate-disabled'):
@@ -43,56 +62,9 @@ class ContractTests(unittest.TestCase):
                 self.calls += 1
                 return ('x', None, 'weights', 'handle') if self.calls == 1 else None
         event = Event()
-        buffer = SimpleNamespace(dispatch=lambda **kw: event)
+        buffer = SimpleNamespace(dispatch=lambda **_: event)
         self.assertEqual(suite.launch(buffer, 'dispatch', True), ('x', None, 'weights', 'handle', event))
         self.assertEqual(event.calls, 2)
-
-    def test_policy_uses_original_b_and_handle_capacity_for_combine(self):
-        case = plan_cases(parse_args(['--bs', '2', '--edge-routes', 'off']), world=8)[0]
-        runtime = dict(arch=3510, num_vec_cores=64)
-        self.assertIsNone(suite.expected_transport('dispatch', case, 0, 'candidate-auto', runtime))
-        fp8 = dict(case, dtype='fp8')
-        self.assertEqual(suite.expected_transport('dispatch', fp8, 0, 'candidate-auto', runtime), 'urma')
-        self.assertEqual(suite.expected_transport('combine', fp8, 0, 'candidate-auto', runtime), 'mte')
-        self.assertEqual(suite.expected_transport('combine', case, 0, 'candidate-auto', runtime,
-                                                  original_b=61, capacity=256), 'urma')
-        self.assertEqual(suite.expected_transport('combine', case, 0, 'candidate-auto', runtime,
-                                                  original_b=2, capacity=512), 'urma')
-        for backend in ('official', 'candidate-disabled'):
-            self.assertEqual(suite.expected_transport('combine', case, 0, backend, runtime), 'urma')
-
-    def test_only_combine_retains_historical_mte_thresholds(self):
-        runtime = dict(arch=3510, num_vec_cores=64)
-        args = parse_args(['--bs', '2', '--edge-routes', 'off'])
-        for world in (1, 2, 4, 8, 16, 32, 64, 128):
-            case = plan_cases(args, world=world)[0]
-            for operation in ('dispatch', 'combine'):
-                thresholds = {8: 60, 16: 17, 128: 32} if operation == 'combine' else {8: 100, 16: 77, 32: 70, 64: 67, 128: 32}
-                threshold = thresholds.get(world, 0)
-                for b in (0, 1, 8, 16, 17, 18, 32, 33, 60, 61, 67, 68, 70, 71, 77, 78, 100, 101, 128, 256):
-                    with self.subTest(world=world, operation=operation, b=b):
-                        expected = None if operation == 'dispatch' else ('mte' if threshold > 0 and 1 <= b <= threshold else 'urma')
-                        self.assertEqual(suite.expected_transport(
-                            operation, case, 0, 'candidate-auto', runtime,
-                            original_b=b, capacity=256), expected)
-
-    def test_mixed_rank_batches_do_not_infer_dispatch_path(self):
-        case = plan_cases(parse_args(['--edge-routes', 'only']), world=128)[0]
-        runtime = dict(arch=3510, num_vec_cores=64)
-        for rank, b in enumerate(case['rank_bs']):
-            for operation in ('dispatch', 'combine'):
-                with self.subTest(rank=rank, operation=operation):
-                    thresholds = {8: 60, 16: 17, 128: 32} if operation == 'combine' else {8: 100, 16: 77, 32: 70, 64: 67, 128: 32}
-                    threshold = thresholds.get(128, 0)
-                    expected = None if operation == 'dispatch' else ('mte' if threshold > 0 and 1 <= b <= threshold else 'urma')
-                    self.assertEqual(suite.expected_transport(
-                        operation, case, rank, 'candidate-auto', runtime), expected)
-
-    def test_candidate_disabled_does_not_claim_dispatch_ll_is_disabled(self):
-        case = plan_cases(parse_args(['--bs', '2', '--edge-routes', 'off']), world=8)[0]
-        runtime = dict(arch=3510, num_vec_cores=64)
-        self.assertIsNone(suite.expected_transport('dispatch', case, 0, 'candidate-disabled', runtime))
-        self.assertEqual(suite.expected_transport('combine', case, 0, 'candidate-disabled', runtime), 'urma')
 
     def test_entrypoint_dry_run_does_not_import_torch(self):
         root = Path(__file__).resolve().parent
@@ -142,7 +114,7 @@ class DispatchOracleTests(unittest.TestCase):
 
     def fixture(self, dtype='bf16', layout='row', backend='official'):
         torch = self.torch
-        from low_latency_reference import payload
+        from ep_reference import payload
         world, rank, alignment, capacity = 8, 0, 16, 256
         # One source sends three slots to rank 0, two to the same expert.
         routes = [[[0, 0, 1, -1, 16, 32, 48, 64]]] + [

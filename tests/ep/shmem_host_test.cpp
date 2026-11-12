@@ -39,6 +39,27 @@ static int allocation_count = 0, barrier_count = 0;
 static size_t configured_heap = 0;
 static std::vector<void*> allocations;
 
+// DecodeAgreement uses a dedicated stream and pinned host staging for a rank-wide vote.
+constexpr int ACL_SUCCESS = 0;
+using aclmdlRI = void*;
+enum aclmdlRICaptureStatus { ACL_MODEL_RI_CAPTURE_STATUS_NONE, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE };
+static bool capturing = false, fail_pinned_alloc = false, fail_device_alloc = false;
+static int streams = 0, pinned = 0, devices = 0;
+int aclrtCreateStream(aclrtStream* stream) { *stream = reinterpret_cast<void*>(4); ++streams; return 0; }
+int aclrtDestroyStream(aclrtStream stream) { assert(stream == reinterpret_cast<void*>(4)); --streams; return 0; }
+int aclrtMallocHost(void** ptr, size_t bytes) {
+    if (fail_pinned_alloc) return 1;
+    *ptr = std::malloc(bytes);
+    if (*ptr) ++pinned;
+    return *ptr ? 0 : 1;
+}
+int aclrtFreeHost(void* ptr) { std::free(ptr); --pinned; return 0; }
+int aclmdlRICaptureGetInfo(aclrtStream stream, aclmdlRICaptureStatus* status, aclmdlRI*) {
+    assert(stream == reinterpret_cast<void*>(3));
+    *status = capturing ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    return 0;
+}
+
 int aclrtGetCurrentContext(aclrtContext* context) {
     *context = reinterpret_cast<void*>(1);
     return 0;
@@ -55,11 +76,14 @@ int aclrtGetMemInfo(int, size_t* free, size_t* total) {
 }
 
 int aclrtMalloc(void** pointer, size_t bytes, int) {
+    if (fail_device_alloc) return 1;
     *pointer = std::malloc(bytes);
+    if (*pointer) ++devices;
     return *pointer ? 0 : 1;
 }
 
 int aclrtFree(void* pointer) {
+    --devices;
     std::free(pointer);
     return 0;
 }
@@ -68,6 +92,11 @@ int aclrtMemcpy(void* dst, size_t capacity, const void* src, size_t bytes, int) 
     assert(bytes <= capacity);
     std::memcpy(dst, src, bytes);
     return 0;
+}
+
+int aclrtMemcpyAsync(void* dst, size_t capacity, const void* src, size_t bytes, int kind, aclrtStream stream) {
+    assert(stream == reinterpret_cast<void*>(4));
+    return aclrtMemcpy(dst, capacity, src, bytes, kind);
 }
 
 int aclrtMemset(void*, size_t, int, size_t) {
@@ -178,6 +207,7 @@ int aclshmem_finalize() {
 }
 
 #include "../../csrc/comm/shmem.hpp"
+#include "../../csrc/comm/decode_agreement.hpp"
 
 using deep_ep::comm::ShmemArena;
 
@@ -196,6 +226,42 @@ int main(int argc, char** argv) {
     assert(argc == 2);
     const std::string name = argv[1];
     const auto create = [] { return ShmemArena::try_create("group", 0, 2, 4096, 120); };
+    if (name == "decode_vote") {
+        using deep_ep::comm::DecodeAgreement;
+        assert(!DecodeAgreement::is_capturing());
+        capturing = true;
+        assert(DecodeAgreement::is_capturing());
+        for (int failure : {0, 1, 2}) {
+            {
+                DecodeAgreement agreement;
+                fail_pinned_alloc = failure == 1;
+                fail_device_alloc = failure == 2;
+                assert(agreement.initialize(2) == (failure == 0));
+                if (!failure) {
+                    auto comm = reinterpret_cast<HcclComm>(2);
+                    for (uint16_t proposal : {0, 1, 2, 3, 4, 8}) {
+                        remote_capabilities = UINT16_MAX;
+                        assert(agreement.matches(comm, 2, 120, proposal) == (proposal != 0));
+                        remote_capabilities = 0;
+                        assert(!agreement.matches(comm, 2, 120, proposal));
+                    }
+                }
+            }
+            assert(streams == 0 && pinned == 0 && devices == 0);
+        }
+        return 0;
+    }
+    if (name == "decode_vote_failure") {
+        {
+            deep_ep::comm::DecodeAgreement agreement;
+            assert(agreement.initialize(2));
+            fail_wait = true;
+            throws([&] { agreement.matches(reinterpret_cast<HcclComm>(2), 2, 120, 1); });
+        }
+        // An unfinished device request may still reference its buffers.
+        assert(streams == 1 && pinned == 1 && devices == 1);
+        return 0;
+    }
     if (name == "capability" or name == "mixed_capability" or name == "capability_error") {
         auto comm = reinterpret_cast<HcclComm>(2);
         if (name == "capability_error") {
@@ -223,12 +289,10 @@ int main(int argc, char** argv) {
         assert(first and second and init_count == 1 and allocation_count == 2);
         assert(configured_heap == size_t{32} << 30);
         assert(first->peer_ptr(1) == static_cast<char*>(first->data()) + 64);
-        assert(first->size() == 4096);
         first->close();
         assert(finalize_count == 0 and free_count == 1);
-        second->barrier(c10_npu::getCurrentNPUStream());
         second->close();
-        assert(finalize_count == 1 and free_count == 2 and barrier_count == 3);
+        assert(finalize_count == 1 and free_count == 2 and barrier_count == 2);
         auto third = create();
         assert(third and init_count == 2);
         third->close();
@@ -238,7 +302,6 @@ int main(int argc, char** argv) {
         first->mark_failed();
         throws([&] { first->check_available(); });
         throws([&] { second->check_available(); });
-        throws([&] { second->barrier(c10_npu::getCurrentNPUStream()); });
         throws([&] { second->close(); });
         throws(create);
         assert(init_count == 1 and allocation_count == 2);

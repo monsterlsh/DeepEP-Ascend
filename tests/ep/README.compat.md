@@ -2,14 +2,24 @@
 
 本套测试用于检查 DeepEP-Ascend 官方接口及功能语义，并采集候选 dispatch LL 和原生传输的设备证据。它区分官方基线与候选运行配置；不切换源码分支，也不构建或安装库。
 
-`test_ep_auto_compat.py` 的正确性矩阵与 `test_stream.py` 的流测试互补。前者逐操作同步，适合数值、metadata 和路径验证；后者验证异步流依赖与 Tensor 生命周期。开启 profiler 的运行不用于性能或 overlap 结论。
+原有的 `tests/ep/test_ep.py` 和 `tests/comm/test_stream.py` 沿用 Ascend main 的入口和默认用例。扩展矩阵 `test_ep_auto_compat.py` 检查数值、metadata 和传输路径，`tests/comm/test_stream_compat.py` 检查异步流依赖与 Tensor 生命周期。
+
+## 在 GPU 和 Ascend 上跑同一个 decode 用例
+
+在安装了 NVIDIA DeepEP V2.5、DeepEP-Ascend main 或当前候选构建的环境中，分别运行同一份独立脚本。官方仓中可将该文件复制到测试目录。单机 8 卡的命令如下。
+
+```bash
+python tests/ep/test_ep_decode_portable.py --num-processes 8
+```
+
+该用例使用相同的 `EPBuffer.dispatch`、`EPBuffer.combine`、deferred event 和数值断言。EP8 的共享容量为 2，各 rank 输入分别为 2、1、1、1、1、1、1、1 个 token。设备初始化使用各平台的分布式后端。验证昇腾内核选路时，使用下方的 `--profile-paths` 用例。
 
 ## 运行身份
 
 | `--backend` | 实际要求 | 环境开关 |
 | --- | --- | --- |
 | `official` | 独立安装/加载选定的 main 基线；使用 `--expected-source-commit` 核验 | 不修改诊断开关 |
-| `candidate-disabled` | 安装/加载候选版本 | 设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1`，combine 使用 URMA，dispatch LL 仍可能启用。移除 `EP_MTE_BS_THRESHOLD` |
+| `candidate-disabled` | 安装/加载候选版本 | 设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1`，dispatch 和 combine 均使用 URMA。移除 `EP_MTE_BS_THRESHOLD` |
 | `candidate-auto` | 安装/加载候选版本 | 移除上述两个开关，验证默认策略 |
 
 测试记录实际导入的 `deep_ep` 路径、扩展二进制 SHA256、可获取的源码 commit/工作区状态、Python/Torch/torch_npu、相关运行文件及测试工具哈希。`--build-label` 只是人工标签。`--expected-source-commit` 从实际导入包所在 Git 仓核验；无可核验源码时会报错，不会把标签当作验证结果。
@@ -22,7 +32,7 @@
 test_ep_auto_compat.py
 compat_config.py
 compat_trace.py
-low_latency_reference.py
+ep_reference.py
 ```
 
 确认 `deep_ep` 从待测构建导入。三个 backend 使用相同测试工具版本、相同输入参数和匹配硬件，各自使用新的输出目录。
@@ -56,6 +66,7 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 | 选项 | 行为 |
 | --- | --- |
 | `--bs` | 默认 `2 32 33 64 65 128 256 2`；覆盖不同输入规模及小→大→小的复用。不能据此预判 dispatch LL 路径 |
+| `--rank-load uniform/decode` | uniform 各 rank 等长。decode 对每个 BS 生成 B=max(1,BS−rank)，搭配 batch 容量时与仓库基准的负载一致 |
 | `--capacity` | 长期复用 buffer 的分配容量，默认 256；不随每次 B 缩小 |
 | `--capacity-mode fixed/batch/both` | fixed 每次传 M=capacity；batch 每次传 M=max(各 rank B)；两者都复用同一容量的 buffer |
 | `--cpu-sync false/true/default/all` | 默认 false；default 传 None 以执行 API 的默认行为。cached 调用始终 False，且不传累计 stats |
@@ -70,15 +81,11 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 | `--profile-paths` | 每个操作采集真实设备 kernel 证据；默认关闭并明确标记 unverified |
 | `--output-dir` | 每 rank 独占创建日志，已有文件拒绝覆盖；三个 backend 和每次复跑使用不同目录 |
 
-测试固定 H7168/K8/E128，生产规模为 EP8/16/32/64/128。候选 BF16 dispatch 的选择取决于共同 M、SHMEM 可用性和真实 UB/arena 限制。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示。
+测试固定 H7168/K8/E128。当前优化覆盖 EP8、EP16、EP32，M 为 1 至 256 的 2 次幂，全组使用 B=max(1,M−rank)。验证配置为 Ascend 3510、32 个 AI Core、64 个向量核、每核 216 KiB UB，BF16 输入、FP32 路由权重、alignment=128，关闭 deterministic 和 CPU sync，启用 deferred、异步、expand 和 zero padding。带 stats、bias、缺失权重、FP8、旧 handle 及矩阵外几何用于检查 main 的 URMA 回退。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示。
 
-combine 在 EP8、EP16、EP128 的默认阈值依次是 60、17、32。支持的设备上，共同容量 M 落在阈值内且全组具备 SHMEM 资源时，每个 rank 使用同一个 SHMEM 接收区协议，包括 B=0 的 rank。回退时每个 rank 用其原始 B 判断 native MTE 或 URMA。EP32 和 EP64 使用 URMA。当前候选 combine 的第 11 个模板参数 `kShmemTransport` 标识 SHMEM 特化。trace 从设备符号区分 `shmem`、`mte` 和 `urma`，也识别历史候选与官方符号。
+dispatch 支持两种 barrier 位置及 fresh/cached 组合，阈值随组合变化。第 14 个显式模板参数标识 direct MTE，设备 trace 的 `actual_transport=mte` 表示本次调用确实使用该内核。解析器同时支持 main 的 13 参数 dispatch。候选 combine 的第 11 个模板参数标识 SHMEM。
 
-当前 dispatch 使用 14 个显式模板参数。第 14 项 `low_latency_transport` 为 true 时，内核直接传输 hidden 和 metadata，trace 记为 `actual_transport=mte`；为 false 时记为 `urma`。SHMEM peer 地址表在运行时传入；确认内存来自 SHMEM 还需要对应调用的 arena 选路证据。
-
-解析器也接受官方 13 参数与历史候选 15 参数的 dispatch。对历史 metadata-only 特化，只有同一设备、同一流依次包含 metadata、`dispatch_server_dedup_kernel`、`dispatch_ll_origin_map_impl`、`dispatch_ll_copy_payload_impl` 才记为 `actual_transport=ll`。这类记录的内部 barrier 按桥接协议单独核对。
-
-FP8 dispatch 预期 URMA，后续 BF16 combine 独立选择。trace 核对 UB、M、cached、CPU sync、dtype/scale pack 和权重分支。未开启 profiler 时路径记为 unverified。
+满足上述条件时，EP8 M≤32 和 EP16 M≤16 的 combine 可全组使用 SHMEM。混合路径仅覆盖 EP8 M=64 的 rank 4–7 以及 EP16 M=32 的 rank 15，这些 rank 可使用 native MTE，其余 rank 使用 URMA。EP32 的 combine 使用 URMA，EP64/128 的 dispatch 和 combine 均使用 URMA。设备特化、SHMEM 资源和全组资格会影响实走路径，未开启 profiler 时路径记为 unverified。
 
 ## 设备运行示例
 
@@ -97,7 +104,7 @@ python tests/ep/test_ep_auto_compat.py \
   --edge-routes off --output-dir /tmp/ep-compat-auto-default-01
 ```
 
-边界用例应包含当前操作阈值的两侧。例如 EP64 dispatch 使用 `2 67 68 256 2`，其 combine 始终预期 URMA；EP128 dispatch/combine 使用 `2 32 33 256 2`。后续增加 alignment、deferred、deterministic 和 hotspot；默认 planner 不把 CPU sync=True 混进主矩阵，避免它截断其他用例。
+检查边界时，可用 EP8 M=32/64/128、EP16 M=16/32/64、EP32 M=32/64，以及非 2 次幂 M=3/33。EP64/128 用于验证完整 URMA 回退。用 `--rank-load uniform` 检查不匹配的负载。
 
 CPU 同步单独核验官方和候选。本分支保留 main 的计数通知实现，不包含历史 CPU-sync 超时问题的修复。先将 `MAIN_SHA` 设为实际构建的 main 提交 SHA：
 
@@ -124,14 +131,19 @@ python tests/ep/test_ep_auto_compat.py \
 
 上述入口由节点数与 `--num-processes` 共同决定全局 EP，不能把全局 EP 直接作为单节点进程数。再单独使用 `--edge-routes only` 验证空 rank、不同 B、masked 和重复专家；dispatch 使用共同 M，不按本 rank 的 B 推断独立选路。保留实际设备证据。
 
-在支持 SHMEM 的单节点 EP8 设备上，可用 B=M=2 强制验收 combine 的设备路径。汇总命令要求每个 rank 的每次 combine 都有 SHMEM 内核证据，回退会使该命令退出失败。
+在支持 SHMEM 的 Ascend EP8 环境中，使用同一组参数对照两个构建。先在已加载官方 main 的环境运行第一组命令，再在候选环境运行第二组。将 `MAIN_SHA` 设为官方构建的提交号，两个输出目录各自独立。候选验收要求有符合条件的 dispatch 和 combine，所有符合条件的调用都须在全组采到对应的优化内核。bias 和缺权重等回退用例按各自预期核验。
 
 ```bash
-python tests/ep/test_ep_auto_compat.py \
-  --backend candidate-auto --num-processes 8 --bs 2 --capacity 2 --capacity-mode batch \
-  --dtype bf16 --cpu-sync false --alignment 1 --deferred false --deterministic false \
-  --route random --edge-routes off --profile-paths --output-dir /tmp/ep-shmem-combine-01
-python tests/ep/summarize_compat.py --input-dir /tmp/ep-shmem-combine-01 --require-shmem-combine
+ep8=(--num-processes 8 --rank-load decode --bs 2 --capacity 2 --capacity-mode batch
+     --dtype bf16 --cpu-sync false --alignment 128 --deferred true --deterministic false
+     --route random --edge-routes off --profile-paths)
+
+python tests/ep/test_ep_auto_compat.py "${ep8[@]}" --backend official \
+  --expected-source-commit "$MAIN_SHA" --output-dir /tmp/ep-main-01
+python tests/ep/summarize_compat.py --input-dir /tmp/ep-main-01 --require-paths
+
+python tests/ep/test_ep_auto_compat.py "${ep8[@]}" --backend candidate-auto --output-dir /tmp/ep-auto-01
+python tests/ep/summarize_compat.py --input-dir /tmp/ep-auto-01 --require-mte-dispatch --require-shmem-combine
 ```
 
 FP8 payload 和非单位 scales 用于检查通信字节、stride、padding 及缓存更新；合成专家函数用可精确表示的 FP8 值生成 BF16 输出。该用例不模拟完整模型的反量化/GEMM 性能。combine 同时检查调用者已乘权和未乘权的专家输出，权重回传不能再次改变 hidden。
@@ -146,7 +158,7 @@ torch_npu 2.12 环境缺少该接口；入口会显式注册 torch_npu，并在�
 保留 H1024/K1、EventOverlap 与 Bucket 冒烟，以及 H7168/K8/E128 的 producer/consumer 双流用例。CLI 中的 `mte` shape 名称保持兼容，仅表示该测试形状；是否走 LL 或 URMA 由主矩阵的 profiler 证据确认：
 
 ```bash
-python tests/comm/test_stream.py --num-processes 8 \
+python tests/comm/test_stream_compat.py --num-processes 8 \
   --ep-shape both --ep-bs 16 --ep-capacity 256 \
   --backend candidate-auto --barrier-in-prologue false
 ```

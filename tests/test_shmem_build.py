@@ -102,6 +102,10 @@ class ShmemBuildTest(unittest.TestCase):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text('#pragma once\n', encoding='utf-8')
+        checks = self.root / 'deep_ep/common/exception.hpp'
+        checks.parent.mkdir(parents=True)
+        checks.write_text('#pragma once\n#define ACL_CHECK(op) do { if ((op) != 0) '
+                          'throw std::runtime_error("ACL"); } while (false)\n#define HCCL_CHECK(op) ACL_CHECK(op)\n')
         environment = os.environ.copy()
         environment['PATH'] = str(Path(compiler).parent) + os.pathsep + environment.get('PATH', '')
         for enabled in (False, True):
@@ -116,7 +120,7 @@ class ShmemBuildTest(unittest.TestCase):
                      'uid', 'attributes', 'init_failure', 'mapping_failure', 'remote_init_failure',
                      'abandon', 'collective', 'wait',
                      'close_order', 'finalize') if enabled else ('disabled',)
-            cases += ('capability', 'mixed_capability', 'capability_error')
+            cases += ('capability', 'mixed_capability', 'capability_error', 'decode_vote', 'decode_vote_failure')
             for case in cases:
                 with self.subTest(enabled=enabled, case=case):
                     result = subprocess.run([str(executable), case], capture_output=True, text=True,

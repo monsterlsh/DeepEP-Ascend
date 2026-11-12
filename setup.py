@@ -226,16 +226,13 @@ if __name__ == '__main__':
         language='c++',
     )
 
-    # Older setuptools versions do not expand recursive package-data globs.
-    headers = [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*')
-               if path.suffix in ('.hpp', '.h')]
-
     # noinspection bad-argument-type
     setuptools.setup(
         name='deep_ep',
         version=get_package_version(),
         packages=setuptools.find_packages(include=['deep_ep', 'deep_ep.*']),
-        package_data={'deep_ep': headers},
+        # Older setuptools versions do not expand recursive package-data globs.
+        package_data={'deep_ep': [str(path.relative_to(package_dir)) for path in (package_dir / 'include').rglob('*.hpp')]},
         ext_modules=[ext_module],
         cmdclass={'build_ext': BuildExtension, 'build_py': CustomBuildPy},
     )

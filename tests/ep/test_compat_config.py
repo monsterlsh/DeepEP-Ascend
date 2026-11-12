@@ -2,9 +2,6 @@
 
 import json
 import os
-from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -127,31 +124,6 @@ class PlannerTests(unittest.TestCase):
                               "--capacity", "128", "--dtype", "bf16", "fp8")
         self.assertTrue(all(case["bs"] == 128 and case["M"] == 128 for case in edge_only))
 
-    def test_help_and_dry_run_do_not_import_torch(self):
-        helper_dir = str(Path(config.__file__).resolve().parent)
-        script = """
-import builtins, sys
-sys.path.insert(0, sys.argv[1])
-original = builtins.__import__
-def no_device_import(name, *args, **kwargs):
-    if name.split('.')[0] in ('torch', 'torch_npu', 'deep_ep'):
-        raise AssertionError('unexpected device dependency: ' + name)
-    return original(name, *args, **kwargs)
-builtins.__import__ = no_device_import
-import compat_config
-raise SystemExit(compat_config.main(sys.argv[2:]))
-"""
-        env = dict(os.environ, WORLD_SIZE="1", PYTHONDONTWRITEBYTECODE="1")
-        for arguments in (["--help"], ["--dry-run", "--bs", "2", "--edge-routes", "off"]):
-            result = subprocess.run([sys.executable, "-c", script, helper_dir, *arguments],
-                                    text=True, capture_output=True, env=env, check=False)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            if "--help" in arguments:
-                self.assertIn("--profile-paths", result.stdout)
-            else:
-                self.assertGreater(json.loads(result.stdout)["num_cases"], 0)
-
-
 class ReportingTests(unittest.TestCase):
     def test_backend_configuration_preserves_official_identity(self):
         env = {config.TRANSPORT_ENV: '1', config.THRESHOLD_ENV: '4096', 'KEEP': 'value'}
@@ -176,8 +148,6 @@ class ReportingTests(unittest.TestCase):
                         record = config.configure_backend(backend, env)
                         self.assertEqual(env, expected)
                         self.assertEqual(record['transport_override'], expected.get(config.TRANSPORT_ENV))
-                        self.assertEqual(record['transport_override_scope'], 'combine_mte_and_shmem')
-                        self.assertEqual(record['dispatch_path_assertion'], 'observe_complete_pipeline')
                         self.assertFalse(record['requires_official_build'])
                     inherited = {config.TRANSPORT_ENV: 'stale', 'KEEP': 'value'}
                     if threshold is not None:

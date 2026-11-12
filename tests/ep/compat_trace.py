@@ -38,7 +38,7 @@ def _operation(value):
 
 def allowed_transports(operation, expected):
     """A list denotes alternatives when runtime SHMEM resources are optional."""
-    possible = ('mte', 'urma', 'll') if _operation(operation) == 'dispatch' else ('mte', 'urma', 'shmem')
+    possible = ('mte', 'urma') if _operation(operation) == 'dispatch' else ('mte', 'urma', 'shmem')
     if expected is None:
         return possible
     choices = expected if isinstance(expected, list) else [expected]
@@ -50,20 +50,6 @@ def allowed_transports(operation, expected):
 def _is_main(name, operation):
     # An epilogue or a generic Python label is never a main-kernel symbol.
     return re.search(r"(?<![A-Za-z_])" + operation + r"_impl(?:I|<)", name) is not None
-
-
-def _dispatch_stage(name):
-    for stage, symbol in (('payload', 'dispatch_server_dedup_kernel'),
-                          ('origin_map', 'dispatch_ll_origin_map_impl'),
-                          ('copy_payload', 'dispatch_ll_copy_payload_impl'),
-                          ('prepare', 'dispatch_low_latency_prepare')):
-        if re.search(r"(?<![A-Za-z_])" + symbol + r"(?:I|<)", name):
-            return stage
-    return None
-
-
-def _is_evidence(name, operation):
-    return _is_main(name, operation) or (operation == 'dispatch' and _dispatch_stage(name) is not None)
 
 
 def template_values(name, operation):
@@ -140,15 +126,9 @@ def parse_kernel(name, operation, backend='candidate'):
         _require(len(values) > transport_index,
                  f"Missing candidate MTE template argument: {name}")
         low_latency = boolean(transport_index, 'low_latency_transport')
-        # Historical dispatch symbols may have a layout-only bool before the derived integer arguments.
-        layout_only = (operation == 'dispatch' and len(values) > 14 and values[14][0] == 'b'
-                       and boolean(14, 'layout_only'))
         if operation == 'dispatch':
-            base = 15 if len(values) > 14 and values[14][0] == 'b' else 14
-            _require(len(values) in (base, base + 3) and all(kind != 'b' for kind, _ in values[base:]),
+            _require(len(values) in (14, 17) and all(kind != 'b' for kind, _ in values[14:]),
                      f"Unknown candidate dispatch template layout: {name}")
-            _require(not layout_only or (low_latency and result['barrier_in_prologue']),
-                     f"Layout-only dispatch requires MTE metadata and a completion barrier: {name}")
         else:
             _require(len(values) in (10, 11), f"Unknown candidate combine template layout: {name}")
             if len(values) == 11:
@@ -166,10 +146,7 @@ def parse_kernel(name, operation, backend='candidate'):
             _require(len(values) == 9,
                      f"Kernel does not match the pinned official combine template: {name}")
         low_latency = False
-        layout_only = False
-    result.update(low_latency_transport=low_latency,
-                  layout_only=layout_only,
-                  transport='metadata_mte' if layout_only else ('mte' if low_latency else 'urma'))
+    result.update(low_latency_transport=low_latency, transport='mte' if low_latency else 'urma')
     if result.get('shmem_transport'):
         result['transport'] = 'shmem'
     return result
@@ -203,13 +180,13 @@ def _normalized(row):
 
 
 def read_kernel_csv(path, operation):
-    """Read native main kernels and dispatch LL stages from a device CSV."""
+    """Read native main kernels from a device CSV."""
     rows = []
     with Path(path).open(newline='', encoding='utf-8-sig') as stream:
         for line, raw in enumerate(csv.DictReader(stream), 2):
             row = _normalized(raw)
             name = row.get('name') or row.get('kernelname') or ''
-            if not _is_evidence(name, operation):
+            if not _is_main(name, operation):
                 continue
             _require(str(row.get('deviceid', '')) != '' and str(row.get('streamid', '')) != '',
                      f"Device/stream ID missing in {path}:{line}")
@@ -238,7 +215,7 @@ def read_chrome_trace(path, operation):
         if not categories.intersection({'kernel', 'kernels', 'npu_kernel', 'aicore_kernel'}):
             continue
         name = event.get('name', '')
-        if not isinstance(name, str) or not _is_evidence(name, operation):
+        if not isinstance(name, str) or not _is_main(name, operation):
             continue
         arguments = _normalized(event.get('args', {}))
         device_id = arguments.get('deviceid', event.get('pid'))
@@ -253,51 +230,20 @@ def read_chrome_trace(path, operation):
 
 
 def verify_kernel_records(records, operation, backend='candidate', expected_transport=None):
-    """Verify native transport or a complete LL pipeline; missing stages fail."""
+    """Verify the native transport encoded by every captured main kernel."""
     operation, backend = _operation(operation), _backend(backend)
     choices = allowed_transports(operation, expected_transport)
     _require(bool(records), f"No {operation} main device kernel was captured")
     names = sorted({record['name'] for record in records})
-    parameters = {name: parse_kernel(name, operation, backend) for name in names if _is_main(name, operation)}
-    _require(bool(parameters), f"No {operation} native main device kernel was captured")
+    parameters = {name: parse_kernel(name, operation, backend) for name in names}
     transports = {value['transport'] for value in parameters.values()}
     _require(len(transports) == 1, f"Contradictory {operation} transports: {sorted(transports)}")
     actual = next(iter(transports))
-    stages = {}
-    if operation == 'dispatch':
-        stages = {stage: [row for row in records if _dispatch_stage(row['name']) == stage]
-                  for stage in ('payload', 'origin_map', 'copy_payload', 'prepare')}
-        if actual == 'metadata_mte':
-            required = ('metadata', 'payload', 'origin_map', 'copy_payload')
-            chain = {'metadata': [row for row in records if _is_main(row['name'], operation)], **stages}
-            identities = {(row.get('device_id'), row.get('stream_id')) for row in chain['metadata']}
-            _require(all(device is not None and stream is not None for device, stream in identities),
-                     'LL metadata kernel is missing device/stream identity')
-            for stage in required:
-                _require(len(chain[stage]) == len(chain['metadata']), f"Incomplete LL dispatch stage: {stage}")
-                _require({(row.get('device_id'), row.get('stream_id')) for row in chain[stage]} == identities,
-                         f"LL stage {stage} is on a different device or stream")
-            for identity in identities:
-                ordered = {stage: sorted((row for row in chain[stage]
-                                         if (row.get('device_id'), row.get('stream_id')) == identity),
-                                        key=lambda row: _number(row.get('start_us'), 'start'))
-                           for stage in required}
-                _require(len({len(rows) for rows in ordered.values()}) == 1,
-                         'LL stage counts differ within a device/stream')
-                for invocation in zip(*(ordered[stage] for stage in required)):
-                    times = [_number(row.get('start_us'), 'start') for row in invocation]
-                    _require(all(left < right for left, right in zip(times, times[1:])),
-                             'LL dispatch stages are not in metadata/payload/map/copy order')
-            actual = 'll'
-        else:
-            _require(not any(stages.values()), 'LL stages without a native metadata-only dispatch')
     _require(actual in choices,
              f"{operation}: expected {expected_transport}, captured {actual}")
     return dict(actual_transport=actual, kernel_names=names,
                 kernel_parameters=parameters, device_kernel_count=len(records),
-                device_kernels=records,
-                dispatch_stages={stage: len(rows) for stage, rows in stages.items()},
-                ll_pipeline_verified=actual == 'll')
+                device_kernels=records)
 
 
 def verify_case_metadata(kernel_parameters, operation, metadata):
@@ -327,14 +273,14 @@ def verify_case_metadata(kernel_parameters, operation, metadata):
     for name, parameters in kernel_parameters.items():
         for case_field, parameter in fields:
             if case_field in metadata and metadata[case_field] is not None:
-                # The metadata-only launch forces a completion barrier before
-                # the LL bridge; it does not encode the caller's runtime choice.
-                if case_field == 'barrier_in_prologue' and parameters.get('layout_only'):
-                    continue
                 _require(parameters[parameter] == metadata[case_field],
                          f"{operation} template {parameter}={parameters[parameter]} differs from "
                          f"case {case_field}={metadata[case_field]}: {name}")
                 checked.add(case_field)
+        if 'optimized_ub_bytes' in metadata and parameters['transport'] != 'urma':
+            _require(parameters['num_ub_bytes'] == metadata['optimized_ub_bytes'],
+                     f"{operation} specialization uses an unverified UB size")
+            checked.add('optimized_ub_bytes')
         if 'min_num_ub_bytes' in metadata:
             _require(parameters['num_ub_bytes'] >= metadata['min_num_ub_bytes'],
                      f"{operation} UB {parameters['num_ub_bytes']} is below "

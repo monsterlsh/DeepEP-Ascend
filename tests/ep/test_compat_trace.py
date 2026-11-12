@@ -31,19 +31,8 @@ DISPATCH_EPILOGUE = '_ZN7deep_ep27dispatch_copy_epilogue_implILi16ELi128ELi8ELi1
 COMBINE_EPILOGUE = '_ZN7deep_ep28combine_reduce_epilogue_implILi16ELi128ELi8ELi7168ELi2ELi221184ELi64ELl100000000000ELb0ELi14336EEEvPu6__bf16PfPlS1_S1_S1_PvS4_i'
 
 
-# Synthetic fixtures for the historical metadata-only dispatch and LL bridge.
-DISPATCH_LAYOUT = DISPATCH_MTE.replace('ELb1ELb1ELi1ELi64ELi6E', 'ELb1ELb1ELb1ELi1ELi64ELi6E')
-LL_PAYLOAD = 'void dispatch_server_dedup_kernel<0>(...)'
-LL_ORIGIN_MAP = 'void deep_ep::dispatch_ll_origin_map_impl<16, 2, 8>(...)'
-LL_COPY = 'void deep_ep::dispatch_ll_copy_payload_impl<16, 2, 8, 14336, 0, 64, 221184, false>(...)'
-
 # Synthetic demangled symbol for the SHMEM combine device specialization.
 COMBINE_SHMEM = 'deep_ep::combine_impl<16, 8, 7168, 2, 64, 100000000000L, 221184, true, true, true, true>(...)'
-
-
-def ll_records():
-    return [dict(name=name, device_id='0', stream_id='1', start_us=index * 10, duration_us=2)
-            for index, name in enumerate((DISPATCH_LAYOUT, LL_PAYLOAD, LL_ORIGIN_MAP, LL_COPY))]
 
 
 class KernelParserTests(unittest.TestCase):
@@ -72,48 +61,8 @@ class KernelParserTests(unittest.TestCase):
         historical_layout = f'void deep_ep::dispatch_impl<{arguments}, true, true>(...)'
         self.assertEqual(trace.identify_transport(official, 'dispatch', 'official'), 'urma')
         self.assertEqual(trace.identify_transport(direct, 'dispatch'), 'mte')
-        self.assertEqual(trace.identify_transport(historical_layout, 'dispatch'), 'metadata_mte')
-
-    def test_historical_dispatch_layout_is_not_payload_evidence(self):
-        parameters = trace.parse_kernel(DISPATCH_LAYOUT, 'dispatch')
-        self.assertTrue(parameters['layout_only'])
-        self.assertEqual(parameters['transport'], 'metadata_mte')
-        for stage in range(4):
-            rows = ll_records()
-            del rows[stage]
-            with self.subTest(missing=stage), self.assertRaises(trace.TraceVerificationError):
-                trace.verify_kernel_records(rows, 'dispatch')
-
-    def test_complete_ll_pipeline_requires_one_stream_and_order(self):
-        result = trace.verify_kernel_records(ll_records(), 'dispatch', expected_transport='ll')
-        self.assertEqual(result['actual_transport'], 'll')
-        self.assertTrue(result['ll_pipeline_verified'])
-        self.assertEqual(result['dispatch_stages']['payload'], 1)
-        for change in ('stream', 'order', 'extra'):
-            rows = ll_records()
-            if change == 'stream':
-                rows[-1]['stream_id'] = '2'
-            elif change == 'order':
-                rows[-1]['start_us'] = 5
-            else:
-                rows.append(dict(rows[-1], start_us=50))
-            with self.subTest(change=change), self.assertRaises(trace.TraceVerificationError):
-                trace.verify_kernel_records(rows, 'dispatch')
-
-    def test_cpu_ll_labels_do_not_complete_a_device_pipeline(self):
-        rows = [ll_records()[0]]
         with self.assertRaises(trace.TraceVerificationError):
-            trace.verify_kernel_records(rows, 'dispatch', expected_transport='ll')
-
-    def test_historical_full_native_dispatch_still_proves_urma(self):
-        symbol = DISPATCH_LAYOUT.replace('ELb1ELb1ELb1ELi1', 'ELb1ELb0ELb0ELi1')
-        self.assertEqual(trace.identify_transport(symbol, 'dispatch'), 'urma')
-        self.assertFalse(trace.parse_kernel(symbol, 'dispatch')['layout_only'])
-
-    def test_layout_barrier_is_distinct_from_runtime_barrier_option(self):
-        checks = trace.verify_case_metadata({DISPATCH_LAYOUT: trace.parse_kernel(DISPATCH_LAYOUT, 'dispatch')},
-                                            'dispatch', {'barrier_in_prologue': False})
-        self.assertIn('barrier_in_prologue', checks['not_observable_from_symbol'])
+            trace.parse_kernel(historical_layout, 'dispatch')
 
     def test_real_candidate_symbols_and_parameters(self):
         for operation, mte, urma in (('dispatch', DISPATCH_MTE, DISPATCH_URMA),
@@ -236,12 +185,6 @@ class ProfileFileTests(unittest.TestCase):
         self.assertEqual(result['device_kernel_count'], 1)
         self.assertEqual(result['device_kernels'][0]['device_id'], '0')
         self.assertEqual(len(result['file_sha256']), 1)
-
-    def test_csv_requires_all_ll_stages(self):
-        self.write_csv([DISPATCH_LAYOUT, LL_PAYLOAD, LL_ORIGIN_MAP, LL_COPY, DISPATCH_EPILOGUE])
-        result = trace.parse_profile_directory(self.root, 'dispatch', expected_transport='ll')
-        self.assertTrue(result['ll_pipeline_verified'])
-        self.assertEqual(result['device_kernel_count'], 4)
 
     def test_chrome_device_kernel_events(self):
         event = dict(name=COMBINE_MTE, cat='kernel', ph='X', pid=12, tid=3, ts=1, dur=2)

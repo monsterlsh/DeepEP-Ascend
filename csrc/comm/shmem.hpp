@@ -53,7 +53,7 @@ class ShmemArena {
         bool operator==(const Admission&) const = default;
     };
 
-    enum class Phase: uint64_t { Attributes, Initialize, Allocate, Barrier, Close, Finalize };
+    enum class Phase: uint64_t { Attributes, Initialize, Allocate, Close, Finalize };
 
     struct Status {
         Phase phase;
@@ -69,7 +69,7 @@ class ShmemArena {
     static void check(int status, const char* operation) {
         if (status != 0) {
 #ifdef DEEPEP_WITH_SHMEM
-            session().poisoned = true;
+            session().failed.store(true);
 #endif
             throw std::runtime_error(std::string("SHMEM: ") + operation + " failed (" + std::to_string(status) + ")");
         }
@@ -156,7 +156,7 @@ class ShmemArena {
     HcclComm comm = nullptr;
     void* pointer = nullptr;
     std::vector<void*> peers;
-    size_t bytes = 0, charge = 0;
+    size_t charge = 0;
     uint64_t id = 0;
     int world = 0, timeout = 0;
     bool closed = true;
@@ -252,12 +252,11 @@ public:
         arena->comm = comm;
         arena->world = world;
         arena->timeout = timeout;
-        arena->bytes = bytes;
         arena->charge = charge;
         arena->id = state.sequence++;
         arena->closed = false;
         state.used += charge;
-        ++state.live;
+        ++ state.live;
         state.poisoned = false;
         return arena;
 #else
@@ -303,29 +302,6 @@ public:
 #endif
     }
 
-    size_t size() const {
-#ifdef DEEPEP_WITH_SHMEM
-        return bytes;
-#else
-        return 0;
-#endif
-    }
-
-    void barrier(aclrtStream stream) {
-#ifdef DEEPEP_WITH_SHMEM
-        auto& state = session();
-        std::lock_guard<std::mutex> guard(state.mutex);
-        check_context();
-        state.poisoned = true;
-        const auto waited = aclrtSynchronizeStreamWithTimeout(stream, timeout * 1000);
-        agree(waited == 0, Phase::Barrier, comm, world, timeout, stream);
-        aclshmem_barrier_all();
-        state.poisoned = false;
-#else
-        (void) stream;
-#endif
-    }
-
     void close() {
 #ifdef DEEPEP_WITH_SHMEM
         auto& state = session();
@@ -347,7 +323,7 @@ public:
         aclshmem_free(pointer);
         pointer = nullptr;
         closed = true;
-        --state.live;
+        -- state.live;
         state.used -= charge;
         if (state.live == 0) {
             const auto finalized = aclshmem_finalize();

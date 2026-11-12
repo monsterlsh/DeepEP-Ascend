@@ -2,7 +2,7 @@
 
 WORLD_SIZE counts nodes and RANK is the node index; do not wrap this mp.spawn
 launcher in torchrun. --dry-run and --help work without Torch. Copy this harness,
-compat_config.py, compat_trace.py and low_latency_reference.py together when
+compat_config.py, compat_trace.py and ep_reference.py together when
 testing the official baseline. The imported deep_ep build is recorded separately.
 
 Correctness runs do not measure performance. Without --profile-paths, device
@@ -18,27 +18,11 @@ import subprocess
 import sys
 import traceback
 
-from compat_config import configure_backend, JsonlReport, parse_args, plan_cases
+from compat_config import DIAGNOSTIC_WORLDS, configure_backend, JsonlReport, parse_args, plan_cases
 from compat_trace import TraceCollector
+from ep_reference import agree
 
 __test__ = False
-
-
-def agree(action):
-    """Make validation/trace failures visible to all ranks before the next call."""
-    import torch
-    import torch.distributed as dist
-
-    error = None
-    try:
-        action()
-    except Exception as exc:
-        error = exc
-        print(f'[rank {dist.get_rank()}] {exc}', flush=True)
-    status = torch.tensor([int(error is not None)], dtype=torch.int32, device='npu')
-    dist.all_reduce(status, op=dist.ReduceOp.MAX)
-    if status.item():
-        raise AssertionError('Compatibility validation failed on at least one rank') from error
 
 
 def check_native_contract(value, attribute, backend):
@@ -76,7 +60,7 @@ def scale_packs(sources, tokens, hidden=7168, version=0):
 
 def make_input(rank, bs, dtype, layout, *, payload_scale=1, scale_version=0, device='npu'):
     import torch
-    from low_latency_reference import payload
+    from ep_reference import payload
 
     values = payload([rank] * bs, range(bs), 7168, torch.bfloat16) * payload_scale
     if dtype == 'bf16':
@@ -93,7 +77,7 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
                    weight_scale=1, payload_scale=1, scale_version=0, has_weights=True,
                    cpu_sync=False):
     import torch
-    from low_latency_reference import expert_entries, payload
+    from ep_reference import expert_entries, payload
 
     entries = expert_entries(routes, 128, world, rank)
     counts = [len(rows) for rows in entries]
@@ -191,27 +175,28 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
         assert handle.num_recv_tokens == sum(expected_counts)
 
 
-def expected_transport(operation, case, rank, backend, runtime, *, original_b=None, capacity=None):
-    """Policy expectation, never an observation of what the device executed."""
-    if backend == 'official':
-        return 'urma'
-    if operation == 'dispatch':
-        # LL uses group-wide capacity, SHMEM availability and dispatch UB/arena
-        # admission. Observe the complete pipeline instead of applying the old
-        # per-rank MTE thresholds. The disable environment flag affects combine.
-        return 'urma' if case['dtype'] == 'fp8' else None
-    if backend == 'candidate-disabled':
-        return 'urma'
-    b = case['rank_bs'][rank] if original_b is None else original_b
+def expected_transport(operation, case, rank, backend, runtime, *, cached=False, has_weights=True,
+                       has_stats=False, has_bias=False, capacity=None):
+    """Allowed device transports; a missing group capability falls back to URMA."""
     m = case['M'] if capacity is None else capacity
     world = len(case['rank_bs'])
-    threshold = {8: 60, 16: 17, 128: 32}.get(world, 0)
-    supported = runtime['arch'] == 3510 and runtime['num_vec_cores'] == 64 and 0 < m <= 256
-    native = 'mte' if supported and 0 < b <= min(threshold, m) else 'urma'
-    # SHMEM selection uses the common handle capacity, including on empty ranks.
-    if supported and m <= threshold and runtime['num_ai_cores'] == 32:
-        return [native, 'shmem']
-    return native
+    if (backend != 'candidate-auto' or world not in (8, 16, 32) or m not in (1, 2, 4, 8, 16, 32, 64, 128, 256)
+            or case['rank_bs'] != [max(1, m - peer) for peer in range(world)]
+            or runtime['arch'] != 3510 or runtime['num_vec_cores'] != 64 or runtime['num_ai_cores'] != 32
+            or case['alignment'] != 128 or case['dtype'] != 'bf16' or case['cpu_sync'] is not False
+            or case['deterministic'] or not case['deferred'] or not has_weights or has_stats or has_bias):
+        return 'urma'
+    if operation == 'dispatch':
+        if case['barrier_in_prologue']:
+            threshold = {8: 256, 16: 16 if cached else 32, 32: 32 if cached else 64}[world]
+        else:
+            threshold = (8 if world == 8 else 0) if cached else 16
+        return ['urma', 'mte'] if m <= threshold else 'urma'
+    if (world == 8 and m <= 32) or (world == 16 and m <= 16):
+        return ['urma', 'shmem']
+    if (world == 8 and m == 64 and rank >= 4) or (world == 16 and m == 32 and rank == 15):
+        return ['urma', 'mte']
+    return 'urma'
 
 
 def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **kwargs):
@@ -240,11 +225,12 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **
     original_b = handle.topk_idx.size(0) if operation == 'combine' else None
     capacity = handle.num_max_tokens_per_rank if handle is not None else case['M']
     expected = expected_transport(operation, case, rank, backend, runtime,
-                                  original_b=original_b, capacity=capacity)
-    if operation == 'dispatch' and backend != 'official':
-        metadata['path_policy'] = 'observed_pipeline; no historical MTE threshold assertion'
-    if expected == 'mte' or isinstance(expected, list):
-        metadata['min_num_ub_bytes'] = 190 * 1024
+                                  capacity=capacity, cached=handle is not None,
+                                  has_weights=metadata['weight_side_channel'],
+                                  has_stats=kwargs.get('cumulative_local_expert_recv_stats') is not None,
+                                  has_bias=kwargs.get('bias') is not None)
+    if isinstance(expected, list):
+        metadata['optimized_ub_bytes'] = 216 * 1024
     if original_b is not None:
         metadata.update(B=original_b, M=capacity)
     result, error, entered = None, None, False
@@ -284,23 +270,22 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **
 
 def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     import torch
-    from low_latency_reference import make_routes, expert_entries, payload, prepare_experts, expected_combine
+    from ep_reference import make_routes, expert_entries, prepare_experts, expected_combine
     bs, alignment, sync = case['bs'], case['alignment'], case['cpu_sync']
     dtype, scale_layout = case['dtype'], case['scale_layout']
     routes = make_routes(world, bs, 8, 128, case['seed'])
     if case['route'] == 'hotspot':
         routes = [[list(range(8)) for _ in range(bs)] for _ in range(world)]
+    routes = [rows[:size] for rows, size in zip(routes, case['rank_bs'])]
     if case['edge_routes']:
         # Include empty ranks and both sides of the automatic cutoff in one
         # collective. Keep the normal API's masked and repeated expert slots.
-        for source, rows in enumerate(routes):
-            routes[source] = rows[:case['rank_bs'][source]]
-            for token, selected in enumerate(routes[source]):
+        for rows in routes:
+            for token, selected in enumerate(rows):
                 selected[-1] = -1
                 selected[1] = selected[0]
                 if token % 3 == 0:
                     selected[-2] = -1
-        bs = len(routes[rank])
     counts = [len(rows) for rows in expert_entries(routes, 128, world, rank)]
     assert [len(rows) for rows in routes] == case['rank_bs']
     bs = case['rank_bs'][rank]
@@ -308,13 +293,12 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     indices = torch.tensor(routes[rank], dtype=torch.int64, device='npu').reshape(bs, 8)
     weights = (torch.arange(1, 9, dtype=torch.float32, device='npu') / 32).repeat(bs, 1)
     weights.masked_fill_(indices < 0, 0)
-    stats = torch.zeros(128 // world, dtype=torch.int32, device='npu')
+    stats = torch.ones(128 // world, dtype=torch.int32, device='npu')
     dispatch_args = dict(x=x, topk_idx=indices, topk_weights=weights, num_experts=128,
                          num_max_tokens_per_rank=case['M'],
                          expert_alignment=alignment, num_sms=0, do_expand=True,
                          do_cpu_sync=sync, do_zero_padding=True, async_with_compute_stream=True,
-                         use_tma_aligned_col_major_sf=scale_layout == 'col',
-                         cumulative_local_expert_recv_stats=stats)
+                         use_tma_aligned_col_major_sf=scale_layout == 'col')
 
     def call(operation, label, **kwargs):
         return invoke(buffer, operation, label, case, rank, backend, runtime, collector, **kwargs)
@@ -324,11 +308,10 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     agree(lambda: check_dispatch(recv, recv_weights, handle, routes, rank, world, alignment,
                                  buffer.deterministic, **check_options))
     agree(lambda: _check_no_indices(recv_idx))
-    agree(lambda: torch.testing.assert_close(stats.cpu(), torch.tensor(counts, dtype=torch.int32), atol=0, rtol=0))
-    # Statistics are supported only on fresh dispatch. A second fresh call
-    # checks accumulation and, when requested, stable deterministic ordering.
-    again, _, again_weights, _, _ = call('dispatch', 'fresh_stats_second', **dispatch_args)
-    agree(lambda: torch.testing.assert_close(stats.cpu(), torch.tensor(counts, dtype=torch.int32) * 2, atol=0, rtol=0))
+    # Accumulate into nonzero existing counts. The first handle retains the normal decode options.
+    again, _, again_weights, _, _ = call('dispatch', 'fresh_stats', **dispatch_args,
+                                         cumulative_local_expert_recv_stats=stats)
+    agree(lambda: torch.testing.assert_close(stats.cpu(), torch.tensor(counts, dtype=torch.int32) + 1, atol=0, rtol=0))
     if buffer.deterministic:
         valid_aligned = sum((c + alignment - 1) // alignment * alignment for c in counts)
         recv_values = recv[0] if isinstance(recv, tuple) else recv
@@ -341,7 +324,7 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     unweighted_expert = prepare_experts(recv, counts, rank, 128, world, torch.bfloat16,
                                        expert_alignment=alignment)
     expected_unweighted = expected_combine(routes, rank, 7168, torch.bfloat16,
-                                            reduce_in_local=True, experts=128)
+                                            experts=128)
     for weighted in (False, True):
         expert = unweighted_expert.clone()
         if weighted:
@@ -356,7 +339,7 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
             if num_bias == 2:
                 bias = (bias, torch.full_like(bias, -.125))
             expected_biased = expected_combine(routes, rank, 7168, torch.bfloat16, weighted=weighted,
-                reduce_in_local=True, experts=128, bias=0 if not num_bias else .25 if num_bias == 1 else .125)
+                experts=128, bias=0 if not num_bias else .25 if num_bias == 1 else .125)
             for send_weights in (False, True):
                 output, output_weights, _ = call('combine',
                     f'weighted_{int(weighted)}_bias_{num_bias}_side_{int(send_weights)}',
@@ -478,7 +461,7 @@ def build_identity(deep_ep, torch, torch_npu, args):
                     harness_sha256=file_hash(__file__),
                     harness_files_sha256={name: file_hash(Path(__file__).parent / name) for name in (
                         'test_ep_auto_compat.py', 'compat_config.py', 'compat_trace.py',
-                        'low_latency_reference.py')},
+                        'ep_reference.py')},
                     runtime_files_sha256={str(relative): file_hash(package.parent / relative)
                                           for relative in (
                                               Path('buffers/ep.py'),
@@ -511,8 +494,7 @@ def worker(local_rank, args):
     identity = {}
     agree(lambda: identity.update(build_identity(deep_ep, torch, torch_npu, args)))
     metadata = dict(backend=args.backend, world=world, runtime=runtime, build=identity,
-                    arguments=vars(args), transport_override=os.getenv('EP_DISABLE_LOW_LATENCY_TRANSPORT'),
-                    ub_acceptance_min_bytes=190 * 1024)
+                    arguments=vars(args), transport_override=os.getenv('EP_DISABLE_LOW_LATENCY_TRANSPORT'))
     fingerprint = hashlib.sha256(json.dumps(
         dict(backend=args.backend, capacity=args.capacity, cases=cases, profile_paths=args.profile_paths,
              arch=runtime['arch'], num_vec_cores=runtime['num_vec_cores']),
@@ -574,6 +556,9 @@ def main(argv=None):
         raise SystemExit(str(exc)) from exc
     if args.dry_run:
         print(json.dumps(dict(backend=args.backend, num_cases=len(cases), cases=cases,
+                              world_size=len(cases[0]['rank_bs']),
+                              diagnostic_world=len(cases[0]['rank_bs']) in DIAGNOSTIC_WORLDS,
+                              expected_source_commit=args.expected_source_commit, build_label=args.build_label,
                               path_status='unverified', profile_paths=args.profile_paths),
                          indent=2, allow_nan=False))
         return

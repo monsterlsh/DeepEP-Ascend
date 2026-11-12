@@ -220,6 +220,7 @@ class EPBuffer(BufferBase):
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
         self.deterministic = deterministic
+        self._decode_handle_owner = object()
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_allocated_qps = 0
         self.num_lb_bytes = num_lb_bytes
@@ -363,7 +364,7 @@ class EPBuffer(BufferBase):
             num_sms: the number of AI cores to use (0 selects a default in Python).
                 Cached dispatch always uses the core count from `handle`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
-            previous_event: on the SHMEM path, the current stream waits for this event before dispatch.
+            previous_event: compatibility parameter; providing an event selects the native URMA path.
             async_with_compute_stream: return an event for the current-stream work.
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             handle: an optional cached `EPHandle` from a previous dispatch; if set, the host will reuse
@@ -432,8 +433,12 @@ class EPBuffer(BufferBase):
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
 
+        # A combine handle retains its dispatch layout. Older and externally constructed
+        # handles have no provenance. Cached dispatch keeps the original handle immutable.
+        decode_handle = not self.deterministic and (
+            handle is None or getattr(handle, '_decode_owner', None) is self._decode_handle_owner)
         # Do dispatch
-        result, event, deferred_epilogue = self.runtime.dispatch(
+        result, event, deferred_epilogue, *matched_layout = self.runtime.dispatch(
             x, sf, topk_idx, topk_weights,
             cumulative_local_expert_recv_stats,
             cached_num_recv_tokens,
@@ -452,7 +457,7 @@ class EPBuffer(BufferBase):
             async_with_compute_stream, allocate_on_comm_stream,
             do_handle_copy, do_cpu_sync, do_expand,
             do_zero_padding, use_tma_aligned_col_major_sf,
-            defer_epilogue)
+            defer_epilogue, decode_handle=decode_handle)
         event_overlap = EventOverlap(event)
 
         def finalize_dispatch(dispatch_result: tuple, deterministic_by_hook: bool) \
@@ -486,6 +491,8 @@ class EPBuffer(BufferBase):
                                   recv_src_metadata,
                                   dst_buffer_slot_idx,
                                   dst_gsge_idx)
+                if matched_layout and matched_layout[0]:
+                    handle._decode_owner = self._decode_handle_owner
             assert handle is not None
 
             # Deterministic epilogue
@@ -550,7 +557,7 @@ class EPBuffer(BufferBase):
                 `torch.bfloat16` final bias to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
-            previous_event: on the SHMEM path, the current stream waits for this event before combine.
+            previous_event: compatibility parameter; providing an event selects the native URMA path.
             async_with_compute_stream: return an event for the current-stream work.
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             defer_epilogue: whether to defer the reduce epilogue until `event.current_stream_wait()` is called.
@@ -585,6 +592,9 @@ class EPBuffer(BufferBase):
             async_with_compute_stream,
             allocate_on_comm_stream,
             defer_epilogue,
+            decode_handle=(not self.deterministic and handle.expert_alignment == 128 and
+                           handle.do_expand and x.size(0) == handle.num_expanded_tokens and
+                           getattr(handle, '_decode_owner', None) is self._decode_handle_owner),
         )
         event_overlap = EventOverlap(event)
 

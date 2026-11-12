@@ -13,12 +13,10 @@ import itertools
 import json
 import os
 from pathlib import Path
-import sys
 
 
 DEFAULT_BS = (2, 32, 33, 64, 65, 128, 256, 2)
 BACKENDS = ('official', 'candidate-disabled', 'candidate-auto')
-PRODUCTION_WORLDS = (8, 16, 32, 64, 128)
 DIAGNOSTIC_WORLDS = (1, 2, 4)
 TRANSPORT_ENV = 'EP_DISABLE_LOW_LATENCY_TRANSPORT'
 THRESHOLD_ENV = 'EP_MTE_BS_THRESHOLD'
@@ -28,6 +26,8 @@ def create_parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--backend", choices=BACKENDS, default="candidate-auto")
     result.add_argument("--bs", nargs="+", type=int, default=list(DEFAULT_BS))
+    result.add_argument("--rank-load", choices=("uniform", "decode"), default="uniform",
+                        help="Decode uses B=max(1, bs-rank) on each rank.")
     result.add_argument("--capacity", type=int, default=256)
     result.add_argument("--capacity-mode", choices=("fixed", "batch", "both"), default="fixed")
     result.add_argument("--cpu-sync", choices=("false", "true", "default", "all"), default="false")
@@ -55,10 +55,6 @@ def create_parser():
     result.add_argument("--profile-paths", action="store_true",
                         help="Collect actual kernel-path evidence (implemented by the device runner).")
     return result
-
-
-# The original test launchers use parser(); retain that spelling for callers.
-parser = create_parser
 
 
 def parse_args(argv=None):
@@ -121,7 +117,9 @@ def plan_cases(args, world=None):
     }[args.cpu_sync]
     batches = []
     if args.edge_routes != "only":
-        batches.extend((bs, [bs] * world, False) for bs in args.bs)
+        for bs in args.bs:
+            rank_bs = [max(1, bs - rank) for rank in range(world)] if args.rank_load == 'decode' else [bs] * world
+            batches.append((bs, rank_bs, False))
     if args.edge_routes == "only" or (
         args.edge_routes == "auto" and world >= 4 and args.capacity >= 128 and max(args.bs) >= 128
     ):
@@ -190,8 +188,6 @@ def configure_backend(backend, environ=None):
     return {
         'backend': backend,
         'transport_override': target.get(TRANSPORT_ENV),
-        'transport_override_scope': 'combine_mte_and_shmem' if backend != 'official' else 'unchanged',
-        'dispatch_path_assertion': 'observe_complete_pipeline' if backend != 'official' else 'official_urma',
         'requires_official_build': backend == 'official',
     }
 
@@ -239,26 +235,3 @@ class JsonlReport:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
-
-
-def main(argv=None):
-    argument_parser = create_parser()
-    args = argument_parser.parse_args(argv)
-    try:
-        cases = plan_cases(args)
-    except ValueError as error:
-        argument_parser.error(str(error))
-    if not args.dry_run:
-        argument_parser.error("This helper only plans cases; use the device runner or --dry-run")
-    json.dump({"backend": args.backend, "num_cases": len(cases),
-               "expected_source_commit": args.expected_source_commit, "build_label": args.build_label,
-               "world_size": len(cases[0]["rank_bs"]),
-               "diagnostic_world": len(cases[0]["rank_bs"]) in DIAGNOSTIC_WORLDS,
-               "cases": cases},
-              sys.stdout, indent=2, allow_nan=False)
-    sys.stdout.write("\n")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -14,6 +14,7 @@ HEADER = ROOT / 'csrc/buffers/low_latency_state.hpp'
 
 def host_test_source():
     prefix = r'''
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -33,17 +34,20 @@ def host_test_source():
 namespace mock {
 std::vector<std::string> events;
 int stream = 0, copies = 0, allocation_count = 0;
-int arch = 3510, cores = 64, vec_per_ai = 2, ub_bytes = 256 * 1024;
+const char* soc = "Ascend950DT_9582";
+int arch = 3510, cores = 64, vec_per_ai = 2, ub_bytes = 216 * 1024;
 int fail_allocation = -1, fail_copy = -1;
 bool event_failure = false, wait_failure = false;
 void note(const std::string& value) { events.push_back(value); }
 void reset() {
+    soc = "Ascend950DT_9582";
     events.clear(); stream = 0; copies = allocation_count = 0;
     fail_allocation = fail_copy = -1;
     event_failure = wait_failure = false;
-    arch = 3510; cores = 64; vec_per_ai = 2; ub_bytes = 256 * 1024;
+    arch = 3510; cores = 64; vec_per_ai = 2; ub_bytes = 216 * 1024;
 }
 }
+const char* aclrtGetSocName() { return mock::soc; }
 #define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while (0)
 #define ACL_CHECK(expr) do { if ((expr) != 0) throw std::runtime_error("ACL copy"); } while (0)
 constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 0;
@@ -99,15 +103,28 @@ struct EventHandle {
     }
 };
 namespace comm {
+constexpr int64_t kNumSystemCyclesPerSecond = 1000000000LL;
 struct HcclContext { void* comm = nullptr; };
 struct Context {
     int rank_idx = 3, num_ranks = 8, num_cpu_timeout_secs = 300;
+    int64_t num_gpu_timeout_cycles = 100 * kNumSystemCyclesPerSecond;
     std::shared_ptr<HcclContext> hccl_context = std::make_shared<HcclContext>();
+};
+class DecodeAgreement {
+public:
+    inline static bool all_match = true, capturing = false;
+    inline static int votes = 0;
+    bool initialize(int) { return true; }
+    static bool is_capturing() { return capturing; }
+    bool matches(void*, int, int, uint16_t proposal) {
+        ++votes;
+        return all_match && proposal != 0;
+    }
 };
 class ShmemArena {
 public:
     inline static bool supported = true;
-    inline static uint16_t peer_capabilities = 3;
+    inline static uint16_t peer_capabilities = 1;
     inline static bool session_failed = false;
     inline static int failure_marks = 0;
     inline static int result = 1, attempts = 0, closes = 0, agreements = 0, peer_reads = 0;
@@ -138,7 +155,8 @@ public:
     void mark_failed() noexcept { session_failed = true; ++failure_marks; }
     void close() { check_available(); ++closes; closed = true; mock::note("close"); }
     static void reset() {
-        supported = true; peer_capabilities = 3; session_failed = false;
+        DecodeAgreement::all_match = true; DecodeAgreement::capturing = false; DecodeAgreement::votes = 0;
+        supported = true; peer_capabilities = 1; session_failed = false;
         result = 1; attempts = closes = failure_marks = agreements = peer_reads = 0;
         bad_peer = -1; peer_misalignment = 0; requested_bytes = 0;
     }
@@ -160,10 +178,16 @@ template<class F> void rejects(F fn, const std::string& message) {
     }
     assert(caught);
 }
-auto input() { return torch::empty({2,128}, {}); }
+auto input() { return torch::empty({1,7168}, {}); }
 auto prepare(EPLowLatencyState& state, const deep_ep::comm::Context& context,
              const torch::Tensor& x, bool fp8 = false) {
-    return state.prepare_dispatch(context, x, 2, 128, 1, 8, 64, 256*1024, fp8, false, false);
+    return state.prepare_dispatch(context, x, 2, 7168, 8, 128, 64, 216*1024, fp8, false, false, true);
+}
+auto combine(EPLowLatencyState& state, const deep_ep::comm::Context& ctx, const torch::Tensor& x, bool eligible) {
+    bool native_mte = false;
+    auto launch = state.prepare_combine(ctx, x, 2, 7168, 8, 128, 64, 221184, 1, eligible, false, native_mte);
+    assert(!native_mte);
+    return launch;
 }
 void check_capability_and_cached_refusal() {
     for (int mode=0; mode<6; ++mode) {
@@ -185,7 +209,7 @@ void check_capability_and_cached_refusal() {
 }
 void check_capacity_gate() {
     reset(); deep_ep::comm::Context ctx; auto x=input();
-    const auto plan=deep_ep::get_dispatch_low_latency_plan(3510,8,2,128,1,8,64,256*1024,false);
+    const auto plan=deep_ep::get_dispatch_low_latency_plan(3510,8,2,7168,8,128,64,216*1024,false);
     assert(plan && plan->buffer_bytes>0);
     EPLowLatencyState short_buffer("group",plan->buffer_bytes-1);
     short_buffer.initialize(ctx);
@@ -204,29 +228,29 @@ void check_group_capacity_and_transport_switch() {
         state.initialize(ctx);
         const auto batch = [&](int capacity, bool cached) {
             const auto x = torch::empty({capacity - rank, 7168}, {});
-            return state.prepare_dispatch(ctx, x, capacity, 7168, 8, 128, 64, 256 * 1024, false, cached, false);
+            return state.prepare_dispatch(ctx, x, capacity, 7168, 8, 128, 64, 216 * 1024, false, cached, false, true);
         };
         assert(not batch(17, false));
         assert(ShmemArena::attempts == 0);
         const auto fresh = batch(16, false);
         assert(fresh and ShmemArena::attempts == 1);
-        state.begin(fresh);
+        state.begin();
         state.record_completion();
 
         mock::stream = 1;
         const auto native = batch(16, true);
         assert(not native and mock::events.back() == "wait:0->1");
-        state.begin(native);
+        state.begin();
         state.record_completion();
 
         mock::stream = 2;
         const auto smaller = batch(8, false);
         assert(smaller and mock::events.back() == "wait:1->2");
-        state.begin(smaller);
+        state.begin();
         state.record_completion();
         const auto cached = batch(8, true);
         assert(cached and cached->arena == fresh->arena and ShmemArena::attempts == 1);
-        state.begin(cached);
+        state.begin();
         state.record_completion();
         state.close();
     }
@@ -246,35 +270,35 @@ void check_pending_and_cross_stream() {
         assert(address==reinterpret_cast<uint64_t>(launch->arena->memory+peer*32));
     }
     const auto allocations=mock::allocation_count;
-    state.begin(launch);
-    std::weak_ptr<deep_ep::EPLowLatencyLaunch> weak=launch;
-    launch.reset(); assert(!weak.expired());
+    state.begin();
+    std::weak_ptr<ShmemArena> weak = launch->arena;
+    assert(!weak.expired());
     const auto before_reject=mock::events.size();
     rejects([&] { prepare(state,ctx,x); },"outstanding");
     assert(mock::events.size()==before_reject);
-    mock::stream=1; state.record_completion(); assert(weak.expired());
+    mock::stream=1; state.record_completion(); assert(!weak.expired());
     assert(mock::events.back()=="record:1");
     mock::events.clear(); mock::stream=2; auto next=prepare(state,ctx,x);
     assert(mock::events.size()==1 && mock::events.front()=="wait:1->2");
-    assert(next->peer_buffers.storage==table && mock::copies==1 && ShmemArena::peer_reads==8);
+    assert(next == launch && next->peer_buffers.storage==table && mock::copies==1 && ShmemArena::peer_reads==8);
     assert(mock::allocation_count==allocations && ShmemArena::attempts==1);
-    state.begin(next); state.record_completion();
+    state.begin(); state.record_completion();
     mock::events.clear(); mock::stream=3;
     assert(!prepare(state,ctx,x,true));
     assert(mock::events.size()==1 && mock::events[0]=="wait:2->3");
-    state.begin(nullptr);
+    state.begin();
     rejects([&] { prepare(state,ctx,x); },"outstanding");
     state.record_completion(); state.close(); assert(ShmemArena::closes==1);
-    state.close(); assert(ShmemArena::closes==1); ++cases;
+    state.close(); assert(ShmemArena::closes==1 && weak.expired()); ++cases;
 }
 void check_combine_then_dispatch() {
     reset(); deep_ep::comm::Context ctx; auto x=input();
     EPLowLatencyState state("group", buffer_bytes);
     state.initialize(ctx);
-    auto native = state.prepare_combine(ctx, x, false);
+    auto native = combine(state, ctx, x, false);
     assert(!native && ShmemArena::attempts == 0);
-    state.begin(native);
-    rejects([&] { state.prepare_combine(ctx, x, true); }, "outstanding");
+    state.begin();
+    rejects([&] { combine(state, ctx, x, true); }, "outstanding");
     rejects([&] { prepare(state, ctx, x); }, "outstanding");
     rejects([&] { state.close(); }, "outstanding");
     assert(!ShmemArena::session_failed && ShmemArena::attempts == 0);
@@ -284,41 +308,39 @@ void check_combine_then_dispatch() {
 
     mock::stream = 2;
     mock::events.clear();
-    auto first = state.prepare_combine(ctx, x, true);
+    auto first = combine(state, ctx, x, true);
     assert(first && mock::events.front() == "wait:1->2");
-    const auto arena = first->arena;
-    const auto table = first->peer_buffers.storage;
-    state.begin(first);
-    std::weak_ptr<deep_ep::EPLowLatencyLaunch> held = first;
-    first.reset();
-    assert(!held.expired());
+    std::weak_ptr<ShmemArena> arena = first->arena;
+    std::weak_ptr<torch::Storage> table = first->peer_buffers.storage;
+    state.begin();
+    assert(!arena.expired() && !table.expired());
     rejects([&] { prepare(state, ctx, x); }, "outstanding");
     rejects([&] { state.close(); }, "outstanding");
     assert(ShmemArena::closes == 0);
     mock::stream = 3;
     state.record_completion();
-    assert(held.expired() && mock::events.back() == "record:3");
+    assert(!arena.expired() && !table.expired() && mock::events.back() == "record:3");
 
     mock::stream = 4;
     auto dispatch = prepare(state, ctx, x);
     assert(dispatch && mock::events.back() == "wait:3->4");
-    assert(dispatch->arena == arena && dispatch->peer_buffers.storage == table);
-    state.begin(dispatch);
+    assert(dispatch == first && dispatch->arena == arena.lock() && dispatch->peer_buffers.storage == table.lock());
+    state.begin();
     state.record_completion();
     mock::stream = 5;
-    native = state.prepare_combine(ctx, x, false);
+    native = combine(state, ctx, x, false);
     assert(!native && mock::events.back() == "wait:4->5");
-    state.begin(native);
+    state.begin();
     state.record_completion();
     mock::stream = 6;
-    auto repeated = state.prepare_combine(ctx, x, true);
+    auto repeated = combine(state, ctx, x, true);
     assert(repeated && mock::events.back() == "wait:5->6");
-    assert(repeated->arena == arena && repeated->peer_buffers.storage == table);
+    assert(repeated == first && repeated->arena == arena.lock() && repeated->peer_buffers.storage == table.lock());
     assert(ShmemArena::agreements == 1 && ShmemArena::attempts == 1 && mock::copies == 1);
-    state.begin(repeated);
+    state.begin();
     state.record_completion();
     state.close();
-    assert(ShmemArena::closes == 1);
+    assert(ShmemArena::closes == 1 && arena.expired() && table.expired());
     ++cases;
 }
 void check_combine_admission() {
@@ -328,44 +350,97 @@ void check_combine_admission() {
         if (mode == 0) mock::arch = 3500;
         if (mode == 1) mock::cores = 63;
         if (mode == 2) mock::ub_bytes = 190 * 1024 - 1;
-        if (mode == 3) ShmemArena::peer_capabilities = 1;
+        if (mode == 3) ShmemArena::peer_capabilities = 0;
         if (mode == 4) mock::vec_per_ai = 1;
         if (mode == 5) ShmemArena::result = 0;
-        if (mode == 6) mock::ub_bytes = 190 * 1024;
+        if (mode == 6) mock::ub_bytes = 216 * 1024;
         state.initialize(ctx);
         for (int attempt = 0; attempt < 2; ++attempt) {
-            auto launch = state.prepare_combine(ctx, x, true);
+            auto launch = combine(state, ctx, x, true);
             assert(bool(launch) == (mode == 6));
-            state.begin(launch);
+            state.begin();
             mock::events.clear();
             state.record_completion();
             if (mode == 0 || mode == 5) assert(mock::events.empty());
         }
         assert(ShmemArena::agreements == 1 && ShmemArena::attempts == (mode >= 5 ? 1 : 0));
         assert(mock::copies == (mode == 6 ? 1 : 0));
-        if (mode >= 1 && mode <= 4) {
-            auto dispatch = prepare(state, ctx, x);
-            assert(dispatch && ShmemArena::attempts == 1);
-            state.begin(dispatch);
-            state.record_completion();
-            assert(!state.prepare_combine(ctx, x, true));
+        if (mode == 3) {
+            assert(!prepare(state, ctx, x));
+            assert(ShmemArena::attempts == 0);
         }
         state.close();
         ++cases;
     }
+}
+void check_group_refusal_and_mixed_combine() {
+    using deep_ep::comm::DecodeAgreement;
+    for (int world : {8, 16, 32, 64, 128}) {
+        for (int rank = 0; rank < world; ++rank) {
+            reset();
+            deep_ep::comm::Context ctx;
+            ctx.num_ranks = world; ctx.rank_idx = rank;
+            EPLowLatencyState state("group", buffer_bytes);
+            state.initialize(ctx);
+            const int m = world == 8 ? 64 : 32;
+            const int b = std::max(1, m-rank);
+            auto x = input();
+            const auto select = [&](int tokens, bool options) {
+                bool native_mte = true;
+                assert(!state.prepare_combine(ctx,x,m,7168,8,128,64,221184,tokens,options,true,native_mte));
+                return native_mte;
+            };
+            assert(select(b,true) == ((world==8 && rank>=4) || (world==16 && rank==15)));
+            assert(!select(b+1,true));
+            assert(!select(b,false));
+            DecodeAgreement::all_match=false;
+            assert(!select(b,true));
+            assert(ShmemArena::attempts==0);
+            assert(DecodeAgreement::votes == ((world == 8 || world == 16) ? 4 : 0));
+            if (world == 8) {
+                const int votes=DecodeAgreement::votes;
+                assert(!combine(state,ctx,x,true));
+                assert(!prepare(state,ctx,x));
+                assert(DecodeAgreement::votes==votes+2 && ShmemArena::attempts==0);
+                DecodeAgreement::all_match=true; DecodeAgreement::capturing=true;
+                assert(!combine(state,ctx,x,true));
+                assert(!prepare(state,ctx,x));
+                assert(DecodeAgreement::votes==votes+2 && ShmemArena::attempts==0);
+            }
+            state.close();
+        }
+    }
+    for (int failure = 0; failure < 3; ++failure) {
+        reset();
+        deep_ep::comm::Context ctx;
+        if (failure == 0) --ctx.num_gpu_timeout_cycles;
+        if (failure == 1) mock::soc = "Ascend950DT_9599";
+        if (failure == 2) mock::soc = nullptr;
+        EPLowLatencyState state("group", buffer_bytes);
+        state.initialize(ctx);
+        auto x = input();
+        assert(!prepare(state,ctx,x));
+        state.begin();
+        assert(!combine(state,ctx,x,true));
+        state.record_completion();
+        assert(DecodeAgreement::votes == 0 && ShmemArena::attempts == 0);
+        state.close();
+    }
+    ++cases;
 }
 void check_combine_failures() {
     for (int mode = 0; mode < 4; ++mode) {
         reset(); deep_ep::comm::Context ctx; auto x=input();
         EPLowLatencyState state("group", buffer_bytes);
         state.initialize(ctx);
-        auto launch = state.prepare_combine(ctx, x, mode != 0);
-        state.begin(launch);
+        const auto launch = combine(state, ctx, x, mode != 0);
+        assert(bool(launch) == (mode != 0));
+        state.begin();
         if (mode == 2) mock::event_failure = true;
         if (mode == 3) {
             state.record_completion();
             mock::wait_failure = true;
-            rejects([&] { state.prepare_combine(ctx, x, false); }, "event wait failure");
+            rejects([&] { combine(state, ctx, x, false); }, "event wait failure");
         } else {
             rejects([&] {
                 const auto guard = state.failure_guard();
@@ -374,7 +449,7 @@ void check_combine_failures() {
             }, mode == 2 ? "event" : "combine");
         }
         rejects([&] { prepare(state, ctx, x); }, "failed");
-        rejects([&] { state.prepare_combine(ctx, x, false); }, "failed");
+        rejects([&] { combine(state, ctx, x, false); }, "failed");
         rejects([&] { state.close(); }, "failed");
         assert(ShmemArena::session_failed == (mode != 0));
         ++cases;
@@ -402,21 +477,21 @@ void check_preparation_failures() {
 void check_guard_and_completion_failures() {
     for(int mode=0;mode<2;++mode) {
         reset(); EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
-        state.initialize(ctx); auto x=input(); auto launch=prepare(state,ctx,x); state.begin(launch);
-        std::weak_ptr<deep_ep::EPLowLatencyLaunch> weak=launch;
+        state.initialize(ctx); auto x=input(); auto launch=prepare(state,ctx,x); state.begin();
+        std::weak_ptr<ShmemArena> weak = launch->arena;
         if(mode==1) mock::event_failure=true;
         rejects([&] {
             const auto guard=state.failure_guard();
             if(mode==0) throw std::runtime_error("external dispatch failure");
             state.record_completion();
         },mode==0 ? "dispatch" : "event");
-        launch.reset(); assert(!weak.expired());
+        assert(!weak.expired());
         rejects([&] { prepare(state,ctx,x); },"failed");
         rejects([&] { state.close(); },"failed"); ++cases;
     }
     reset(); EPLowLatencyState state("group",buffer_bytes); deep_ep::comm::Context ctx;
     state.initialize(ctx); auto x=input(); auto launch=prepare(state,ctx,x);
-    state.begin(launch); state.record_completion(); mock::wait_failure=true;
+    assert(launch); state.begin(); state.record_completion(); mock::wait_failure=true;
     rejects([&] { prepare(state,ctx,x); },"event wait failure");
     assert(ShmemArena::session_failed && ShmemArena::failure_marks==1);
     rejects([&] { prepare(state,ctx,x); },"failed"); ++cases;
@@ -428,7 +503,7 @@ void check_shared_session_failure() {
         first.initialize(ctx); second.initialize(ctx); auto x=input();
         auto a=prepare(first,ctx,x),b=prepare(second,ctx,x);
         assert(a && b && a->arena!=b->arena && a->peer_buffers.storage!=b->peer_buffers.storage);
-        first.begin(a); first.record_completion(); second.begin(b); second.record_completion();
+        first.begin(); first.record_completion(); second.begin(); second.record_completion();
         mock::events.clear(); first.fail();
         assert(ShmemArena::session_failed && ShmemArena::failure_marks==1);
         rejects([&] { prepare(second,ctx,x,fallback); },"shared session failed");
@@ -440,7 +515,7 @@ void check_shared_session_failure() {
 int main() {
     check_capability_and_cached_refusal(); check_capacity_gate(); check_pending_and_cross_stream();
     check_group_capacity_and_transport_switch();
-    check_combine_then_dispatch(); check_combine_admission(); check_combine_failures();
+    check_combine_then_dispatch(); check_combine_admission(); check_group_refusal_and_mixed_combine(); check_combine_failures();
     check_preparation_failures(); check_guard_and_completion_failures(); check_shared_session_failure();
     std::cout << "PASS " << cases << " CPU State source cases\n";
 }
@@ -449,9 +524,13 @@ int main() {
 
 
 class DispatchLLStateHostTests(unittest.TestCase):
+    def test_decode_policy_grid(self):
+        source = (ROOT / 'tests/ep/decode_policy_test.cpp').read_text()
+        run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'))
+
     def test_actual_state_transitions(self):
         output = run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'))
-        self.assertIn('PASS 31 CPU State source cases', output)
+        self.assertIn('PASS 32 CPU State source cases', output)
 
 
 if __name__ == '__main__':

@@ -1,6 +1,6 @@
 """Host-only checks for the optional MTE stream test's routing and oracle.
 
-Pure helpers are extracted from test_stream.py without importing deep_ep,
+Pure helpers are extracted from test_stream_compat.py without importing deep_ep,
 Torch NPU, or its distributed runner. The data-oracle test uses CPU Torch when
 available; routing and configuration checks require only the standard library.
 """
@@ -18,8 +18,8 @@ from unittest.mock import Mock, patch
 
 
 def load_helpers():
-    source = Path(__file__).with_name("test_stream.py")
-    names = {"mte_routes", "validate_config", "configure_backend", "check_mte_dispatch", "require_device_delay"}
+    source = Path(__file__).with_name("test_stream_compat.py")
+    names = {"mte_routes", "validate_config", "check_mte_dispatch", "require_device_delay"}
     nodes = [node for node in ast.parse(source.read_text(encoding="utf-8")).body
              if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in nodes} == names
@@ -67,28 +67,6 @@ class StreamHostTests(unittest.TestCase):
                 validate(SimpleNamespace(ep_shape="mte", ep_bs=16, ep_capacity=16), world)
             validate(SimpleNamespace(ep_shape="fallback", ep_bs=16, ep_capacity=16), world)
 
-    def test_official_backend_preserves_environment(self):
-        inherited = {'EP_DISABLE_LOW_LATENCY_TRANSPORT': 'stale',
-                     'EP_MTE_BS_THRESHOLD': '4096', 'KEEP': 'value'}
-        with patch.dict(os.environ, inherited, clear=True):
-            self.helpers['configure_backend']('official')
-            self.assertEqual(dict(os.environ), inherited)
-
-    def test_candidate_modes_discard_inherited_threshold_overrides(self):
-        for backend in ('candidate-disabled', 'candidate-auto'):
-            for threshold in (None, '0', '4096', 'invalid'):
-                inherited = {'EP_DISABLE_LOW_LATENCY_TRANSPORT': 'stale', 'KEEP': 'value'}
-                if threshold is not None:
-                    inherited['EP_MTE_BS_THRESHOLD'] = threshold
-                expected = {'KEEP': 'value'}
-                if backend == 'candidate-disabled':
-                    expected['EP_DISABLE_LOW_LATENCY_TRANSPORT'] = '1'
-                with self.subTest(backend=backend, threshold=threshold), \
-                        patch.dict(os.environ, inherited, clear=True):
-                    for _ in range(2):
-                        self.helpers['configure_backend'](backend)
-                        self.assertEqual(dict(os.environ), expected)
-
     def test_delay_preflight_rejects_missing_or_noncallable_api(self):
         for torch in (SimpleNamespace(), SimpleNamespace(npu=SimpleNamespace()),
                       SimpleNamespace(npu=SimpleNamespace(_sleep=None)),
@@ -104,7 +82,7 @@ class StreamHostTests(unittest.TestCase):
         delay.assert_not_called()
 
     def test_worker_checks_delay_before_initializing_distributed(self):
-        source = Path(__file__).with_name('test_stream.py')
+        source = Path(__file__).with_name('test_stream_compat.py')
         tree = ast.parse(source.read_text(encoding='utf-8'))
         worker = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'test')
         # Execute the real worker body without the Torch inference decorator.
@@ -121,13 +99,14 @@ class StreamHostTests(unittest.TestCase):
                 with self.assertRaisesRegex(error, message):
                     namespace['test'](0, 2, SimpleNamespace(backend='official'))
             if available:
+                configure.assert_called_once_with("official")
                 init_dist.assert_called_once_with(0, 2)
             else:
                 init_dist.assert_not_called()
                 configure.assert_not_called()
 
     def test_parent_checks_delay_before_spawning_workers(self):
-        source = Path(__file__).with_name('test_stream.py')
+        source = Path(__file__).with_name('test_stream_compat.py')
         tree = ast.parse(source.read_text(encoding='utf-8'))
         main = next(node for node in tree.body if isinstance(node, ast.If)
                     and ast.unparse(node.test) == "__name__ == '__main__'")
@@ -135,11 +114,11 @@ class StreamHostTests(unittest.TestCase):
             spawn, delay, worker = Mock(), Mock(), object()
             torch = SimpleNamespace(npu=SimpleNamespace(_sleep=delay if available else None),
                                     multiprocessing=SimpleNamespace(spawn=spawn))
-            namespace = dict(self.helpers, __name__='__main__', argparse=argparse,
+            namespace = dict(self.helpers, __name__='__main__', argparse=argparse, configure_backend=Mock(),
                              torch=torch, test=worker)
             errors = io.StringIO()
             with self.subTest(available=available), patch.dict(self.helpers, torch=torch), \
-                    patch.object(sys, 'argv', ['test_stream.py']), redirect_stderr(errors):
+                    patch.object(sys, 'argv', ['test_stream_compat.py']), redirect_stderr(errors):
                 if available:
                     exec(compile(ast.Module(body=[main], type_ignores=[]), str(source), 'exec'), namespace)
                 else:
@@ -154,7 +133,7 @@ class StreamHostTests(unittest.TestCase):
             delay.assert_not_called()
 
     def test_explicit_backend_registration_precedes_extension_import(self):
-        source = Path(__file__).with_name('test_stream.py')
+        source = Path(__file__).with_name('test_stream_compat.py')
         tree = ast.parse(source.read_text(encoding='utf-8'))
         imports = {alias.name: index for index, node in enumerate(tree.body) if isinstance(node, ast.Import)
                    for alias in node.names}

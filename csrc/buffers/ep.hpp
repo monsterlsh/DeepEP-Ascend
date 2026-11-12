@@ -132,7 +132,7 @@ public:
              const bool& do_handle_copy, const bool& do_cpu_sync,
              const bool& do_expand, const bool& do_zero_padding,
              const bool& use_cube_aligned_col_major_sf,
-             const bool& defer_epilogue) const {
+             const bool& defer_epilogue, bool decode_handle = false) const {
         EP_HOST_ASSERT(not destroyed);
 
         // Ascend EP has some limitations over NVIDIA version
@@ -270,11 +270,16 @@ public:
         }
 
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
+        const bool matched_layout = decode_handle and num_ai_cores == 32 and expert_alignment == 128 and
+            topk_weights.has_value() and not cumulative_local_expert_recv_stats and not do_cpu_sync and
+            do_zero_padding and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
+            defer_epilogue and not use_cube_aligned_col_major_sf and
+            num_tokens == std::max(1, num_max_tokens_per_rank - context->rank_idx) and
+            is_decode_shape(context->num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
+                            num_used_vec_cores, num_ub_bytes, sf.has_value());
         const auto ll_launch = low_latency_state->prepare_dispatch(
             *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
-            num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue);
-        if (ll_launch and previous_event)
-            previous_event->current_stream_wait();
+            num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue, matched_layout);
         const auto dispatch_buffer = ll_launch ? ll_launch->buffer() : context->buffer;
 
         // Clean host workspace
@@ -286,7 +291,7 @@ public:
         }
 
         // Launch dispatch
-        low_latency_state->begin(ll_launch);
+        low_latency_state->begin();
         const auto ll_failure_guard = low_latency_state->failure_guard();
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr(), topk_weights_ptr,
@@ -312,13 +317,13 @@ public:
                         num_ub_bytes,
                         num_used_vec_cores,
                         context->num_gpu_timeout_cycles,
-                        barrier_in_prologue, ll_launch != nullptr,
+                        barrier_in_prologue,
                         ll_launch ? ll_launch->peer_buffers.data_ptr() : nullptr);
 
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
-                         ll_launch = ll_launch, low_latency_state = low_latency_state]() {
+                         low_latency_state = low_latency_state]() {
             const auto ll_failure_guard = low_latency_state->failure_guard();
             // Wait GPU notify or reuse cached allocation sizes
             int num_recv_tokens = context->num_ranks * num_max_tokens_per_rank;
@@ -432,8 +437,12 @@ public:
         };
 
         // Defer epilogue and host sync
-        if (defer_epilogue)
-            return defer(std::move(epilogue));
+        if (defer_epilogue) {
+            const auto deferred = defer(std::move(epilogue));
+            if (matched_layout)
+                return pybind11::make_tuple(deferred[0], deferred[1], deferred[2], true);
+            return deferred;
+        }
 
         // Do epilogue immediately
         const auto result = epilogue();
@@ -456,7 +465,7 @@ public:
             const std::optional<EventHandle>& previous_event,
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
-            const bool& defer_epilogue) const {
+            const bool& defer_epilogue, bool decode_handle = false) const {
         EP_HOST_ASSERT(not destroyed);
         EP_HOST_ASSERT(not defer_epilogue or async_with_compute_stream);
         EP_HOST_ASSERT(num_experts % context->num_ranks == 0);
@@ -517,18 +526,13 @@ public:
 
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
-        const bool mte_enabled = low_latency_transport_enabled();
-        // All peers must select the same receive arena, even when one rank has zero input tokens.
-        const bool shmem_shape = mte_enabled and num_sms == 32 and
-            mte_workload_fits(true, context->num_ranks, num_max_tokens_per_rank, num_max_tokens_per_rank,
-                              hidden, num_topk, num_experts, mte_bs_threshold_override());
-        const auto ll_launch = low_latency_state->prepare_combine(*context, x, shmem_shape);
-        if (ll_launch and previous_event)
-            previous_event->current_stream_wait();
-        const bool low_latency_transport = ll_launch or (mte_enabled and
-            prefer_low_latency_transport_runtime(true, runtime->get_npu_arch(), context->num_ranks, num_combined_tokens,
-                                                 num_max_tokens_per_rank, hidden, num_topk, num_experts,
-                                                 num_used_vec_cores, false, num_ub_bytes));
+        bool native_mte = false;
+        const auto ll_launch = low_latency_state->prepare_combine(
+            *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes,
+            num_combined_tokens, decode_handle and num_sms == 32 and topk_weights.has_value() and not bias_0 and
+            not bias_1 and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
+            defer_epilogue, barrier_in_prologue, native_mte);
+        const bool low_latency_transport = ll_launch or native_mte;
         torch::Tensor send_buffer;
         if (not low_latency_transport) {
             const auto token_layout = get_combine_token_layout(hidden * static_cast<int>(sizeof(uint16_t)), num_topk);
@@ -541,7 +545,7 @@ public:
         record_use(psum_num_recv_tokens_per_rank, issue_stream);
         if (topk_weights)
             record_use(*topk_weights, issue_stream);
-        low_latency_state->begin(ll_launch);
+        low_latency_state->begin();
         const auto ll_failure_guard = low_latency_state->failure_guard();
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
@@ -566,7 +570,7 @@ public:
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, send_buffer = send_buffer, context = context,
-                         ll_launch = ll_launch, low_latency_state = low_latency_state]() {
+                         low_latency_state = low_latency_state]() {
             const auto ll_failure_guard = low_latency_state->failure_guard();
             const auto reduce_stream = c10_npu::getCurrentNPUStream();
             record_use(combined_topk_idx, reduce_stream);

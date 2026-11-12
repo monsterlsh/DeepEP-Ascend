@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import sys
 
-from compat_trace import TraceVerificationError, allowed_transports, verify_kernel_records
+from compat_trace import TraceVerificationError, verify_case_metadata, verify_kernel_records
 
 BACKENDS = {'official', 'candidate-disabled', 'candidate-auto'}
 BUILD_FIELDS = (
@@ -105,29 +105,23 @@ def check_paths(record, rank, case_id, backend):
         names = operation.get('kernel_names')
         parameters = operation.get('kernel_parameters')
         hashes = operation.get('file_sha256')
-        parameter_evidence = (
-            isinstance(parameters, dict) and isinstance(names, list) and set(parameters) == set(names)
-            and all(isinstance(value, dict) and value.get('transport') == operation.get('actual_transport')
-                    for value in parameters.values()))
         actual, expected = operation.get('actual_transport'), operation.get('expected_transport')
+        parameter_evidence = False
         try:
-            allowed = allowed_transports(kind, expected)
-        except TraceVerificationError:
-            allowed = ()
-        if actual in ('ll', 'shmem') or (isinstance(expected, list) and 'shmem' in expected):
-            # Recheck device symbols for SHMEM and every stage of historical LL dispatch.
-            parameter_evidence = False
-            try:
-                proof = verify_kernel_records(kernels or [], kind, normalized_backend, actual)
-                parameter_evidence = ((actual != 'll' or operation.get('ll_pipeline_verified') is True)
-                                      and proof['kernel_parameters'] == parameters
-                                      and set(proof['kernel_names']) == set(names or []))
-            except (TraceVerificationError, KeyError, TypeError, ValueError):
-                pass
+            proof = verify_kernel_records(kernels or [], kind, normalized_backend, expected)
+            require(isinstance(evidence, dict), "operation metadata must be an object")
+            verify_case_metadata(proof['kernel_parameters'], kind, evidence)
+            parameter_evidence = (
+                proof['actual_transport'] == actual and set(proof['kernel_names']) == set(names or [])
+                and isinstance(parameters, dict) and set(parameters) == set(proof['kernel_names'])
+                and all(isinstance(parameters[name], dict)
+                        and all(parameters[name].get(key) == value for key, value in parsed.items())
+                        for name, parsed in proof['kernel_parameters'].items()))
+        except (TraceVerificationError, KeyError, TypeError, ValueError):
+            pass
         complete = (
             operation.get('profiling_enabled') is True
             and operation.get('backend') == normalized_backend
-            and actual in allowed
             and (actual != 'shmem' or backend == 'candidate-auto')
             and isinstance(evidence, dict)
             and evidence.get('rank') == rank and evidence.get('case_id') == case_id
@@ -227,13 +221,14 @@ def read_rank(path, rank):
                                 record, rank, case_id, result['metadata']['backend'])
                         else:
                             path_status, reasons, operation_count = 'unverified', ['case failed'], 0
-                        combine_transports = {}
+                        transports = {}
                         if path_status == 'verified':
-                            combine_transports = {op['label']: op['actual_transport'] for op in record['operations']
-                                                  if op['operation'] == 'combine'}
+                            for op in record['operations']:
+                                transports[op['operation'], op['label']] = (
+                                    op['actual_transport'], op.get('expected_transport'))
                         result['cases'].append(dict(case_id=case_id, case=case, status=status,
                             path_status=path_status, path_reasons=reasons, operation_count=operation_count,
-                            combine_transports=combine_transports))
+                            transports=transports))
                         active = None
                 except (ValueError, TypeError, KeyError) as error:
                     result['errors'].append(f"{path.name}:{line_number}: {error}")
@@ -263,8 +258,13 @@ def variants(reports, section, key):
     return list(groups.values())
 
 
-def summarize(input_dir, require_paths=False, require_shmem_combine=False):
-    require_paths = require_paths or require_shmem_combine
+def summarize(input_dir, require_paths=False, require_shmem_combine=False, require_mte_dispatch=False):
+    required_transports = {}
+    if require_mte_dispatch:
+        required_transports['dispatch'] = 'mte'
+    if require_shmem_combine:
+        required_transports['combine'] = 'shmem'
+    require_paths = require_paths or bool(required_transports)
     directory = Path(input_dir)
     reports, errors = [], []
     if not directory.is_dir():
@@ -313,16 +313,25 @@ def summarize(input_dir, require_paths=False, require_shmem_combine=False):
     for case_id, values in definitions.items():
         if len(values) > 1:
             errors.append(f"conflicting case definition for {case_id}")
+    observed_eligible = set()
     for results in case_results.values():
-        # Every rank must select the same SHMEM arena for a collective. Native
-        # fallback transports may legitimately differ with the rank's local B.
-        shmem_labels = {label for _, case in results for label, transport in case['combine_transports'].items()
-                        if transport == 'shmem'}
+        collective_targets = {}
         for _, case in results:
-            for label, transport in case['combine_transports'].items():
-                if transport != 'shmem' and (require_shmem_combine or label in shmem_labels):
-                    reason = 'required by acceptance check' if require_shmem_combine else 'observed on another rank'
-                    case['path_reasons'].append(f"combine/{label}: captured {transport}, SHMEM {reason}")
+            for key, (actual, expected_options) in case['transports'].items():
+                kind, _label = key
+                target = required_transports.get(kind)
+                if target and target in (expected_options or ()):
+                    observed_eligible.add(kind)
+                    collective_targets[key] = target
+                # A combine that used the SHMEM arena must agree across ranks
+                # even when strict fast-path checks are disabled.
+                if kind == 'combine' and actual == 'shmem':
+                    collective_targets[key] = 'shmem'
+        for _, case in results:
+            for (kind, label), target in sorted(collective_targets.items()):
+                transport, _ = case['transports'].get((kind, label), ('no device record', None))
+                if transport != target:
+                    case['path_reasons'].append(f"{kind}/{label}: expected group-wide {target.upper()}, captured {transport}")
                     case['path_status'] = 'unverified'
     complete = (world is not None and bool(reports) and not missing and not unexpected
                 and all(report['complete'] for report in reports) and not errors)
@@ -330,6 +339,9 @@ def summarize(input_dir, require_paths=False, require_shmem_combine=False):
     correctness = 'invalid' if errors else 'failed' if failed else 'passed' if complete else 'incomplete'
     paths_verified = complete and all(case['path_status'] == 'verified'
                                       for report in reports for case in report['cases'])
+    missing_eligible = sorted(required_transports.keys() - observed_eligible)
+    if missing_eligible:
+        paths_verified = False
     path_status = 'verified' if paths_verified else 'unverified'
     accepted = correctness == 'passed' and (not require_paths or paths_verified)
     status = ('pass' if accepted else 'invalid' if errors else 'fail' if failed
@@ -352,6 +364,7 @@ def summarize(input_dir, require_paths=False, require_shmem_combine=False):
     return dict(schema_version=1, input_dir=str(directory), status=status, accepted=accepted,
                 complete=complete, correctness=correctness, path_status=path_status,
                 require_paths=require_paths, require_shmem_combine=require_shmem_combine,
+                require_mte_dispatch=require_mte_dispatch, missing_eligible_operations=missing_eligible,
                 backend=backends[0] if len(backends) == 1 else None,
                 expected_world=world, observed_ranks=observed, missing_ranks=missing,
                 unexpected_ranks=unexpected, planned_case_ids=plan, cases=cases, ranks=ranks,
@@ -367,9 +380,11 @@ def main(argv=None):
     parser.add_argument('--require-paths', action='store_true',
                         help='Require verified embedded device evidence in addition to correctness')
     parser.add_argument('--require-shmem-combine', action='store_true',
-                        help='Require verified paths and a SHMEM device specialization for every combine on every rank')
+                        help='Require verified paths and at least one SHMEM-eligible combine, with SHMEM on every eligible rank and call')
+    parser.add_argument('--require-mte-dispatch', action='store_true',
+                        help='Require verified paths and at least one MTE-eligible dispatch, with MTE on all ranks for each eligible call')
     args = parser.parse_args(argv)
-    result = summarize(args.input_dir, args.require_paths, args.require_shmem_combine)
+    result = summarize(args.input_dir, args.require_paths, args.require_shmem_combine, args.require_mte_dispatch)
     json.dump(result, sys.stdout, indent=2, ensure_ascii=False, allow_nan=False)
     sys.stdout.write('\n')
     return 0 if result['accepted'] else 1

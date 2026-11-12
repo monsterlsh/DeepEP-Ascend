@@ -6,37 +6,19 @@
 
 namespace deep_ep {
 
-// Per-operation batch thresholds for native MTE transport.
-// Zero keeps URMA; eligible shapes must also pass the guards below.
-
-constexpr int dispatch_mte_threshold_bs(int num_ranks) {
-    switch (num_ranks) {
-        case 8:   return 100;
-        case 16:  return 77;
-        case 32:  return 70;
-        case 64:  return 67;
-        case 128: return 32;
-        default:  return 0;
-    }
+// The measured grid uses a shared per-rank capacity, not the number of tokens on this rank.
+constexpr bool is_decode_capacity(int num_ranks, int capacity) {
+    return (num_ranks == 8 or num_ranks == 16 or num_ranks == 32) and
+           capacity >= 1 and capacity <= 256 and (capacity & (capacity - 1)) == 0;
 }
 
-constexpr int combine_mte_threshold_bs(int num_ranks) {
-    switch (num_ranks) {
-        case 8:   return 60;
-        case 16:  return 17;
-        case 128: return 32;
-        default:  return 0;
-    }
+constexpr bool is_decode_shape(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
+                               int num_vec_cores, int num_ub_bytes, bool use_fp8) {
+    return is_decode_capacity(num_ranks, capacity) and hidden == 7168 and num_topk == 8 and
+           num_experts == 128 and num_vec_cores == 64 and num_ub_bytes == 216 * 1024 and not use_fp8;
 }
 
-inline int mte_threshold_bs(bool is_combine, int num_ranks) {
-    return is_combine ? combine_mte_threshold_bs(num_ranks)
-                      : dispatch_mte_threshold_bs(num_ranks);
-}
-
-// Override the BS threshold only for supported operation/EP combinations.
-// Unset, empty, -1 or invalid values use the default policy; 0 disables MTE.
-// All ranks must use the same value.
+// An override may narrow a measured route. A larger threshold cannot enable unmeasured traffic.
 inline int mte_bs_threshold_override() {
     const auto value = std::getenv("EP_MTE_BS_THRESHOLD");
     if (value == nullptr or *value == '\0')
@@ -49,36 +31,17 @@ inline int mte_bs_threshold_override() {
     return threshold;
 }
 
-inline bool mte_workload_fits(bool is_combine, int num_ranks, int num_tokens, int capacity,
-                              int hidden, int num_topk, int num_experts, int bs_threshold_override) {
-    const auto threshold = mte_threshold_bs(is_combine, num_ranks);
-    return threshold > 0 and hidden == 7168 and num_topk == 8 and num_experts == 128 and
-           num_tokens > 0 and num_tokens <= capacity and capacity <= 256 and
-           num_tokens <= (bs_threshold_override >= 0 ? bs_threshold_override : threshold);
+constexpr bool combine_shmem_capacity(int num_ranks, int capacity, int threshold_override) {
+    return is_decode_capacity(num_ranks, capacity) and
+           ((num_ranks == 8 and capacity <= 32) or (num_ranks == 16 and capacity <= 16)) and
+           (threshold_override < 0 or capacity <= threshold_override);
 }
 
-// Host policy: hard hardware/capacity guards + fixed per-operation threshold.
-inline bool prefer_low_latency_transport(bool is_combine, int arch, int num_ranks,
-                                         int num_tokens, int num_max_tokens_per_rank,
-                                         int hidden, int num_topk, int num_experts,
-                                         int num_vec_cores, bool use_fp8,
-                                         int num_ub_bytes = 190 * 1024,
-                                         int bs_threshold_override = -1) {
-    return arch == 3510 and not use_fp8 and num_vec_cores == 64 and num_ub_bytes >= 190 * 1024 and
-           mte_workload_fits(is_combine, num_ranks, num_tokens, num_max_tokens_per_rank,
-                             hidden, num_topk, num_experts, bs_threshold_override);
-}
-
-// Runtime decision entry: wraps the policy with the environment override.
-// ep.hpp dispatch/combine call this.
-inline bool prefer_low_latency_transport_runtime(bool is_combine, int arch, int num_ranks,
-                                                 int num_tokens, int num_max_tokens_per_rank,
-                                                 int hidden, int num_topk, int num_experts,
-                                                 int num_vec_cores, bool use_fp8,
-                                                 int num_ub_bytes = 190 * 1024) {
-    return prefer_low_latency_transport(is_combine, arch, num_ranks, num_tokens,
-                                        num_max_tokens_per_rank, hidden, num_topk, num_experts,
-                                        num_vec_cores, use_fp8, num_ub_bytes, mte_bs_threshold_override());
+constexpr bool combine_native_mte_rank(int num_ranks, int capacity, int rank, int tokens, int threshold_override) {
+    return tokens == capacity - rank and rank >= 0 and rank < num_ranks and
+           ((num_ranks == 8 and capacity == 64 and rank >= 4) or
+            (num_ranks == 16 and capacity == 32 and rank == 15)) and
+           (threshold_override < 0 or tokens <= threshold_override);
 }
 
 // Diagnostic escape hatch for comparing the same public API against its original

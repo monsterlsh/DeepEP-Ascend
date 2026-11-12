@@ -6,12 +6,7 @@
 
 ## Performance
 
-The measurements below and the earlier low-latency BS/EP matrix predate the
-current automatic MTE transport integration and removal of weighting from the
-legacy LL combine kernels. They are historical results, not validation of this
-revision. See [Automatic decode transport in EPBuffer](#automatic-decode-transport-in-epbuffer)
-for the current native MTE/URMA policy and its validation scope; the historical
-tables do not establish a speedup of the current integration.
+The following prefill measurements predate the decode transport described under [Automatic decode transport in EPBuffer](#automatic-decode-transport-in-epbuffer).
 
 Measured on Ascend 950DT NPUs with CANN 9.2.0 and the manually configured PoC HDK described under [Recommended HDK and firmware](#recommended-hdk-and-firmware). All measurements use netlayer 1, the supernode's external Clos network.
 
@@ -47,12 +42,6 @@ Use the CPU build of PyTorch with `torch_npu`. In the Python 3.11 build check,
 PyTorch `2.12.0+cu130` and `torch_npu 2.12.0.post1` failed during import because
 both registered the same allocator configuration keys. Using `2.12.0+cpu`
 resolved that failure; disabling backend autoload alone did not.
-
-The build selects the installed CANN directories for the host CPU (`x86_64` or
-`aarch64`). The pinned DeepJIT revision assumes an ARM toolkit path, so the
-build creates a version-checked header copy under its temporary build directory
-with a host-aware toolkit lookup. The source submodule and CANN installation
-are not changed. Updating DeepJIT requires reviewing this compatibility copy.
 
 ### Recommended HDK and firmware
 
@@ -106,7 +95,6 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 | Interface | Ascend support |
 | --- | --- |
 | `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and automatic SHMEM transport for eligible decode dispatch and combine |
-| `DecodeBuffer` | BF16 convenience wrapper over one `EPBuffer`; exposes received routing weights and leaves weighting to the expert computation |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
@@ -240,90 +228,62 @@ Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on 
 
 ## Automatic decode transport in EPBuffer
 
-`EPBuffer.dispatch` selects between SHMEM low-latency (LL) direct push and
-native URMA using the group size, per-rank capacity and dispatch mode.
-No additional constructor or dispatch argument is needed. Both paths return
-the standard weights, counts, handle and deferred event results. Cached
-dispatch and combine use the same native routing metadata.
+The native EP interface uses the measured decode routes for the following workload:
 
-The LL path reuses native routing and deduplicates each token by destination
-rank. MTE writes payload and metadata directly into a SHMEM buffer with the
-native receive layout; the original epilogue produces the outputs. There is
-no intermediate expert-expanded payload or layout conversion.
+- Ascend950DT_9582 on A5, 32 AI cores (64 vector cores), 216 KiB of UB per vector core
+  and the default 100-second device timeout.
+- EP8, EP16 or EP32, with a common capacity `M` of 1, 2, 4, 8, 16, 32, 64, 128 or 256.
+  Rank `r` in the EP group supplies `max(1, M - r)` tokens.
+- BF16 activations, hidden size 7168, top-8 routing over 128 experts, expert alignment 128.
+  Dispatch uses FP32 routing weights, expanded output, zero padding, an asynchronous deferred
+  epilogue and no host count sync, cumulative stats or deterministic sorting. Combine returns
+  the weight side channel and sums the expert outputs with no bias.
 
-For BF16 on A5, the table gives the largest `num_max_tokens_per_rank` eligible
-for LL. All ranks use the same capacity even when their actual token counts
-differ. Fresh dispatch builds a handle and cached dispatch reuses one.
-The cutoffs come from BF16 measurements with hidden size 7168, top-8 routing
-and 128 experts.
+Dispatch writes each token directly into the destination rank's SHMEM buffer using MTE.
+The native copy epilogue and the cached handle use the same layout as URMA. Among the
+capacities listed above, the table gives the largest one using SHMEM for each dispatch mode.
+All other dispatches use URMA.
 
 | EP | Prologue barrier, fresh | Prologue barrier, cached | Epilogue barrier (default), fresh | Epilogue barrier (default), cached |
 |---|---:|---:|---:|---:|
 | 8 | 256 | 256 | 16 | 8 |
 | 16 | 32 | 16 | 16 | — |
 | 32 | 64 | 32 | 16 | — |
-| 64 | 16 | 16 | 8 | — |
 
-A dash, an unlisted EP size or a capacity above the limit selects URMA. LL
-also requires sufficient UB and buffer space and a supported layout. FP8 uses
-URMA. The barrier placement applies to both ordinary and deferred epilogues.
+Combine selects its transport independently of the dispatch kernel on a compatible handle:
 
-Build with `SHMEM_ROOT=/path/to/shmem/install/shmem` to enable the backend.
-The SDK headers must match the pinned SHMEM revision
-`4dd80e2129da42bd773982c2bb3758af1ed0bba8`. The wheel records SDK header and
-library hashes in `deep_ep/shmem-sdk.json`. Without the SDK the standard build
-uses native transport. SHMEM owns one 32-GiB heap per process. Eligible
-dispatch and combine calls on one EPBuffer share a single arena sized to its
-configured buffer capacity. Unsupported or unavailable resources select native before launch.
-Initialization or communication failure is reported, never retried with a
-different protocol.
+| EP | Capacities using SHMEM on every rank | Native MTE on the original communication buffer |
+|---|---|---|
+| 8 | 1, 2, 4, 8, 16, 32 | M=64 on ranks 4–7 |
+| 16 | 1, 2, 4, 8, 16 | M=32 on rank 15 |
+| 32 | — | — |
 
-For BF16 combine with hidden size 7168, top-8 routing and 128 experts, an
-eligible A5 group using 64 vector cores can write partial sums directly to
-the original token owner's SHMEM arena. The reduce epilogue reads those slots
-using the dispatch handle. This also works with a handle from native dispatch.
-Every rank uses the handle's common `num_max_tokens_per_rank` for admission,
-including ranks with zero local tokens. The initial capacity cutoffs come
-from the native combine MTE policy (EP8 up to 60, EP16 up to 17, EP128 up to
-32). Native fallback selects MTE or URMA using the local token count as before.
+The remaining ranks and capacities use native URMA. For a candidate shape, ranks exchange
+their eligibility on a separate HCCL stream before choosing a transport. This adds a host
+wait on the control stream. An unmeasured batch distribution selects URMA for the group.
+Both fresh and cached handles support the two barrier placements. Collective graph capture
+uses native URMA and requires the same capture and replay order across ranks.
 
-Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to use URMA for combine, or
-`EP_MTE_BS_THRESHOLD` to override the combine cutoff on a supported EP size
-(maximum capacity 256). Set these options identically on every rank.
-Complete a deferred epilogue with `event.current_stream_wait()` before
-issuing the next operation on the same buffer or destroying it.
+Build with `SHMEM_ROOT=/path/to/shmem/install/shmem` to enable SHMEM. The build checks
+the SDK headers against revision `4dd80e2129da42bd773982c2bb3758af1ed0bba8` and records
+header and library hashes in `deep_ep/shmem-sdk.json`. SHMEM initializes its 32 GiB heap
+on first use, and dispatch and combine share one arena per EPBuffer. Complete a deferred
+epilogue with `event.current_stream_wait()` before reusing or destroying the buffer.
 
-Dispatch returns routing weights as metadata. Apply them once in the expert
-computation. Combine sums expert outputs; its optional `topk_weights` argument
-returns a separate weight tensor without scaling the outputs.
+Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to use URMA for dispatch and combine.
+`EP_MTE_BS_THRESHOLD` can further reduce the tested combine limits. Use the same settings on all ranks.
 
-### Optional BF16 convenience wrapper
+For decode calls that return routing weights, pass the `recv_weights` from
+`EPBuffer.dispatch` to `EPBuffer.combine` as `topk_weights`. Combine returns
+these weights in the original token order. The expert computation applies the
+weights to its outputs once, as in [Dispatch and combine](#dispatch-and-combine).
+Run the [EP8 decode test](tests/ep/test_ep_decode_portable.py) with the same command on NVIDIA and Ascend:
 
-`DecodeBuffer` wraps one native `EPBuffer`. All ranks must use matching shapes
-and call order, with distinct valid int64 expert IDs and FP32 routing weights.
-Only the leading `sum(handle.expert_recv_counts)` rows are valid.
-
-```python
-from deep_ep import DecodeBuffer
-
-buffer = DecodeBuffer(ep_group, num_max_tokens_per_rank=256,
-                      hidden=7168, num_topk=8, num_experts=128)
-recv_x, handle, event = buffer.dispatch(x, topk_idx, topk_weights)
-event.wait()
-expert_output = local_experts_forward(
-    recv_x, handle.expert_recv_counts, handle.recv_topk_weights)
-output, event = buffer.combine(expert_output, handle)
-event.wait()
-buffer.destroy()  # Collective; before destroying the process group.
+```bash
+python tests/ep/test_ep_decode_portable.py --num-processes 8
 ```
 
-See the [compatibility test guide](tests/ep/README.compat.md) and
-[DecodeBuffer test](tests/ep/test_decode.py) for validation examples.
-
-The former explicit LL adapter remains accessible only through the private
-fixture in `tests/ep/_low_latency_fixture.py` for source-kernel regression.
-It is not the public EPBuffer entry point and does not validate the integrated
-SHMEM dispatch path.
+The [compatibility test guide](tests/ep/README.compat.md) also shows how to verify the selected Ascend transport with a device trace.
 
 ## Other buffer interfaces
 

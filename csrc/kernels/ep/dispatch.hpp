@@ -41,7 +41,6 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
                             const bool& do_barrier = false,
-                            const bool& low_latency_transport = false,
                             void* peer_buffers = nullptr) {
     // Calculate configs
     EP_HOST_ASSERT(num_vec_cores > 0);
@@ -50,10 +49,8 @@ static void launch_dispatch(void* x, void* sf,
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(16 <= num_vec_cores);
 
-    // peer_buffers holds the SHMEM receive addresses. A null table selects native UBMEM.
-    EP_HOST_ASSERT(peer_buffers == nullptr or low_latency_transport);
-
     // Compile
+    const auto low_latency_transport = peer_buffers != nullptr;
     const auto kernel = jit->compile(low_latency_transport ? "dispatch_mte" : "dispatch", std::format(R"(
 #include <deep_ep/impls/ep/dispatch.hpp>
 

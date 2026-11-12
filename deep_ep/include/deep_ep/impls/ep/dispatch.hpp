@@ -840,13 +840,8 @@ __global__ __vector__ void dispatch_impl(
         asm volatile("nop");
 
     const auto get_remote_token = [&](int dst_rank_idx, int dst_slot_idx) __aicore__ {
-        if (peer_buffers != nullptr) {
-            return reinterpret_cast<__gm__ uint8_t*>(dispatch_direct_token_address(
-                peer_buffers[dst_rank_idx], rank_idx, kNumMaxTokensPerRank, dst_slot_idx, token_layout.get_num_bytes()));
-        }
-        const auto local_slot = recv_buffer.get_token_buffer(dst_slot_idx);
-        return layout::get_sym_ptr(workspace_layout.get_common_signals(),
-                                   local_slot.template get_hidden_ptr<__gm__ uint8_t>(), dst_rank_idx);
+        return reinterpret_cast<__gm__ uint8_t*>(dispatch_direct_token_address(
+            peer_buffers[dst_rank_idx], rank_idx, kNumMaxTokensPerRank, dst_slot_idx, token_layout.get_num_bytes()));
     };
 
     if constexpr (kPackDirectTokens) {

@@ -1,7 +1,9 @@
-"""CPU-only checks of the public Python contract against the pinned main baseline.
+"""CPU-only checks of the public EP contract against pinned upstream revisions.
 
-Signature fixtures below were checked against the main revision recorded below,
-not generated from the candidate. Calls execute the real Python wrappers with an inert extension
+Signatures follow DeepEP-Ascend 4dfccac4fc345519427e1019557301c9e59e9c76.
+EPBuffer.dispatch and EPBuffer.combine also match deepseek-ai/DeepEP
+f6aa38fe06cd4a0489e7730365d4e0114970a2f3 (deep_ep/buffers/ep.py).
+Calls execute the real Python wrappers with an inert extension
 double; they cannot validate NPU ordering, communication or tensor contents.
 Run: python -B tests/ep/test_public_api_compat_host.py
 """
@@ -40,9 +42,6 @@ class RouteTensor(Tensor):
     """Only shape/version metadata is needed by the Python handle wrapper."""
 
     _version = 0
-
-    def size(self, index):
-        return self.shape[index]
 
     def is_inference(self):
         return False
@@ -110,7 +109,12 @@ class PublicAPIContracts(unittest.TestCase):
                     'topk_idx_t', 'EventOverlap', 'EventHandle', 'init_seed', 'get_local_seed',
                     'get_global_seed', 'dist_print', 'init_dist', 'KernelProfile', 'bench_msprof'}
         self.assertTrue(official <= imports, official - imports)
-        self.assertTrue({'DecodeBuffer', 'DecodeHandle'} <= imports)
+        shared_buffers = {'BufferAllocator', 'BufferBase', 'EPBuffer', 'EPHandle',
+                          'EngramBuffer', 'BucketBuffer', 'BucketSession', 'PPBuffer'}
+        buffer_exports = {alias.asname or alias.name for node in tree.body
+                          if isinstance(node, ast.ImportFrom) and (node.module or '').startswith('buffers.')
+                          for alias in node.names if not (alias.asname or alias.name).startswith('_')}
+        self.assertEqual(buffer_exports, shared_buffers)
 
     def test_default_constructor_uses_one_native_arena_and_official_arguments(self):
         self.assertFalse(hasattr(self.buffer, 'low_latency_mode'))
@@ -143,6 +147,25 @@ class PublicAPIContracts(unittest.TestCase):
                 self.assertIs(handle.topk_idx, self.routes)
                 self.assertEqual(handle.num_recv_tokens_per_expert_list, [16])
                 self.assertIs(event.event, self.event)
+
+    def test_decode_provenance_follows_completed_fresh_handle(self):
+        # Exercise both private runtime return forms through the public dispatch/combine API.
+        options = dict(expert_alignment=128, do_cpu_sync=False, async_with_compute_stream=True)
+        _, _, _, legacy, _ = self.dispatch(**options)
+        self.buffer.combine(self.recv, legacy)
+        self.assertFalse(self.runtime.combine.call_args.kwargs['decode_handle'])
+        self.runtime.dispatch.return_value = None, self.event, lambda: self.result, True
+        fresh = self.dispatch(**options, defer_epilogue=True)
+        _, _, _, matched = fresh.wait()
+        self.assertIs(matched._decode_owner, self.buffer._decode_handle_owner)
+        self.buffer.combine(self.recv, matched)
+        self.assertTrue(self.runtime.combine.call_args.kwargs['decode_handle'])
+        self.buffer.combine(Tensor((15, 7168)), matched)
+        self.assertFalse(self.runtime.combine.call_args.kwargs['decode_handle'])
+        # Handles from another buffer cannot opt into its arena.
+        self.buffer._decode_handle_owner = object()
+        self.buffer.combine(self.recv, matched)
+        self.assertFalse(self.runtime.combine.call_args.kwargs['decode_handle'])
 
     def test_cached_dispatch_reuses_handle_configuration_and_updated_weights(self):
         handle = self.dispatch(num_max_tokens_per_rank=64, expert_alignment=16, num_sms=16)[3]
