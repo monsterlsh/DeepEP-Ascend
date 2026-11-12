@@ -9,7 +9,7 @@ namespace deep_ep {
 // The measured grid uses a shared per-rank capacity, not the number of tokens on this rank.
 constexpr bool is_decode_capacity(int num_ranks, int capacity) {
     return (num_ranks == 8 or num_ranks == 16 or num_ranks == 32) and
-           capacity >= 1 and capacity <= 256 and (capacity & (capacity - 1)) == 0;
+           capacity >= 1 and capacity <= 256;
 }
 
 constexpr bool is_decode_shape(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,

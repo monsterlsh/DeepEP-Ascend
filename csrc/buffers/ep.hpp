@@ -48,6 +48,29 @@ class EPBuffer: public BufferBase {
         return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(hook));
     }
 
+    static bool matches_decode_dispatch(
+            const comm::Context& context, const torch::Tensor& x,
+            const std::optional<torch::Tensor>& sf,
+            const std::optional<torch::Tensor>& topk_weights,
+            const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+            const int& num_max_tokens_per_rank, const int& num_experts, const int& num_topk,
+            const int& expert_alignment, const int& num_ai_cores,
+            const std::optional<EventHandle>& previous_event,
+            const bool& async_with_compute_stream, const bool& allocate_on_comm_stream,
+            const bool& do_cpu_sync, const bool& do_zero_padding,
+            const bool& use_cube_aligned_col_major_sf, const bool& defer_epilogue,
+            const bool& decode_handle, const int& num_used_vec_cores, const int& num_ub_bytes) {
+        const auto num_tokens = static_cast<int>(x.size(0));
+        const auto hidden = static_cast<int>(x.size(1));
+        return decode_handle and num_ai_cores == 32 and expert_alignment == 128 and
+               topk_weights.has_value() and not cumulative_local_expert_recv_stats and not do_cpu_sync and
+               do_zero_padding and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
+               defer_epilogue and not use_cube_aligned_col_major_sf and
+               num_tokens == std::max(1, num_max_tokens_per_rank - context.rank_idx) and
+               is_decode_shape(context.num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
+                               num_used_vec_cores, num_ub_bytes, sf.has_value());
+    }
+
 public:
     std::shared_ptr<comm::Context> context;
     torch::Tensor lb_storage;
@@ -270,13 +293,12 @@ public:
         }
 
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
-        const bool matched_layout = decode_handle and num_ai_cores == 32 and expert_alignment == 128 and
-            topk_weights.has_value() and not cumulative_local_expert_recv_stats and not do_cpu_sync and
-            do_zero_padding and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
-            defer_epilogue and not use_cube_aligned_col_major_sf and
-            num_tokens == std::max(1, num_max_tokens_per_rank - context->rank_idx) and
-            is_decode_shape(context->num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
-                            num_used_vec_cores, num_ub_bytes, sf.has_value());
+        const bool matched_layout = matches_decode_dispatch(
+            *context, x, sf, topk_weights, cumulative_local_expert_recv_stats,
+            num_max_tokens_per_rank, num_experts, num_topk, expert_alignment, num_ai_cores,
+            previous_event, async_with_compute_stream, allocate_on_comm_stream,
+            do_cpu_sync, do_zero_padding, use_cube_aligned_col_major_sf, defer_epilogue,
+            decode_handle, num_used_vec_cores, num_ub_bytes);
         const auto ll_launch = low_latency_state->prepare_dispatch(
             *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
             num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue, matched_layout);
