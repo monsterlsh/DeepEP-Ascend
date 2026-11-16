@@ -113,7 +113,7 @@ class SummaryTests(unittest.TestCase):
         write_transport(0, COMBINE_MTE, claimed='shmem')
         self.assertFalse(summarize(self.root, require_shmem_combine=True)['accepted'])
 
-    def test_strict_mte_combine_covers_group_and_mixed_ranks(self):
+    def test_strict_mte_combine_requires_group_agreement(self):
         def store(rank, symbol, expected):
             rows = records(rank, plan=('decode',), verified=True)
             combine = rows[2]['operations'][1]
@@ -126,7 +126,7 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summarize(self.root, require_mte_combine=True)['missing_eligible_operations'], ['combine'])
         alternatives = ['mte', 'urma']
         store(0, COMBINE_MTE, alternatives)
-        self.assertTrue(summarize(self.root, require_mte_combine=True)['accepted'])
+        self.assertFalse(summarize(self.root, require_mte_combine=True)['accepted'])
         store(1, COMBINE_URMA, alternatives)
         self.assertFalse(summarize(self.root, require_mte_combine=True)['accepted'])
         store(1, COMBINE_MTE, alternatives)

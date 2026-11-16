@@ -232,43 +232,31 @@ The native EP interface can select MTE for the following decode workload:
 
 - Ascend950DT_9582 on A5, 32 AI cores (64 vector cores), 216 KiB of UB per vector core
   and the default 100-second device timeout.
-- EP8, EP16 or EP32, with a common integer capacity `M` from 1 through 256.
-  Rank `r` in the EP group supplies `max(1, M - r)` tokens.
+- EP2, EP4, EP8, EP16, EP32, EP64 or EP128 with a common per-rank capacity
+  `1 ≤ M ≤ 256`. Each rank can supply any number of tokens from 1 through `M`.
 - BF16 activations, hidden size 7168, top-8 routing over 128 experts, expert alignment 128.
   Dispatch uses FP32 routing weights, expanded output, zero padding, an asynchronous deferred
   epilogue and no host count sync, cumulative stats or deterministic sorting. Combine returns
   the weight side channel and sums the expert outputs with no bias.
 
-Dispatch uses MTE to write each token into the destination rank's registered EP communication
-buffer. The native copy epilogue and cached handle use the same token layout as URMA. The
-table gives the largest eligible capacity for each dispatch mode. Other dispatches use URMA.
+Dispatch writes each token into the destination rank's registered EP communication buffer.
+The native copy epilogue and cached handle use the same token layout as URMA. Fresh and
+cached dispatch and either barrier placement use the full capacity range. Combine selects
+its transport independently on a compatible handle from the same buffer.
 
-| EP | Prologue barrier, fresh | Prologue barrier, cached | Epilogue barrier (default), fresh | Epilogue barrier (default), cached |
-|---|---:|---:|---:|---:|
-| 8 | 256 | 256 | 16 | 8 |
-| 16 | 32 | 16 | 16 | — |
-| 32 | 64 | 32 | 16 | — |
-
-Combine selects its transport independently of the dispatch kernel on a compatible handle:
-
-| EP | Capacities using MTE on every rank | Capacities using MTE on selected ranks |
-|---|---|---|
-| 8 | 1–32 | M=64 on ranks 4–7 |
-| 16 | 1–16 | M=32 on rank 15 |
-| 32 | — | — |
-
-The remaining ranks and capacities use native URMA. For a candidate shape, ranks exchange
-their eligibility on a separate HCCL stream before choosing a transport. This adds a host
-wait on the control stream. A batch distribution outside the specified pattern selects URMA for the group.
-Both fresh and cached handles support the two barrier placements. Collective graph capture
-uses native URMA and requires the same capture and replay order across ranks.
+For eligible geometry, each operation exchanges its current eligibility across all ranks
+on a separate HCCL stream. A local veto, including an empty input rank, selects URMA for
+the group. Collective graph capture uses URMA and requires the same capture and replay
+order across ranks. The capacity range is open for performance comparison with main.
+See the [decode benchmark and device trace commands](tests/ep/README.compat.md).
 
 Dispatch and combine both use the communication buffer allocated by `EPBuffer` and registered
 with HCCL. Complete a deferred epilogue with `event.current_stream_wait()` before reusing
 or destroying the buffer.
 
 Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to use URMA for dispatch and combine.
-`EP_MTE_BS_THRESHOLD` can further reduce the combine limits. Use the same settings on all ranks.
+`EP_MTE_BS_THRESHOLD` optionally sets a lower inclusive upper bound on shared `M` for
+combine. Leave it unset to compare the full range. Use the same settings on all ranks.
 
 For decode calls that return routing weights, pass the `recv_weights` from
 `EPBuffer.dispatch` to `EPBuffer.combine` as `topk_weights`. Combine returns

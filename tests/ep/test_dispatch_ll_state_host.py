@@ -29,11 +29,9 @@ bool event_failure = false, wait_failure = false;
 void note(const std::string& value) { events.push_back(value); }
 }
 const char* aclrtGetSocName() { return mock::soc; }
-namespace torch {
-struct Tensor {
-    int batch;
-    int size(int dim) const { assert(dim == 0); return batch; }
-};
+namespace c10_npu {
+using NPUStream = int;
+NPUStream getCurrentNPUStream() { return mock::stream; }
 }
 namespace deep_ep {
 struct FakeRuntime {
@@ -45,7 +43,7 @@ struct FakeRuntime {
 auto runtime = &runtime_value;
 struct EventHandle {
     int stream;
-    EventHandle(): stream(mock::stream) {
+    explicit EventHandle(c10_npu::NPUStream recorded): stream(recorded) {
         mock::note("record:" + std::to_string(stream));
         if (mock::event_failure) throw std::runtime_error("event record failure");
     }
@@ -89,13 +87,11 @@ using deep_ep::EPLowLatencyState;
 constexpr int64_t buffer_bytes = 1LL << 30;
 
 bool dispatch(EPLowLatencyState& state, const Context& ctx, int m = 2, bool cached = false,
-              bool prologue = false, bool options = true, int extra_tokens = 0, bool fp8 = false) {
-    torch::Tensor x{std::max(1, m - ctx.rank_idx) + extra_tokens};
-    return state.prepare_dispatch(ctx, x, m, 7168, 8, 128, 64, 216 * 1024, fp8, cached, prologue, options);
+              bool prologue = false, bool options = true, bool fp8 = false) {
+    return state.prepare_dispatch(ctx, m, 7168, 8, 128, 64, 216 * 1024, fp8, cached, prologue, options);
 }
 bool combine(EPLowLatencyState& state, const Context& ctx, int m = 2, bool options = true,
-             int extra_tokens = 0, bool prologue = false) {
-    const int b = std::max(1, m - ctx.rank_idx) + extra_tokens;
+             int b = 1, bool prologue = false) {
     return state.prepare_combine(ctx, m, 7168, 8, 128, 64, 216 * 1024, b, options, prologue);
 }
 template <class F> void rejects(F fn, std::string_view message) {
@@ -117,7 +113,7 @@ void check_admission() {
         if (mode == 5) --ctx.num_gpu_timeout_cycles;
         if (mode == 6) DecodeAgreement::resources = false;
         if (mode == 7) DecodeAgreement::capable_peer = false;
-        if (mode == 8) ctx.num_ranks = 64;
+        if (mode == 8) ctx.num_ranks = 1;
         const auto votes = DecodeAgreement::initial_votes;
         DecodeAgreement::proposals.clear();
         EPLowLatencyState state(buffer_bytes);
@@ -152,13 +148,13 @@ void check_proposals() {
             assert(DecodeAgreement::proposals.back() == 1 + 2 * cached + prologue);
         }
     assert(!dispatch(state, ctx, 3, false, false, false));
-    assert(!dispatch(state, ctx, 3, false, false, true, 1));
-    assert(!dispatch(state, ctx, 3, false, false, true, 0, true));
-    assert(!dispatch(state, ctx, 9, true));
+    assert(!dispatch(state, ctx, 3, false, false, true, true));
+    assert(dispatch(state, ctx, 9, true));
     assert(dispatch(state, ctx, 9, false));
     assert(!combine(state, ctx, 3, false));
-    assert(!combine(state, ctx, 3, true, 1));
-    assert(combine(state, ctx, 3, true, 0, true));
+    assert(!combine(state, ctx, 3, true, 0));
+    assert(DecodeAgreement::proposals.back() == 0);
+    assert(combine(state, ctx, 3, true, 3, true));
     assert(DecodeAgreement::proposals.back() == 2);
     DecodeAgreement::matching_peer = false;
     assert(!dispatch(state, ctx) && !combine(state, ctx));
@@ -169,17 +165,41 @@ void check_proposals() {
     DecodeAgreement::capturing = false;
     assert(DecodeAgreement::proposals.size() == count);
 }
-void check_mixed_combine() {
-    for (int world : {8, 16, 32, 64, 128})
+void check_all_rank_admission() {
+    for (int world : {2, 4, 8, 16, 32, 64, 128})
         for (int rank = 0; rank < world; ++rank) {
             Context ctx;
             ctx.num_ranks = world; ctx.rank_idx = rank;
             EPLowLatencyState state(buffer_bytes);
             state.initialize(ctx);
-            assert(combine(state, ctx, 3) == (world == 8 || world == 16));
-            assert(combine(state, ctx, world == 8 ? 64 : 32) ==
-                   ((world == 8 && rank >= 4) || (world == 16 && rank == 15)));
+            for (int m = 1; m <= 256; ++m) {
+                for (bool prologue : {false, true}) {
+                    assert(dispatch(state, ctx, m, false, prologue));
+                    assert(dispatch(state, ctx, m, true, prologue));
+                    assert(combine(state, ctx, m, true, m, prologue));
+                    assert(combine(state, ctx, m, true, std::max(1, m - rank), prologue));
+                }
+            }
+            const auto votes = DecodeAgreement::proposals.size();
+            for (int m : {0, 257}) {
+                assert(!dispatch(state, ctx, m) && !combine(state, ctx, m));
+            }
+            assert(DecodeAgreement::proposals.size() == votes);
         }
+}
+void check_threshold_override() {
+#ifdef _WIN32
+    assert(_putenv_s("EP_MTE_BS_THRESHOLD", "16") == 0);
+#else
+    assert(setenv("EP_MTE_BS_THRESHOLD", "16", 1) == 0);
+#endif
+    Context ctx;
+    EPLowLatencyState state(buffer_bytes);
+    state.initialize(ctx);
+    assert(combine(state, ctx, 16));
+    assert(!combine(state, ctx, 17));
+    assert(DecodeAgreement::proposals.back() == 0);
+    assert(dispatch(state, ctx, 256));
 }
 void check_events() {
     Context ctx;
@@ -190,6 +210,12 @@ void check_events() {
     rejects([&] { combine(state, ctx); }, "outstanding");
     rejects([&] { state.close(); }, "outstanding");
     mock::stream = 1;
+    state.record_completion();
+    const auto count = mock::events.size();
+    assert(mock::events.back() == "record:1");
+    assert(combine(state, ctx));
+    assert(mock::events.size() == count);
+    state.begin();
     state.record_completion();
     mock::stream = 2;
     assert(!combine(state, ctx, 2, false));
@@ -216,6 +242,7 @@ void check_failures() {
             mock::event_failure = false;
         } else {
             state.record_completion();
+            ++mock::stream;
             mock::wait_failure = true;
             rejects([&] { combine(state, ctx); }, "wait");
             mock::wait_failure = false;
@@ -227,9 +254,10 @@ void check_failures() {
 int main() {
     check_admission();
     check_proposals();
-    check_mixed_combine();
+    check_all_rank_admission();
     check_events();
     check_failures();
+    check_threshold_override();
 }
 """
     return prefix + production + harness

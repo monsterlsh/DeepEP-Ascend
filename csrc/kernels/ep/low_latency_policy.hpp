@@ -6,19 +6,31 @@
 
 namespace deep_ep {
 
-// The measured grid uses a shared per-rank capacity, not the number of tokens on this rank.
+constexpr int kDecodeNumExperts = 128;
+constexpr int kMaxDecodeCapacity = 256;
+
+// M is the common per-rank slot capacity used to address each peer's communication buffer.
 constexpr bool is_decode_capacity(int num_ranks, int capacity) {
-    return (num_ranks == 8 or num_ranks == 16 or num_ranks == 32) and
-           capacity >= 1 and capacity <= 256;
+    return num_ranks > 1 and kDecodeNumExperts % num_ranks == 0 and
+           capacity >= 1 and capacity <= kMaxDecodeCapacity;
+}
+
+constexpr bool is_decode_batch(int batch, int capacity) {
+    return batch > 0 and batch <= capacity;
+}
+
+constexpr bool is_decode_geometry(int num_ranks, int capacity, int hidden, int num_topk, int num_experts) {
+    return is_decode_capacity(num_ranks, capacity) and hidden == 7168 and
+           num_topk == 8 and num_experts == kDecodeNumExperts;
 }
 
 constexpr bool is_decode_shape(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
                                int num_vec_cores, int num_ub_bytes, bool use_fp8) {
-    return is_decode_capacity(num_ranks, capacity) and hidden == 7168 and num_topk == 8 and
-           num_experts == 128 and num_vec_cores == 64 and num_ub_bytes == 216 * 1024 and not use_fp8;
+    return is_decode_geometry(num_ranks, capacity, hidden, num_topk, num_experts) and
+           num_vec_cores == 64 and num_ub_bytes == 216 * 1024 and not use_fp8;
 }
 
-// An override may narrow a measured route. A larger threshold cannot enable unmeasured traffic.
+// An explicit combine limit can narrow the decode capacity range.
 inline int mte_bs_threshold_override() {
     const auto value = std::getenv("EP_MTE_BS_THRESHOLD");
     if (value == nullptr or *value == '\0')
@@ -29,19 +41,6 @@ inline int mte_bs_threshold_override() {
     if (result.ec != std::errc{} or result.ptr != end or threshold < -1)
         return -1;
     return threshold;
-}
-
-constexpr bool combine_group_mte_capacity(int num_ranks, int capacity, int threshold_override) {
-    return is_decode_capacity(num_ranks, capacity) and
-           ((num_ranks == 8 and capacity <= 32) or (num_ranks == 16 and capacity <= 16)) and
-           (threshold_override < 0 or capacity <= threshold_override);
-}
-
-constexpr bool combine_native_mte_rank(int num_ranks, int capacity, int rank, int tokens, int threshold_override) {
-    return tokens == capacity - rank and rank >= 0 and rank < num_ranks and
-           ((num_ranks == 8 and capacity == 64 and rank >= 4) or
-            (num_ranks == 16 and capacity == 32 and rank == 15)) and
-           (threshold_override < 0 or tokens <= threshold_override);
 }
 
 // Diagnostic escape hatch for comparing the same public API against its original

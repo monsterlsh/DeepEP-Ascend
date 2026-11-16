@@ -1,5 +1,4 @@
 #include <cassert>
-#include <climits>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -70,36 +69,21 @@ int main() {
     test_override_parsing();
     set_threshold_override(nullptr);
     assert(mte_bs_threshold_override() == -1);
-    for (int ep : {1, 2, 4, 8, 16, 24, 32, 64, 128}) {
+    for (int ep = -1; ep <= 256; ++ep) {
         for (int m = -1; m <= 513; ++m) {
-            const bool in_grid = (ep == 8 || ep == 16 || ep == 32) &&
-                m >= 1 && m <= 256;
+            const bool in_grid = (ep == 2 || ep == 4 || ep == 8 || ep == 16 ||
+                                  ep == 32 || ep == 64 || ep == 128) && m >= 1 && m <= 256;
             assert(is_decode_capacity(ep, m) == in_grid);
             assert(is_decode_shape(ep, m, 7168, 8, 128, 64, 221184, false) == in_grid);
             const auto plan = get_dispatch_low_latency_plan(3510, ep, m, 7168, 8, 128, 64, 221184, false);
             assert(bool(plan) == in_grid);
             if (plan)
                 assert(plan->buffer_bytes == int64_t(ep) * m * (14336 + 128));
-            for (int limit : {-1, 0, 16, 60, INT_MAX}) {
-                const bool group_mte = in_grid && ((ep == 8 && m <= 32) || (ep == 16 && m <= 16));
-                assert(combine_group_mte_capacity(ep, m, limit) == (group_mte && (limit < 0 || m <= limit)));
-                for (int rank = 0; rank < ep; ++rank) {
-                    const int tokens = m > rank ? m - rank : 1;
-                    const bool direct = (ep == 8 && m == 64 && rank >= 4) || (ep == 16 && m == 32 && rank == 15);
-                    assert(combine_native_mte_rank(ep, m, rank, tokens, limit) == (direct && (limit < 0 || tokens <= limit)));
-                    assert(!combine_native_mte_rank(ep, m, rank, tokens + 1, limit));
-                }
-            }
         }
     }
-
-    const int thresholds[][5] = {{8,256,256,16,8}, {16,32,16,16,0}, {32,64,32,16,0},
-                                  {1,0,0,0,0}, {24,0,0,0,0}, {64,0,0,0,0}, {128,0,0,0,0}};
-    for (const auto& [ep, fresh_prologue, cached_prologue, fresh_epilogue, cached_epilogue] : thresholds) {
-        assert(get_dispatch_low_latency_threshold(ep, false, true) == fresh_prologue);
-        assert(get_dispatch_low_latency_threshold(ep, true, true) == cached_prologue);
-        assert(get_dispatch_low_latency_threshold(ep, false, false) == fresh_epilogue);
-        assert(get_dispatch_low_latency_threshold(ep, true, false) == cached_epilogue);
+    for (int m = 1; m <= 256; ++m) {
+        for (int b = -1; b <= m + 1; ++b)
+            assert(is_decode_batch(b, m) == (b >= 1 && b <= m));
     }
     const auto plan = [](int arch, int h, int k, int e, int cores, int ub, bool fp8) {
         return get_dispatch_low_latency_plan(arch, 8, 64, h, k, e, cores, ub, fp8);
@@ -112,8 +96,8 @@ int main() {
     assert(!plan(3510,7168,8,128,64,221183,false));
     assert(!plan(3510,7168,8,128,64,221185,false));
     assert(!plan(3510,7168,8,128,64,221184,true));
-    check_workspace_size<128, 8, 1, 8>();
-    check_workspace_size<128, 32, 4, 8>();
+    check_workspace_size<128, 2, 1, 8>();
+    check_workspace_size<128, 128, 4, 8>();
     const auto routing = get_dispatch_routing_workspace_bytes(8, 128, 4, 8);
     assert(!dispatch_direct_ub_fits(routing, 4, 14336, 8, routing + 14336 + 4 * 128 - 1, false));
     assert(dispatch_direct_ub_fits(routing, 4, 14336, 8, routing + 14336 + 4 * 128, false));

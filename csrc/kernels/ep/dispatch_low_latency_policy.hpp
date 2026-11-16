@@ -15,23 +15,6 @@ struct DispatchLowLatencyPlan {
     int64_t buffer_bytes;
 };
 
-constexpr int get_dispatch_low_latency_threshold(int num_ranks, bool cached_mode, bool barrier_in_prologue) {
-    if (barrier_in_prologue) {
-        switch (num_ranks) {
-            case 8:  return 256;
-            case 16: return cached_mode ? 16 : 32;
-            case 32: return cached_mode ? 32 : 64;
-            default: return 0;
-        }
-    }
-    switch (num_ranks) {
-        case 8:  return cached_mode ? 8 : 16;
-        case 16:
-        case 32: return cached_mode ? 0 : 16;
-        default: return 0;
-    }
-}
-
 constexpr bool dispatch_direct_ub_fits(int64_t workspace_bytes, int64_t tokens_per_core,
                                        int64_t hidden_bytes, int64_t num_topk, int64_t ub_bytes,
                                        bool cached_mode) {
@@ -49,8 +32,8 @@ inline std::optional<DispatchLowLatencyPlan> get_dispatch_low_latency_plan(
                                             num_vec_cores, num_ub_bytes, use_fp8))
         return std::nullopt;
 
-    static_assert(32 <= kNumMaxRanks and 32 <= kDispatchReductionMaxArrivals);
-    static_assert(32 * 256 <= kDispatchReductionMaxValue);
+    static_assert(kDecodeNumExperts <= kNumMaxRanks and kDecodeNumExperts <= kDispatchReductionMaxArrivals);
+    static_assert(kDecodeNumExperts * kMaxDecodeCapacity <= kDispatchReductionMaxValue);
     const auto total_capacity = static_cast<int64_t>(capacity) * num_ranks;
     const auto hidden_bytes = static_cast<int64_t>(hidden) * 2;
     const auto metadata_bytes = get_dispatch_token_bytes(0, 0, num_topk, false);

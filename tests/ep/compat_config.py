@@ -17,7 +17,7 @@ from pathlib import Path
 
 DEFAULT_BS = (2, 32, 33, 64, 65, 128, 256, 2)
 BACKENDS = ('official', 'candidate-disabled', 'candidate-auto')
-DIAGNOSTIC_WORLDS = (1, 2, 4)
+DIAGNOSTIC_WORLDS = (1,)
 TRANSPORT_ENV = 'EP_DISABLE_LOW_LATENCY_TRANSPORT'
 THRESHOLD_ENV = 'EP_MTE_BS_THRESHOLD'
 

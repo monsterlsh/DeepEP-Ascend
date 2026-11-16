@@ -54,7 +54,7 @@ python tests/ep/test_ep_auto_compat.py --dry-run \
 
 ```bash
 cd tests/ep
-python -B -m unittest test_compat_config test_compat_trace test_ep_auto_compat_host test_summarize_compat
+python -B -m unittest test_bench_decode test_compat_config test_compat_trace test_ep_auto_compat_host test_summarize_compat
 cd ../comm
 python -B -m unittest test_stream_host
 ```
@@ -81,11 +81,11 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 | `--profile-paths` | 每个操作采集真实设备 kernel 证据；默认关闭并明确标记 unverified |
 | `--output-dir` | 每 rank 独占创建日志，已有文件拒绝覆盖；三个 backend 和每次复跑使用不同目录 |
 
-测试固定 H7168/K8/E128。当前优化覆盖 EP8、EP16、EP32，M 为 1 至 256 的整数，全组使用 B=max(1,M−rank)。验证配置为 Ascend 3510、32 个 AI Core、64 个向量核、每核 216 KiB UB，BF16 输入、FP32 路由权重、alignment=128，关闭 deterministic 和 CPU sync，启用 deferred、异步、expand 和 zero padding。带 stats、bias、缺失权重、FP8、旧 handle 及矩阵外几何用于检查 main 的 URMA 回退。FP8 测试数据要求实际 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示。
+测试固定 H7168/K8/E128。候选策略允许 EP2/4/8/16/32/64/128、共享容量 1≤M≤256 和各 rank 任意 1≤B≤M，既可均匀也可不均匀。目标配置为 Ascend950DT、架构 3510、32 个 AI Core、64 个向量核、每核 216 KiB UB，BF16 输入、FP32 路由权重、alignment=128，关闭 deterministic 和 CPU sync，启用 deferred、异步、expand 和 zero padding。使用 stats、bias、缺失权重、FP8 或任一空 rank 的用例验证全组 URMA 回退。同一 buffer 产生的旧 handle 用于检查跨 dispatch 复用。FP8 测试数据要求 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示。
 
-dispatch 支持两种 barrier 位置及 fresh/cached 组合，阈值随组合变化。第 14 个显式模板参数标识 direct MTE，设备 trace 的 `actual_transport=mte` 表示本次调用确实使用该内核。解析器同时支持 main 的 13 参数 dispatch。本分支 combine 的第 10 个模板参数标识 native MTE。解析器也识别父分支带第 11 个 SHMEM 参数的历史 trace，便于回看基线。
+dispatch 的 fresh/cached 与前置/后置 barrier 共用同一容量范围。第 14 个显式模板参数标识 direct MTE，设备 trace 的 `actual_transport=mte` 表示本次调用确实使用该内核。解析器同时支持 main 的 13 参数 dispatch。本分支 combine 的第 10 个模板参数标识 native MTE。解析器也识别父分支带第 11 个 SHMEM 参数的历史 trace。
 
-满足上述条件时，EP8 M≤32 和 EP16 M≤16 的 combine 可全组使用 native MTE。混合路径仅覆盖 EP8 M=64 的 rank 4–7 以及 EP16 M=32 的 rank 15，这些 rank 可使用 native MTE，其余 rank 使用 URMA。EP32 的 combine 使用 URMA，EP64/128 的 dispatch 和 combine 均使用 URMA。设备特化和全组资格会影响实走路径，未开启 profiler 时路径记为 unverified。
+满足调用条件、内存布局、设备能力和全组协商后，dispatch 和 combine 都选择全组 MTE。未开启 profiler 时路径记为 unverified。新增覆盖范围的设备正确性和性能需要按各 EP 实测。
 
 ## 设备运行示例
 
@@ -104,7 +104,7 @@ python tests/ep/test_ep_auto_compat.py \
   --edge-routes off --output-dir /tmp/ep-compat-auto-default-01
 ```
 
-检查边界时，可用 EP8 M=32/64/128、EP16 M=16/32/64、EP32 M=32/64，以及非 2 次幂 M=3/33。EP64/128 用于验证完整 URMA 回退。用 `--rank-load uniform` 检查不匹配的负载。
+检查边界时，在目标 EP 上使用 M=1/2/3/16/32/33/64/128/255/256，分别测试 `--rank-load decode` 和 `--rank-load uniform`。以 `--capacity 257 --bs 257 --capacity-mode batch --dtype bf16` 验证上界之外的 URMA 回退。
 
 CPU 同步单独核验官方和候选。本分支保留 main 的计数通知实现，不包含历史 CPU-sync 超时问题的修复。先将 `MAIN_SHA` 设为实际构建的 main 提交 SHA：
 
@@ -148,24 +148,38 @@ python tests/ep/summarize_compat.py --input-dir /tmp/ep-auto-01 --require-mte-di
 
 FP8 payload 和非单位 scales 用于检查通信字节、stride、padding 及缓存更新；合成专家函数用可精确表示的 FP8 值生成 BF16 输出。该用例不模拟完整模型的反量化/GEMM 性能。combine 同时检查调用者已乘权和未乘权的专家输出，权重回传不能再次改变 hidden。
 
+## 与 main 对比 M≤256 的公共 API 延迟
+
+从候选分支取相同的 `tests/ep` 测试目录，在固定的物理节点、卡序、Torch 和 CANN 环境中依次加载 main 和候选的独立构建。每个构建使用独立的 `EP_JIT_CACHE_DIR`。以下操作都由同一份驱动执行。在各节点设置 `WORLD_SIZE`（节点数）、`RANK`（节点编号）及一致的 `MASTER_ADDR/MASTER_PORT`。每节点 8 卡时，1/2/4 个节点对应 EP8/16/32。
+
+```bash
+bench=(--num-processes 8 --capacity 256 --bs 1 2 3 8 16 32 33 64 128 255 256
+       --rank-load decode --warmup 15 --samples 60)
+# 在 main 环境执行
+python tests/ep/bench_decode.py run "${bench[@]}" --backend official \
+  --expected-source-commit "$MAIN_SHA" --output /tmp/ep-main.json
+# 在候选环境执行
+python tests/ep/bench_decode.py run "${bench[@]}" --backend candidate-auto \
+  --expected-source-commit "$CANDIDATE_SHA" --output /tmp/ep-candidate.json
+# 在存有两个 rank 0 文件的主机上执行
+python tests/ep/bench_decode.py compare /tmp/ep-main.json /tmp/ep-candidate.json
+```
+
+脚本固定 H7168、Top-8、128 专家和 alignment 128；每个 M 的路由、BF16 输入、FP32 权重和测试矩阵一致。两版均校验恒等专家的 reduction 以及回传权重。`fresh` 提供路由，`cached` 复用本轮 M 的 handle。各模式分别计时 dispatch、使用该模式返回值的独立 combine，以及不在两步之间同步的 dispatch→combine 整轮。每次计时包含 deferred 回调和末尾 NPU 同步，进程组 barrier、预热、校验及 profiler 都在计时区间外。先逐次取最慢 rank，再计算 P50；CSV 的百分比为 `100 × (候选延迟 / main 延迟 − 1)`，正值表示变慢。JSON 保留每次最慢 rank 耗时及构建身份。包从 wheel 导入且无对应 Git checkout 时，省略 `--expected-source-commit`，对照 JSON 中的扩展 SHA256 与实际构建产物。
+
+要逐整数扫描，可将两边的 `--bs` 都改为 `--bs $(seq 1 256)`。用 `--barrier-in-prologue` 和 `--rank-load uniform` 分别对比前置 barrier 和等长负载。稳态样本接近时，在相同硬件上反转两版的运行顺序并使用新的输出文件。设备选路另用上面的 `test_ep_auto_compat.py` 命令，指定同一批 `--bs`、`--capacity 256 --capacity-mode batch`、rank 负载及 barrier 选项。候选日志以 `--require-mte-dispatch --require-mte-combine` 严格验收。未采到设备 trace 的延迟数据只能说明公共 API 的实际耗时。
+
 ## 事件与共享通信层
 
-运行前必须确认目标运行时提供可调用的 `torch.npu._sleep`。此前检查的
-torch_npu 2.12 环境缺少该接口；入口会显式注册 torch_npu，并在分布式初始化前
-拒绝缺少延迟接口的环境。该环境仍需适配并验证设备端异步延迟，不能用 CPU sleep
-或同步操作代替后宣称完成跨流验收。
-
-保留 H1024/K1、EventOverlap 与 Bucket 冒烟，以及 H7168/K8/E128 的 producer/consumer 双流用例。CLI 中的 `mte` shape 名称保持兼容，仅表示该测试形状；是否走 LL 或 URMA 由主矩阵的 profiler 证据确认：
+H7168/K8/E128 专项在 producer/consumer 两条流上检查延迟生产、提前释放输入、分配压力和跨流等待。`--ep-shape mte` 遇到缺少 `torch.npu._sleep` 的运行时时使用预热后的 GEMM 提供设备端延迟，并验证 producer 事件在独立探针流推进时仍未完成。无法观测到该窗口时测试失败。指定 `--verify-mte` 会额外采一轮 deferred trace，在每个 rank 校验 dispatch、combine 的 MTE 主核。常规延迟用例仍在无 profiler 的独立迭代执行。
 
 ```bash
 python tests/comm/test_stream_compat.py --num-processes 8 \
-  --ep-shape both --ep-bs 16 --ep-capacity 256 \
-  --backend candidate-auto --barrier-in-prologue false
+  --ep-shape mte --ep-bs 2 --ep-capacity 2 --backend candidate-auto \
+  --verify-mte /tmp/ep8-stream-traces-01 --skip-bucket
 ```
 
-该入口检查延迟生产、提前释放输入、分配压力、dispatch 与 combine 的跨流等待，以及 immediate/deferred 两种完成方式。`--skip-bucket` 只用于隔离问题，完整公共层冒烟保留默认 Bucket 检查。不同 backend、barrier=True 另跑。
-
-该测试不使用 profiler 证明 transport，避免 profiler 的同步影响流行为。路径证据由相同 shape 的主矩阵另行提供；标准输出显示真实包路径和配置。PP/Engram 等其他共享层回归仍使用原有专项测试，不因 Bucket 通过就宣称全部通过。
+`--ep-shape fallback/both` 包含原有 H1024/K1 冒烟并要求可调用的 `torch.npu._sleep`。完整公共层冒烟保留默认 Bucket 检查，PP/Engram 使用各自的专项测试。不同 backend、barrier=True 可另跑。
 
 ## 结果与汇总
 
@@ -191,7 +205,7 @@ python tests/ep/summarize_compat.py --input-dir /tmp/ep-compat-auto-paths-01 --r
 
 测试中断后使用新的输出目录重新运行，或先从 dry-run 获取 case ID，再用相同配置筛选复跑；不要追加到不完整的旧日志，也不要删除 failed 行来制造通过结果。
 
-## EP8 去除 SHMEM 的 Decode 实测
+## 历史实测：EP8 去除 SHMEM，容量策略放开之前
 
 基线为本地父提交 `d7109e3`，候选为 `112ba8a`。两者在同一台 8 卡 Ascend950DT 上串行运行，使用 CANN 9.2.0、BF16、H7168、Top-8、128 个专家、alignment 128，rank `r` 的 token 数为 `max(1, M-r)`。fresh 每次传入路由索引，cached 复用预先生成的 handle。两种模式都把 dispatch 输出直接送入 combine，逐 rank 核对 payload、路由槽位、回传权重和合并结果。首次建链、通信区分配与 JIT 均在稳态采样前完成。
 
@@ -205,7 +219,7 @@ python tests/ep/summarize_compat.py --input-dir /tmp/ep-compat-auto-paths-01 --r
 
 M2、M32 的两版 dispatch 均命中直接写入特化，combine 从 SHMEM arena 切换到原生通信区。M256 在两版中都是 dispatch 直接写入、combine 全组使用 URMA。
 
-同一候选扩展设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` 后，设备 trace 确认全部 8 个 rank 都使用 URMA。M2 fresh 启用原生 MTE 后，dispatch 从 44.95 降到 35.66 µs，combine 从 29.48 降到 21.30 µs。M32 fresh 对应为 51.94 → 44.76 和 37.58 → 31.75 µs。父版在这两档已经使用 MTE 向 SHMEM arena 写入。在 M256，以 URMA 为基准，改用直接写入后 fresh dispatch 从 112.41 升至 118.61 µs（+5.51%），cached 从 105.32 升至 116.61 µs（+10.72%）。本分支沿用父版容量阈值。
+同一候选扩展设置 `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` 后，设备 trace 确认全部 8 个 rank 都使用 URMA。M2 fresh 启用原生 MTE 后，dispatch 从 44.95 降到 35.66 µs，combine 从 29.48 降到 21.30 µs。M32 fresh 对应为 51.94 → 44.76 和 37.58 → 31.75 µs。父版在这两档已经使用 MTE 向 SHMEM arena 写入。在 M256，以 URMA 为基准，改用直接写入后 fresh dispatch 从 112.41 升至 118.61 µs（+5.51%），cached 从 105.32 升至 116.61 µs（+10.72%）。该历史候选沿用当时父版的容量阈值。
 
 **公共 API 往返耗时（µs）**。计时覆盖 dispatch、combine、两次 deferred epilogue 和最后的 NPU 同步。每步先取最慢 rank，再计算稳态 P50。默认后置 barrier 下，M2 预热 15 次、采样 60 次，父版 → 候选的 fresh 为 572.25 → 653.40，cached 为 527.25 → 567.90。在另一台 8 卡节点上以相同输入单独比较 `main@4dfccac` → 同一候选，fresh 为 228.40 → 681.15，cached 为 193.06 → 583.34。两组比较各自同机。此处统计通信往返，不含专家计算。
 

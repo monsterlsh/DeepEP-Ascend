@@ -66,7 +66,7 @@ class EPBuffer: public BufferBase {
                topk_weights.has_value() and not cumulative_local_expert_recv_stats and not do_cpu_sync and
                do_zero_padding and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
                defer_epilogue and not use_cube_aligned_col_major_sf and
-               num_tokens == std::max(1, num_max_tokens_per_rank - context.rank_idx) and
+               is_decode_batch(num_tokens, num_max_tokens_per_rank) and
                is_decode_shape(context.num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
                                num_used_vec_cores, num_ub_bytes, sf.has_value());
     }
@@ -300,7 +300,7 @@ public:
             do_cpu_sync, do_zero_padding, use_cube_aligned_col_major_sf, defer_epilogue,
             decode_handle, num_used_vec_cores, num_ub_bytes);
         const bool low_latency_transport = low_latency_state->prepare_dispatch(
-            *context, x, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
+            *context, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
             num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue, matched_layout);
 
         // Clean host workspace
@@ -309,6 +309,21 @@ public:
             std::fill_n(host_workspace_layout.get_host_rank_count_ptr(), context->num_ranks, 0);
             std::fill_n(host_workspace_layout.get_host_expert_count_ptr(), num_experts_per_rank, 0);
             std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
+
+        // Direct launches may read inputs allocated on another NPU stream.
+        const auto issue_stream = c10_npu::getCurrentNPUStream();
+        record_use(x, issue_stream);
+        record_use(topk_idx, issue_stream);
+        if (sf)
+            record_use(*sf, issue_stream);
+        if (topk_weights)
+            record_use(*topk_weights, issue_stream);
+        if (cumulative_local_expert_recv_stats)
+            record_use(*cumulative_local_expert_recv_stats, issue_stream);
+        if (cached_mode) {
+            record_use(dst_buffer_slot_idx, issue_stream);
+            record_use(dst_gsge_idx, issue_stream);
         }
 
         // Launch dispatch
@@ -346,6 +361,18 @@ public:
         auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
                          low_latency_state = low_latency_state]() {
             const auto ll_failure_guard = low_latency_state->failure_guard();
+            const auto copy_stream = c10_npu::getCurrentNPUStream();
+            if (cached_mode or copy_stream != issue_stream) {
+                record_use(psum_num_recv_tokens_per_rank, copy_stream);
+                record_use(psum_num_recv_tokens_per_expert, copy_stream);
+            }
+            if (cached_mode)
+                record_use(*cached_recv_src_metadata, copy_stream);
+            if (not low_latency_transport and copy_stream != issue_stream) {
+                record_use(x, copy_stream);
+                record_use(metadata_send_buffer, copy_stream);
+            }
+
             // Wait GPU notify or reuse cached allocation sizes
             int num_recv_tokens = context->num_ranks * num_max_tokens_per_rank;
             int num_expanded_tokens = 0;

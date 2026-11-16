@@ -175,31 +175,20 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
         assert handle.num_recv_tokens == sum(expected_counts)
 
 
-def expected_transport(operation, case, rank, backend, runtime, *, cached=False, has_weights=True,
-                       has_stats=False, has_bias=False, capacity=None):
+def expected_transport(case, backend, runtime, *, has_weights=True, has_stats=False, has_bias=False):
     """Allowed device transports; a missing group capability falls back to URMA."""
-    m = case['M'] if capacity is None else capacity
+    m = case['M']
     world = len(case['rank_bs'])
-    if (backend != 'candidate-auto' or world not in (8, 16, 32) or not 1 <= m <= 256
-            or case['rank_bs'] != [max(1, m - peer) for peer in range(world)]
+    if (backend != 'candidate-auto' or world not in (2, 4, 8, 16, 32, 64, 128) or not 1 <= m <= 256
+            or not all(1 <= batch <= m for batch in case['rank_bs'])
             or runtime['arch'] != 3510 or runtime['num_vec_cores'] != 64 or runtime['num_ai_cores'] != 32
             or case['alignment'] != 128 or case['dtype'] != 'bf16' or case['cpu_sync'] is not False
             or case['deterministic'] or not case['deferred'] or not has_weights or has_stats or has_bias):
         return 'urma'
-    if operation == 'dispatch':
-        if case['barrier_in_prologue']:
-            threshold = {8: 256, 16: 16 if cached else 32, 32: 32 if cached else 64}[world]
-        else:
-            threshold = (8 if world == 8 else 0) if cached else 16
-        return ['urma', 'mte'] if m <= threshold else 'urma'
-    if (world == 8 and m <= 32) or (world == 16 and m <= 16):
-        return ['urma', 'mte']
-    if (world == 8 and m == 64 and rank >= 4) or (world == 16 and m == 32 and rank == 15):
-        return ['urma', 'mte']
-    return 'urma'
+    return ['urma', 'mte']
 
 
-def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **kwargs):
+def invoke(buffer, operation, label, case, rank, backend, runtime, collector, *, handle_case=None, **kwargs):
     import torch
 
     metadata = dict(case_id=case['case_id'], backend=backend, rank=rank,
@@ -224,8 +213,11 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, **
             metadata['expected_num_sf_packs'] = 0
     original_b = handle.topk_idx.size(0) if operation == 'combine' else None
     capacity = handle.num_max_tokens_per_rank if handle is not None else case['M']
-    expected = expected_transport(operation, case, rank, backend, runtime,
-                                  capacity=capacity, cached=handle is not None,
+    # A retained handle may have a different capacity, load, dtype or alignment
+    # from the most recent dispatch. Both its origin and this call must qualify.
+    selection = dict(handle_case or case, M=capacity)
+    selection['deferred'] = selection['deferred'] and case['deferred']
+    expected = expected_transport(selection, backend, runtime,
                                   has_weights=metadata['weight_side_channel'],
                                   has_stats=kwargs.get('cumulative_local_expert_recv_stats') is not None,
                                   has_bias=kwargs.get('bias') is not None)
@@ -387,27 +379,32 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
         no_weight_args = dict(x=updated, topk_weights=None, do_expand=True, do_cpu_sync=False,
                               do_zero_padding=True, async_with_compute_stream=True,
                               use_tma_aligned_col_major_sf=scale_layout == 'col')
+        check_routes = routes
         if cached_mode:
             no_weight_args['handle'] = handle
         else:
-            no_weight_args.update(topk_idx=indices, num_experts=128,
+            # Move every active slot to the next rank. The old handle must still
+            # address its own rows after this fresh dispatch reuses the workspace.
+            step = 128 // world
+            check_routes = [[[(e + step) % 128 if e >= 0 else e for e in row]
+                             for row in source] for source in routes]
+            new_indices = torch.tensor(check_routes[rank], dtype=torch.int64, device='npu').reshape(bs, 8)
+            no_weight_args.update(topk_idx=new_indices, num_experts=128,
                                   num_max_tokens_per_rank=case['M'], expert_alignment=alignment)
         no_weight_x, no_idx, no_weights, no_weight_handle, _ = call(
             'dispatch', 'cached_no_weights' if cached_mode else 'fresh_no_weights', **no_weight_args)
         agree(lambda: _check_no_indices(no_idx))
-        agree(lambda: check_dispatch(no_weight_x, no_weights, no_weight_handle, routes, rank, world, alignment,
+        agree(lambda: check_dispatch(no_weight_x, no_weights, no_weight_handle, check_routes, rank, world, alignment,
             buffer.deterministic, backend=backend, dtype=dtype, scale_layout=scale_layout,
             payload_scale=2, scale_version=1, has_weights=False))
 
-    if retained is not None:
-        old_expert, old_handle, old_expected = retained
-        output, output_weights, _ = call('combine', 'old_handle',
-            x=old_expert, handle=old_handle, num_sms=0, async_with_compute_stream=True)
-        torch.npu.synchronize()
-        agree(lambda: torch.testing.assert_close(output.float().cpu(), old_expected.float(), atol=.125, rtol=.02))
-        agree(lambda: _check_no_indices(output_weights))
-    else:
-        retained = unweighted_expert, handle, expected_unweighted
+    if retained is None:
+        retained = (unweighted_expert, handle, expected_unweighted, cached_weights, weights * 3, case)
+    old_expert, old_handle, old_expected, old_weights, expected_weights, old_case = retained
+    output, output_weights, _ = call('combine', 'old_handle', handle_case=old_case,
+        x=old_expert, handle=old_handle, topk_weights=old_weights, async_with_compute_stream=True)
+    agree(lambda: torch.testing.assert_close(output.float().cpu(), old_expected.float(), atol=.125, rtol=.02))
+    agree(lambda: torch.testing.assert_close(output_weights, expected_weights, atol=0, rtol=0))
     if rank == 0:
         print(f"PASS {case['case_id']} EP{world} B={case['rank_bs']} M={case['M']} "
               f"{dtype=} alignment={alignment} deferred={case['deferred']} cpu_sync={sync} "

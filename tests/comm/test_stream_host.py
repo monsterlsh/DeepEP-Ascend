@@ -7,7 +7,7 @@ available; routing and configuration checks require only the standard library.
 
 import argparse
 import ast
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 import io
 import os
 from pathlib import Path
@@ -19,7 +19,7 @@ from unittest.mock import Mock, patch
 
 def load_helpers():
     source = Path(__file__).with_name("test_stream_compat.py")
-    names = {"mte_routes", "validate_config", "check_mte_dispatch", "require_device_delay"}
+    names = {"mte_routes", "validate_config", "check_mte_dispatch", "require_device_delay", "make_stream_delay"}
     nodes = [node for node in ast.parse(source.read_text(encoding="utf-8")).body
              if isinstance(node, ast.FunctionDef) and node.name in names]
     assert {node.name for node in nodes} == names
@@ -34,7 +34,7 @@ class StreamHostTests(unittest.TestCase):
         cls.helpers = load_helpers()
 
     def test_routes_are_valid_distinct_and_balanced(self):
-        for world in (8, 16, 32, 64, 128):
+        for world in (2, 4, 8, 16, 32, 64, 128):
             for bs in (1, 16, 64 if world == 8 else 32):
                 with self.subTest(world=world, bs=bs):
                     received = [0] * world
@@ -46,26 +46,26 @@ class StreamHostTests(unittest.TestCase):
                             self.assertEqual(len(set(experts)), 8)
                             self.assertTrue(all(0 <= expert < 128 for expert in experts))
                             ranks = [expert // (128 // world) for expert in experts]
-                            self.assertEqual(len(set(ranks)), 8)
+                            self.assertEqual(len(set(ranks)), min(8, world))
                             for rank in ranks:
                                 received[rank] += 1
                     self.assertEqual(received, [8 * bs] * world)
 
     def test_mte_gates_and_fallback(self):
         validate = self.helpers["validate_config"]
-        for world in (8, 16, 32, 64, 128):
-            limit = 64 if world == 8 else 32
+        for world in (2, 4, 8, 16, 32, 64, 128):
+            limit = 256
             for bs in (1, limit):
                 for capacity in (bs, 256):
-                    validate(SimpleNamespace(ep_shape="mte", ep_bs=bs, ep_capacity=capacity), world)
+                    validate(SimpleNamespace(ep_shape="mte", ep_bs=bs, ep_capacity=capacity, verify_mte=None), world)
             for bs, capacity in ((0, 16), (limit + 1, 256), (16, 15), (16, 257)):
                 with self.subTest(world=world, bs=bs, capacity=capacity):
                     with self.assertRaises(ValueError):
-                        validate(SimpleNamespace(ep_shape="both", ep_bs=bs, ep_capacity=capacity), world)
-        for world in (1, 2, 4, 256):
+                        validate(SimpleNamespace(ep_shape="both", ep_bs=bs, ep_capacity=capacity, verify_mte=None), world)
+        for world in (1, 3, 256):
             with self.assertRaises(ValueError):
-                validate(SimpleNamespace(ep_shape="mte", ep_bs=16, ep_capacity=16), world)
-            validate(SimpleNamespace(ep_shape="fallback", ep_bs=16, ep_capacity=16), world)
+                validate(SimpleNamespace(ep_shape="mte", ep_bs=16, ep_capacity=16, verify_mte=None), world)
+            validate(SimpleNamespace(ep_shape="fallback", ep_bs=16, ep_capacity=16, verify_mte=None), world)
 
     def test_delay_preflight_rejects_missing_or_noncallable_api(self):
         for torch in (SimpleNamespace(), SimpleNamespace(npu=SimpleNamespace()),
@@ -80,6 +80,26 @@ class StreamHostTests(unittest.TestCase):
         with patch.dict(self.helpers, torch=SimpleNamespace(npu=SimpleNamespace(_sleep=delay))):
             self.helpers['require_device_delay']()
         delay.assert_not_called()
+
+    def test_gemm_delay_requires_a_pending_device_event(self):
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                stream, observer = Mock(), Mock()
+                tail = Mock()
+                tail.query.return_value = not pending
+                npu = SimpleNamespace(stream=lambda _: nullcontext(), Event=lambda: tail)
+                torch = SimpleNamespace(npu=npu, mm=Mock(), ones=Mock(), empty_like=Mock(), bfloat16=object())
+                with patch.dict(self.helpers, torch=torch):
+                    if pending:
+                        delay = self.helpers['make_stream_delay'](stream, observer)
+                        torch.mm.reset_mock()
+                        delay()
+                        self.assertEqual(torch.mm.call_count, 4)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'asynchronous device window'):
+                            self.helpers['make_stream_delay'](stream, observer)
+                    tail.query.assert_called()
+                    tail.synchronize.assert_called()
 
     def test_worker_checks_delay_before_initializing_distributed(self):
         source = Path(__file__).with_name('test_stream_compat.py')
@@ -97,7 +117,7 @@ class StreamHostTests(unittest.TestCase):
                 error = LookupError if available else RuntimeError
                 message = 'Reached distributed initialization' if available else r'callable torch\.npu\._sleep'
                 with self.assertRaisesRegex(error, message):
-                    namespace['test'](0, 2, SimpleNamespace(backend='official'))
+                    namespace['test'](0, 2, SimpleNamespace(backend='official', ep_shape='fallback'))
             if available:
                 configure.assert_called_once_with("official")
                 init_dist.assert_called_once_with(0, 2)
@@ -147,40 +167,50 @@ class StreamHostTests(unittest.TestCase):
         except ImportError:
             self.skipTest("CPU Torch is unavailable; routing/configuration tests still run")
         self.helpers["torch"] = torch
-        for world in (8, 16, 32, 64, 128):
+        for world in (2, 4, 8, 16, 32, 64, 128):
             with self.subTest(world=world):
                 bs, capacity, iteration, rank = 2, 7, 1, world - 1
                 local_experts = 128 // world
-                entries, rank_counts, expert_counts = [], [0] * world, [0] * local_experts
+                rows, rank_counts, expert_counts = [], [0] * world, [0] * local_experts
                 for source in range(world):
                     for token in range(bs):
-                        for k in range(8):
-                            if (source + token + k) % world == rank:
-                                entries.append((source, token, k))
-                                rank_counts[source] += 1
-                                expert_counts[((source + token) // world) % local_experts] += 1
-                entries.reverse()
-                count = len(entries)
-                x = torch.full((count + 4, 7168), -999, dtype=torch.bfloat16, device="cpu")
-                weights = torch.full((count + 4,), -999, dtype=torch.float32, device="cpu")
-                metadata = torch.full((count + 4, 10), -1, dtype=torch.int32, device="cpu")
-                for index, (source, token, k) in enumerate(entries):
-                    slot = (index + 3) % count
-                    x[slot].fill_(source + 10 * iteration)
-                    x[slot, 0] = token
-                    weights[slot] = k + 1
-                    metadata[index, k] = slot
+                        entries = [(k, ((source + token) // world + k // world) % local_experts)
+                                   for k in range(8) if (source + token + k) % world == rank]
+                        if entries:
+                            rows.append((source, token, entries))
+                            rank_counts[source] += 1
+                            for _, local in entries:
+                                expert_counts[local] += 1
+                rows.reverse()
+                alignment = 128
+                offset, ends = 0, []
+                for n in expert_counts:
+                    ends.append(offset + n)
+                    offset += (n + alignment - 1) // alignment * alignment
+                x = torch.full((offset + 4, 7168), -999, dtype=torch.bfloat16, device="cpu")
+                weights = torch.full((offset + 4,), -999, dtype=torch.float32, device="cpu")
+                metadata = torch.full((len(rows) + 4, 10), -1, dtype=torch.int32, device="cpu")
+                positions = list(ends)
+                for index, (source, token, entries) in enumerate(rows):
+                    for k, local in entries:
+                        positions[local] -= 1
+                        slot = positions[local]
+                        x[slot].fill_(source + 10 * iteration)
+                        x[slot, 0] = token
+                        weights[slot] = k + 1
+                        metadata[index, k] = slot
                     metadata[index, -2] = source * capacity + token
-                    metadata[index, -1] = k
+                    metadata[index, -1] = max(k for k, _ in entries)
                 handle = SimpleNamespace(
+                    expert_alignment=alignment,
                     topk_idx=torch.tensor(self.helpers["mte_routes"](rank, world, bs), device="cpu"),
                     psum_num_recv_tokens_per_rank=torch.tensor(rank_counts, device="cpu").cumsum(0),
                     num_unaligned_recv_tokens_per_expert=torch.tensor(expert_counts, device="cpu"),
-                    psum_num_recv_tokens_per_expert=torch.tensor(expert_counts, device="cpu").cumsum(0),
+                    psum_num_recv_tokens_per_expert=torch.tensor(ends, device="cpu"),
                     recv_src_metadata=metadata)
                 check = self.helpers["check_mte_dispatch"]
                 check(x, None, weights, handle, rank, world, bs, capacity, iteration)
-                x[0, 7] = -1
+                x[slot, 7] = -1
                 with self.assertRaises(AssertionError):
                     check(x, None, weights, handle, rank, world, bs, capacity, iteration)
 

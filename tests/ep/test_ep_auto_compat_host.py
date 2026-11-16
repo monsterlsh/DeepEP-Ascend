@@ -1,5 +1,6 @@
 """CPU tests of the compatibility harness, not validation of NPU kernels."""
 
+from contextlib import nullcontext
 import json
 from pathlib import Path
 import subprocess
@@ -13,42 +14,52 @@ from compat_config import parse_args, plan_cases
 
 
 class ContractTests(unittest.TestCase):
-    def test_measured_shapes_and_mixed_combine_ranks(self):
+    def test_positive_batches_at_all_supported_world_sizes(self):
         runtime = dict(arch=3510, num_vec_cores=64, num_ai_cores=32)
-        args = parse_args(['--bs', '16', '32', '64', '--rank-load', 'decode', '--capacity-mode', 'batch',
-                           '--alignment', '128', '--cpu-sync', 'false', '--deferred', 'true',
-                           '--deterministic', 'false', '--barrier-in-prologue', 'true', '--route', 'random',
-                           '--edge-routes', 'off'])
-        case16, case32, case64 = plan_cases(args, world=16)
-        self.assertEqual(suite.expected_transport('combine', case16, 0, 'candidate-auto', runtime), ['urma', 'mte'])
-        self.assertEqual(suite.expected_transport('combine', case32, 15, 'candidate-auto', runtime), ['urma', 'mte'])
-        self.assertEqual(suite.expected_transport('combine', case32, 14, 'candidate-auto', runtime), 'urma')
-        self.assertEqual(suite.expected_transport('dispatch', case32, 0, 'candidate-auto', runtime), ['urma', 'mte'])
-        self.assertEqual(suite.expected_transport('dispatch', case32, 0, 'candidate-auto', runtime, cached=True), 'urma')
-        self.assertEqual(suite.expected_transport('dispatch', case64, 0, 'candidate-auto', runtime), 'urma')
-        case = plan_cases(args, world=8)[2]
-        for rank in range(8):
-            self.assertEqual(suite.expected_transport('combine', case, rank, 'candidate-auto', runtime),
-                             ['urma', 'mte'] if rank >= 4 else 'urma')
+        for world in (2, 4, 8, 16, 32, 64, 128):
+            for m in (1, 3, 16, 32, 64, 128, 255, 256):
+                for loads in ([m] * world, [max(1, m - rank) for rank in range(world)], [1] * world):
+                    case = dict(rank_bs=loads, M=m, alignment=128, dtype='bf16', cpu_sync=False,
+                                deterministic=False, deferred=True)
+                    with self.subTest(world=world, m=m, loads=loads):
+                        self.assertEqual(suite.expected_transport(case, 'candidate-auto', runtime), ['urma', 'mte'])
 
-    def test_unmeasured_shapes_options_and_backends_fall_back(self):
+    def test_unsupported_shapes_options_and_backends_fall_back(self):
         runtime = dict(arch=3510, num_vec_cores=64, num_ai_cores=32)
-        case = dict(rank_bs=[2, 1, 1, 1, 1, 1, 1, 1], M=2, alignment=128, dtype='bf16', cpu_sync=False,
-                    deterministic=False, deferred=True, barrier_in_prologue=False)
-        for op in ('dispatch', 'combine'):
-            non_power_of_two = dict(case, M=3, rank_bs=[3, 2] + [1] * 6)
-            self.assertEqual(suite.expected_transport(op, non_power_of_two, 0, 'candidate-auto', runtime),
-                             ['urma', 'mte'])
-            for changes in (dict(M=3), dict(rank_bs=[2] * 8), dict(rank_bs=[2] + [1] * 63),
-                            dict(rank_bs=[2] + [1] * 127), dict(alignment=1), dict(cpu_sync=True),
-                            dict(deferred=False), dict(deterministic=True), dict(dtype='fp8')):
-                with self.subTest(op=op, changes=changes):
-                    self.assertEqual(suite.expected_transport(op, dict(case, **changes), 0, 'candidate-auto', runtime),
-                                     'urma')
-            for options in (dict(has_weights=False), dict(has_stats=True), dict(has_bias=True)):
-                self.assertEqual(suite.expected_transport(op, case, 0, 'candidate-auto', runtime, **options), 'urma')
-            for backend in ('candidate-disabled', 'official'):
-                self.assertEqual(suite.expected_transport(op, case, 0, backend, runtime), 'urma')
+        case = dict(rank_bs=[2] + [1] * 7, M=2, alignment=128, dtype='bf16', cpu_sync=False,
+                    deterministic=False, deferred=True)
+        for changes in (dict(M=257), dict(rank_bs=[0] + [1] * 7), dict(rank_bs=[3] + [1] * 7),
+                        dict(rank_bs=[1]), dict(rank_bs=[1] * 3),
+                        dict(alignment=1), dict(cpu_sync=True), dict(deferred=False),
+                        dict(deterministic=True), dict(dtype='fp8')):
+            with self.subTest(changes=changes):
+                self.assertEqual(suite.expected_transport(dict(case, **changes), 'candidate-auto', runtime), 'urma')
+        for options in (dict(has_weights=False), dict(has_stats=True), dict(has_bias=True)):
+            self.assertEqual(suite.expected_transport(case, 'candidate-auto', runtime, **options), 'urma')
+        for backend in ('candidate-disabled', 'official'):
+            self.assertEqual(suite.expected_transport(case, backend, runtime), 'urma')
+
+    def test_old_handle_trace_uses_its_original_capacity_and_layout(self):
+        current = plan_cases(parse_args(['--bs', '32', '--capacity-mode', 'batch', '--alignment', '1',
+                                         '--deferred', 'true', '--deterministic', 'false',
+                                         '--edge-routes', 'off']))[0]
+        old = dict(current, alignment=128, M=3, rank_bs=[2] * 8)
+        handle = SimpleNamespace(expert_alignment=128, num_max_tokens_per_rank=3,
+                                 topk_idx=SimpleNamespace(size=lambda dim: 2))
+        evidence = {}
+        def capture(label, operation, **kwargs):
+            evidence.update(kwargs)
+            return nullcontext()
+        fake_torch = SimpleNamespace(npu=SimpleNamespace(synchronize=lambda: None))
+        runtime = dict(arch=3510, num_vec_cores=64, num_ai_cores=32)
+        with patch.dict(sys.modules, torch=fake_torch), patch.object(suite, 'agree', lambda check: check()), \
+                patch.object(suite, 'launch'):
+            suite.invoke(None, 'combine', 'old_handle', current, 0, 'candidate-auto', runtime,
+                         SimpleNamespace(capture=capture), handle_case=old, handle=handle, topk_weights=object())
+        self.assertEqual(evidence['expected_transport'], ['urma', 'mte'])
+        self.assertEqual(evidence['metadata']['M'], 3)
+        self.assertEqual(evidence['metadata']['B'], 2)
+        self.assertEqual(evidence['metadata']['case_id'], current['case_id'])
 
     def test_both_versions_have_no_public_experiment_markers(self):
         for backend in ('official', 'candidate-auto', 'candidate-disabled'):
@@ -102,7 +113,7 @@ runpy.run_path('test_ep_auto_compat.py', run_name='__main__')
         with patch.dict(sys.modules, torch=fake_torch), patch.object(suite, 'agree', lambda check: check()):
             with self.assertRaisesRegex(OSError, 'trace directory'):
                 suite.invoke(buffer, 'dispatch', 'fresh', case, 0, 'candidate-auto',
-                             dict(arch=3510, num_vec_cores=64), collector, x=None)
+                             dict(arch=3510, num_vec_cores=64, num_ai_cores=32), collector, x=None)
         self.assertEqual(calls, [])
 
 

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <optional>
@@ -11,21 +10,25 @@
 #include "../kernels/comm/api.hpp"
 #include "../kernels/ep/dispatch_low_latency_policy.hpp"
 #include "../utils/event.hpp"
-#include "../utils/tensor.hpp"
 
 namespace deep_ep {
 
 class EPLowLatencyState {
+    struct Completion {
+        c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
+        EventHandle event{stream};
+    };
+
     int64_t num_buffer_bytes;
-    std::optional<EventHandle> last_event;
+    std::optional<Completion> last_completion;
     bool pending = false;
     bool failed = false;
     bool group_enabled = false;
     comm::DecodeAgreement agreement;
 
     void wait_for_workspace() {
-        if (last_event)
-            last_event->current_stream_wait();
+        if (last_completion and last_completion->stream != c10_npu::getCurrentNPUStream())
+            last_completion->event.current_stream_wait();
     }
 
 public:
@@ -66,28 +69,24 @@ public:
     }
 
     bool prepare_dispatch(
-            const comm::Context& context, const torch::Tensor& x, int capacity, int hidden,
+            const comm::Context& context, int capacity, int hidden,
             int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes, bool use_fp8,
             bool cached_mode, bool barrier_in_prologue, bool matched_options) {
         require_idle();
         const auto guard = failure_guard();
         wait_for_workspace();
-        bool eligible = false;
-        // Capacity and payload geometry are shared EP wire-layout arguments. B and the
-        // optional tensors are rank-local, so they only affect the vote, never participation.
-        if (group_enabled and is_decode_capacity(context.num_ranks, capacity) and
-            hidden == 7168 and num_topk == 8 and num_experts == 128 and
-            capacity <= get_dispatch_low_latency_threshold(context.num_ranks, false, true) and
-            not comm::DecodeAgreement::is_capturing()) {
-            const auto plan = get_dispatch_low_latency_plan(runtime->get_npu_arch(), context.num_ranks, capacity,
-                hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, use_fp8);
-            const bool match = plan and num_buffer_bytes >= plan->buffer_bytes and low_latency_transport_enabled() and
-                matched_options and x.size(0) == std::max(1, capacity - context.rank_idx) and
-                capacity <= get_dispatch_low_latency_threshold(context.num_ranks, cached_mode, barrier_in_prologue);
-            const uint16_t proposal = match ? 1 + 2 * cached_mode + barrier_in_prologue : 0;
-            eligible = agreement.matches(context.hccl_context->comm, context.num_ranks, context.num_cpu_timeout_secs, proposal);
-        }
-        return eligible;
+        const auto world = context.num_ranks;
+        // Only shared wire geometry may skip the collective. Rank-local options vote below.
+        if (not group_enabled or not is_decode_geometry(world, capacity, hidden, num_topk, num_experts) or
+            comm::DecodeAgreement::is_capturing())
+            return false;
+
+        const auto plan = get_dispatch_low_latency_plan(runtime->get_npu_arch(), world, capacity,
+            hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, use_fp8);
+        const bool match = plan and num_buffer_bytes >= plan->buffer_bytes and
+            low_latency_transport_enabled() and matched_options;
+        const uint16_t proposal = match ? 1 + 2 * cached_mode + barrier_in_prologue : 0;
+        return agreement.matches(context.hccl_context->comm, world, context.num_cpu_timeout_secs, proposal);
     }
 
     bool prepare_combine(
@@ -98,21 +97,16 @@ public:
         const auto guard = failure_guard();
         wait_for_workspace();
         const auto world = context.num_ranks;
-        const bool mixed = (world == 8 and capacity == 64) or (world == 16 and capacity == 32);
-        const bool all_mte = combine_group_mte_capacity(world, capacity, -1);
-        if (not group_enabled or not (all_mte or mixed) or
-            hidden != 7168 or num_topk != 8 or num_experts != 128 or comm::DecodeAgreement::is_capturing())
+        if (not group_enabled or not is_decode_geometry(world, capacity, hidden, num_topk, num_experts) or
+            comm::DecodeAgreement::is_capturing())
             return false;
 
         const auto threshold = mte_bs_threshold_override();
-        const bool enabled = all_mte ? combine_group_mte_capacity(world, capacity, threshold) :
-            (threshold < 0 or threshold >= (world == 8 ? 60 : 17));
-        const bool match = enabled and low_latency_transport_enabled() and matched_options and
-            is_decode_shape(world, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, false) and
-            batch == std::max(1, capacity - context.rank_idx);
+        const bool match = (threshold < 0 or capacity <= threshold) and
+            low_latency_transport_enabled() and matched_options and is_decode_batch(batch, capacity) and
+            is_decode_shape(world, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, false);
         const uint16_t proposal = match ? 1 + barrier_in_prologue : 0;
-        const bool eligible = agreement.matches(context.hccl_context->comm, world, context.num_cpu_timeout_secs, proposal);
-        return eligible and (all_mte or combine_native_mte_rank(world, capacity, context.rank_idx, batch, threshold));
+        return agreement.matches(context.hccl_context->comm, world, context.num_cpu_timeout_secs, proposal);
     }
 
     void begin() {
@@ -128,13 +122,13 @@ public:
         if (not group_enabled)
             return;
         // Both transports use the native EP buffer and workspace across streams.
-        last_event.emplace();
+        last_completion.emplace();
         pending = false;
     }
 
     void close() {
         require_idle();
-        last_event.reset();
+        last_completion.reset();
     }
 };
 

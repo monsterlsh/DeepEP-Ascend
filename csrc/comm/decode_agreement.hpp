@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -16,7 +17,10 @@ namespace deep_ep::comm {
 
 // This host decision needs only shape/options metadata. No device data or producer event is an input.
 class DecodeAgreement {
-    static constexpr size_t kRecvOffset = 64;
+    // Zero vetoes the fast path. A dispatch encodes fresh/cached and barrier
+    // placement as 1..4; combine uses 1..2. Keep each HCCL input aligned.
+    struct alignas(64) Vote { uint16_t value; };
+    static constexpr std::array<Vote, 5> votes{{{0}, {1}, {2}, {3}, {4}}};
     aclrtStream stream = nullptr;
     void* host = nullptr;
     void* device = nullptr;
@@ -28,10 +32,11 @@ public:
     DecodeAgreement& operator=(const DecodeAgreement&) = delete;
 
     bool initialize(int world) {
-        const size_t bytes = kRecvOffset + world * sizeof(uint16_t);
+        const size_t recv_bytes = world * sizeof(uint16_t);
         return aclrtCreateStream(&stream) == ACL_SUCCESS and
-               aclrtMallocHost(&host, bytes) == ACL_SUCCESS and
-               aclrtMalloc(&device, bytes, ACL_MEM_MALLOC_NORMAL_ONLY) == ACL_SUCCESS;
+               aclrtMallocHost(&host, recv_bytes) == ACL_SUCCESS and
+               aclrtMalloc(&device, sizeof(votes) + recv_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) == ACL_SUCCESS and
+               aclrtMemcpy(device, sizeof(votes), votes.data(), sizeof(votes), ACL_MEMCPY_HOST_TO_DEVICE) == ACL_SUCCESS;
     }
 
     // Even a rank that could not allocate the per-call vote resources must
@@ -68,13 +73,17 @@ public:
         if (in_flight)
             throw std::runtime_error("Previous EP transport agreement failed; restart the distributed job");
         const size_t bytes = world * sizeof(proposal);
-        auto host_recv = reinterpret_cast<uint16_t*>(static_cast<char*>(host) + kRecvOffset);
-        auto device_recv = static_cast<char*>(device) + kRecvOffset;
-        *static_cast<uint16_t*>(host) = proposal;
+        auto* host_recv = static_cast<uint16_t*>(host);
+        auto* device_recv = static_cast<char*>(device) + sizeof(votes);
+        // Select an immutable device value. Every rank still votes on this call,
+        // including a rank with an unsupported proposal or different local inputs.
+        if (proposal >= votes.size())
+            proposal = 0;
+        auto* send = static_cast<char*>(device) + proposal * sizeof(Vote);
         in_flight = true;
-        ACL_CHECK(aclrtMemcpyAsync(device, sizeof(proposal), host, sizeof(proposal), ACL_MEMCPY_HOST_TO_DEVICE, stream));
-        HCCL_CHECK(HcclAllGather(device, device_recv, 1, HCCL_DATA_TYPE_UINT16, comm, stream));
-        ACL_CHECK(aclrtMemcpyAsync(host_recv, bytes, device_recv, bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream));
+        HCCL_CHECK(HcclAllGather(send, device_recv, 1, HCCL_DATA_TYPE_UINT16, comm, stream));
+        if (proposal != 0)
+            ACL_CHECK(aclrtMemcpyAsync(host_recv, bytes, device_recv, bytes, ACL_MEMCPY_DEVICE_TO_HOST, stream));
         ACL_CHECK(aclrtSynchronizeStreamWithTimeout(stream, timeout * 1000));
         in_flight = false;
         return proposal != 0 and std::all_of(host_recv, host_recv + world,

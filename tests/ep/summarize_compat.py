@@ -332,11 +332,7 @@ def summarize(input_dir, require_paths=False, require_shmem_combine=False, requi
                     collective_targets[key] = 'shmem'
         for _, case in results:
             for (kind, label), target in sorted(collective_targets.items()):
-                transport, options = case['transports'].get((kind, label), ('no device record', None))
-                # Mixed native combine deliberately uses URMA on some ranks. All ranks
-                # still need verified evidence for this label, including the fallback ranks.
-                if kind == 'combine' and target == 'mte' and options and 'mte' not in options:
-                    target = 'urma'
+                transport, _ = case['transports'].get((kind, label), ('no device record', None))
                 if transport != target:
                     case['path_reasons'].append(f"{kind}/{label}: expected group-wide {target.upper()}, captured {transport}")
                     case['path_status'] = 'unverified'
@@ -389,7 +385,7 @@ def main(argv=None):
                         help='Require verified embedded device evidence in addition to correctness')
     combine_group = parser.add_mutually_exclusive_group()
     combine_group.add_argument('--require-mte-combine', action='store_true',
-                               help='Require native MTE on each eligible combine rank and call')
+                               help='Require native MTE on every rank of each eligible combine call')
     combine_group.add_argument('--require-shmem-combine', action='store_true',
                                help='Validate group-wide SHMEM combine in archived candidate reports')
     parser.add_argument('--require-mte-dispatch', action='store_true',
