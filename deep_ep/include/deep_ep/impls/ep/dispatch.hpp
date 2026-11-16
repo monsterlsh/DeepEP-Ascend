@@ -16,6 +16,7 @@
 #include <deep_ep/common/math.hpp>
 #include <deep_ep/common/reduction.hpp>
 #include <deep_ep/common/simt.hpp>
+#include <deep_ep/impls/ep/dispatch_direct_layout.hpp>
 
 namespace deep_ep {
 
@@ -54,18 +55,17 @@ struct alignas(kNumUbAlignmentBytes) DispatchUBLayout {
 template <typename ub_layout_t, int kNumHiddenBytes, int kNumSFPacks, int kNumTopk,
           int kNumMaxTokensPerVecCore, int kNumUbBytes, bool kCachedMode>
 struct UBLayoutWithBuffer {
-    static constexpr int kNumMetadataTokenBytes = layout::TokenLayout(0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes();
+    static constexpr int kNumMetadataTokenBytes =
+        layout::TokenLayout(0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes();
     static constexpr int kNumHiddenMTEStageBytes = math::align(kNumHiddenBytes, kNumUbAlignmentBytes);
-    static constexpr int kNumAvailableMetadataBytes = kNumUbBytes - static_cast<int>(sizeof(ub_layout_t)) - kNumHiddenMTEStageBytes;
-    EP_STATIC_ASSERT(kNumAvailableMetadataBytes >= 4 * kNumMetadataTokenBytes, "Insufficient dispatch UB buffer space");
-    static constexpr int kNumTokensPerMetadataMTE = kNumAvailableMetadataBytes / kNumMetadataTokenBytes >= 64 ? 64 : 4;
+    static constexpr auto kStages = get_dispatch_buffer_stages(
+        kNumUbBytes - static_cast<int64_t>(sizeof(ub_layout_t)), kNumHiddenMTEStageBytes, kNumMetadataTokenBytes,
+        kNumMaxTokensPerVecCore);
+    EP_STATIC_ASSERT(kStages.num_metadata_stages > 0 and kStages.num_hidden_stages > 0, "Insufficient dispatch UB buffer space");
+    static constexpr int kNumTokensPerMetadataMTE = kStages.tokens_per_metadata_stage;
     static constexpr int kNumMetadataMTEStageBytes = kNumTokensPerMetadataMTE * kNumMetadataTokenBytes;
-    static constexpr int kNumMetadataMTEStages = math::min(
-        math::min(8, math::ceil_div(kNumMaxTokensPerVecCore, kNumTokensPerMetadataMTE)),
-        kNumAvailableMetadataBytes / kNumMetadataMTEStageBytes);
-    static constexpr int kNumHiddenMTEStages = math::min(8,
-        (kNumUbBytes - static_cast<int>(sizeof(ub_layout_t)) - kNumMetadataMTEStages * kNumMetadataMTEStageBytes) /
-            kNumHiddenMTEStageBytes);
+    static constexpr int kNumMetadataMTEStages = kStages.num_metadata_stages;
+    static constexpr int kNumHiddenMTEStages = kStages.num_hidden_stages;
 
     ub_layout_t workspace;
     alignas(kNumUbAlignmentBytes) uint8_t metadata[kNumMetadataMTEStages][kNumMetadataMTEStageBytes];
@@ -76,7 +76,7 @@ template <int kNumMaxTokensPerRank,
           int kNumRanks, int kNumExperts, int kNumTopk, int kExpertAlignment,
           bool kCachedMode, bool kDoCPUSync, int kNumVecCores, int kNumThreads,
           int kNumSGEPairsPerSQE,
-          int64_t kNumTimeoutCycles,
+          int64_t kNumTimeoutCycles, bool kLowLatencyTransport = false,
           int kNumExpertsPerRank = kNumExperts / kNumRanks,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumWarps = kNumThreads / warpSize,
@@ -295,20 +295,23 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     if (thread_idx == 0)
         ub_layout->local_copy_ready = 1;
 
-    // Load descriptors while the scalar pipeline copies local payloads.
-    if (thread_idx < kNumRanks and thread_idx != rank_idx)
-        handle::HcommPeerInfo::load_peer_info(ub_layout->peer_info + thread_idx, jetty_ptrs,
-                              thread_idx < rank_idx ? thread_idx : thread_idx - 1);
-    if (warp_idx == 1 and kNumRanks > 1) {
-        handle::HcommJettyInfo::load_jetty_info(&ub_layout->jetty_info, jetty_ptrs, vec_core_idx, lane_idx);
-        // Check SQ capacity before releasing other warps to write WQEBBs.
-        if (lane_idx == 0 and static_cast<uint64_t>(ub_layout->lsqe_counter) * kNumWQEBBsPerSQESlot > handle::kSQDepth)
+    // Keep the routing plan for cached dispatch. Only URMA needs SQ descriptors.
+    if constexpr (not kLowLatencyTransport) {
+        // Load descriptors while the scalar pipeline copies local payloads.
+        if (thread_idx < kNumRanks and thread_idx != rank_idx)
+            handle::HcommPeerInfo::load_peer_info(
+                ub_layout->peer_info + thread_idx, jetty_ptrs, thread_idx < rank_idx ? thread_idx : thread_idx - 1);
+        if (warp_idx == 1 and kNumRanks > 1) {
+            handle::HcommJettyInfo::load_jetty_info(&ub_layout->jetty_info, jetty_ptrs, vec_core_idx, lane_idx);
+            // Check SQ capacity before releasing other warps to write WQEBBs.
+            if (lane_idx == 0 and static_cast<uint64_t>(ub_layout->lsqe_counter) * kNumWQEBBsPerSQESlot > handle::kSQDepth)
+                __asc_simt_vf::__trap();
+        }
+        asc_syncthreads();
+        if (thread_idx == 0 and kNumRanks > 1 and
+            static_cast<uint32_t>(ub_layout->jetty_info.packed_head) % kSQEBBAlignment != 0)
             __asc_simt_vf::__trap();
     }
-    asc_syncthreads();
-    if (thread_idx == 0 and kNumRanks > 1 and
-        static_cast<uint32_t>(ub_layout->jetty_info.packed_head) % kSQEBBAlignment != 0)
-        __asc_simt_vf::__trap();
 
     if constexpr (not kCachedMode) {
         // scatter rank counts to remote ranks
@@ -322,124 +325,128 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         }
     }
 
-    // Write SQEs
-    static constexpr int kNumWQEBBLanes = handle::kNumWQEBBBytes / sizeof(uint64_t);
-    static constexpr int kNumWriteHeaderLanes = sizeof(AscendC::HcommUrmaSqeCtx) / sizeof(uint64_t);
-    static constexpr int kNumSGEPairLanes = 2 * sizeof(AscendC::HcommUrmaSgeCtx) / sizeof(uint64_t);
-    const int num_sqes = ub_layout->lsqe_counter;
+    if constexpr (not kLowLatencyTransport) {
+        // Write SQEs
+        static constexpr int kNumWQEBBLanes = handle::kNumWQEBBBytes / sizeof(uint64_t);
+        static constexpr int kNumWriteHeaderLanes = sizeof(AscendC::HcommUrmaSqeCtx) / sizeof(uint64_t);
+        static constexpr int kNumSGEPairLanes = 2 * sizeof(AscendC::HcommUrmaSgeCtx) / sizeof(uint64_t);
+        const int num_sqes = ub_layout->lsqe_counter;
 
-    const int num_sqes_per_warp = math::ceil_div(num_sqes, kNumWarps);
-    const int start_lsqe_idx = warp_idx * num_sqes_per_warp;
-    const int end_lsqe_idx = math::min(start_lsqe_idx + num_sqes_per_warp, num_sqes);
-    for (int i = start_lsqe_idx; i < end_lsqe_idx; ++ i) {
-        // Allocate physical SQE
-        int psqe_idx = 0;
-        if (lane_idx == 0)
-            psqe_idx = asc_atomic_add(&ub_layout->psqe_counter, 1);
-        psqe_idx = simt::exchange(psqe_idx, 0);
+        const int num_sqes_per_warp = math::ceil_div(num_sqes, kNumWarps);
+        const int start_lsqe_idx = warp_idx * num_sqes_per_warp;
+        const int end_lsqe_idx = math::min(start_lsqe_idx + num_sqes_per_warp, num_sqes);
+        for (int i = start_lsqe_idx; i < end_lsqe_idx; ++ i) {
+            // Allocate physical SQE
+            int psqe_idx = 0;
+            if (lane_idx == 0)
+                psqe_idx = asc_atomic_add(&ub_layout->psqe_counter, 1);
+            psqe_idx = simt::exchange(psqe_idx, 0);
 
-        // Now we need to know the SGEs' source and destination (rank and slot)
-        // Also, we use `entry_idx` to see whether the SGE is valid
-        EP_STATIC_ASSERT(kNumSGEPairsPerSQE <= warpSize);
-        int entry_idx = -1, dst_rank_idx = -1, dst_slot_idx = -1;
-        if (lane_idx < kNumSGEPairsPerSQE) {
-            const auto global_sge_idx = psqe_idx * kNumSGEPairsPerSQE + lane_idx;
-            entry_idx = ub_layout->sgep_to_entry[global_sge_idx];
-            if (entry_idx >= 0) {
-                dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
-                dst_slot_idx = ub_layout->dst_slot_idx[entry_idx];
+            // Now we need to know the SGEs' source and destination (rank and slot)
+            // Also, we use `entry_idx` to see whether the SGE is valid
+            EP_STATIC_ASSERT(kNumSGEPairsPerSQE <= warpSize);
+            int entry_idx = -1, dst_rank_idx = -1, dst_slot_idx = -1;
+            if (lane_idx < kNumSGEPairsPerSQE) {
+                const auto global_sge_idx = psqe_idx * kNumSGEPairsPerSQE + lane_idx;
+                entry_idx = ub_layout->sgep_to_entry[global_sge_idx];
+                if (entry_idx >= 0) {
+                    dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
+                    dst_slot_idx = ub_layout->dst_slot_idx[entry_idx];
+                }
             }
-        }
 
-        // Create SQE
-        // 48B header + 16B * 12 SGEs <= 4 x 64B WQEBBs
-        // Header uses 6 lanes
-        // SGE pair uses 4 lanes
-        // For example
-        // Lane 6/7: SGE 0, SGEP 0 token data (the token index is from lane 0)
-        //   - ptr = math::advance_ptr(x, token_idx * kHiddenBytes)
-        // Lane 8/9: SGE 1, SGEP 0 token meta (the token index is from lane 0)
-        //   - ptr = math::advance_ptr(metadata_send_buffer, token_idx * token_layout.get_num_bytes(true))
-        // Lane 10/11: SGE 2, SGEP 1 token data (the token index is from lane 1)
-        //   - ptr = math::advance_ptr(x, token_idx * kHiddenBytes)
-        // Lane 12/13: SGE 3, SGEP 1 token meta (the token index is from lane 1)
-        //   - ptr = math::advance_ptr(metadata_send_buffer, token_idx * token_layout.get_num_bytes(true))
-        // ...
-        EP_STATIC_ASSERT(kNumSGEPairsPerSQE == 6);
-        const auto num_sgeps = __reduce_add(entry_idx >= 0);
-        const auto num_sges = num_sgeps * 2;
-        const auto num_wqebbs = math::ceil_div(
-            static_cast<int>(sizeof(AscendC::HcommUrmaSqeCtx) + num_sges * sizeof(AscendC::HcommUrmaSgeCtx)),
-            handle::kNumWQEBBBytes);
-        const auto sqe_dst_rank_idx = simt::exchange(dst_rank_idx, 0);
-        const auto sqe_dst_slot_idx = simt::exchange(dst_slot_idx, 0);
-        const auto peer_info = ub_layout->peer_info + sqe_dst_rank_idx;
-        const auto peer_info_words = reinterpret_cast<__ubuf__ uint64_t*>(peer_info);
-        const auto sgep_idx = lane_idx < kNumWriteHeaderLanes ? 0 :
-            math::min((lane_idx - kNumWriteHeaderLanes) / kNumSGEPairLanes, kNumSGEPairsPerSQE - 1);
-        const auto sgep_entry_idx = simt::exchange(entry_idx, sgep_idx);
+            // Create SQE
+            // 48B header + 16B * 12 SGEs <= 4 x 64B WQEBBs
+            // Header uses 6 lanes
+            // SGE pair uses 4 lanes
+            // For example
+            // Lane 6/7: SGE 0, SGEP 0 token data (the token index is from lane 0)
+            //   - ptr = math::advance_ptr(x, token_idx * kHiddenBytes)
+            // Lane 8/9: SGE 1, SGEP 0 token meta (the token index is from lane 0)
+            //   - ptr = math::advance_ptr(metadata_send_buffer, token_idx * token_layout.get_num_bytes(true))
+            // Lane 10/11: SGE 2, SGEP 1 token data (the token index is from lane 1)
+            //   - ptr = math::advance_ptr(x, token_idx * kHiddenBytes)
+            // Lane 12/13: SGE 3, SGEP 1 token meta (the token index is from lane 1)
+            //   - ptr = math::advance_ptr(metadata_send_buffer, token_idx * token_layout.get_num_bytes(true))
+            // ...
+            EP_STATIC_ASSERT(kNumSGEPairsPerSQE == 6);
+            const auto num_sgeps = __reduce_add(entry_idx >= 0);
+            const auto num_sges = num_sgeps * 2;
+            const auto num_wqebbs = math::ceil_div(
+                static_cast<int>(sizeof(AscendC::HcommUrmaSqeCtx) + num_sges * sizeof(AscendC::HcommUrmaSgeCtx)),
+                handle::kNumWQEBBBytes);
+            const auto sqe_dst_rank_idx = simt::exchange(dst_rank_idx, 0);
+            const auto sqe_dst_slot_idx = simt::exchange(dst_slot_idx, 0);
+            const auto peer_info = ub_layout->peer_info + sqe_dst_rank_idx;
+            const auto peer_info_words = reinterpret_cast<__ubuf__ uint64_t*>(peer_info);
+            const auto sgep_idx = lane_idx < kNumWriteHeaderLanes ? 0 :
+                math::min((lane_idx - kNumWriteHeaderLanes) / kNumSGEPairLanes, kNumSGEPairsPerSQE - 1);
+            const auto sgep_entry_idx = simt::exchange(entry_idx, sgep_idx);
 
-        const auto slot_head =
-            static_cast<uint32_t>(ub_layout->jetty_info.packed_head) +
-            psqe_idx * kNumWQEBBsPerSQESlot;
-        const auto wqebb_head = slot_head + lane_idx / kNumWQEBBLanes;
-        const auto owner_bit = static_cast<uint64_t>((wqebb_head & handle::kSQDepth) == 0) << 31;
-        const auto sq_wqebb_idx = wqebb_head % handle::kSQDepth;
+            const auto slot_head =
+                static_cast<uint32_t>(ub_layout->jetty_info.packed_head) +
+                psqe_idx * kNumWQEBBsPerSQESlot;
+            const auto wqebb_head = slot_head + lane_idx / kNumWQEBBLanes;
+            const auto owner_bit = static_cast<uint64_t>((wqebb_head & handle::kSQDepth) == 0) << 31;
+            const auto sq_wqebb_idx = wqebb_head % handle::kSQDepth;
 
-        uint64_t sqe_word = 0;
-        if (lane_idx == 0) {
-            sqe_word = handle::kWriteSQEHeaderTemplate | owner_bit | static_cast<uint64_t>(sq_wqebb_idx);
-            // Request strong order and CQE for the last physical SQE.
-            if (psqe_idx + 1 == num_sqes)
-                sqe_word |= handle::kWriteSQEFinalFlags;
-        } else if (lane_idx < kNumWriteHeaderLanes) {
-            sqe_word = peer_info_words[lane_idx - 1];
-            if (lane_idx == 1)
-                sqe_word |= static_cast<uint64_t>(num_sges) << 24;  // num_sges
-            if (lane_idx == 5)
-                sqe_word += recv_buffer_offset + static_cast<uint64_t>(sqe_dst_slot_idx) * num_token_bytes;  // remote_addr
-        } else if (lane_idx < kNumWriteHeaderLanes + num_sgeps * kNumSGEPairLanes) {
-            const auto sgep_lane_idx = (lane_idx - kNumWriteHeaderLanes) % kNumSGEPairLanes;
-            const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + sgep_entry_idx / kNumTopk;
-            if (sgep_lane_idx == 0) {
-                sqe_word = static_cast<uint64_t>(num_hidden_bytes);
-            } else if (sgep_lane_idx == 1) {
-                sqe_word = reinterpret_cast<uint64_t>(x) + static_cast<uint64_t>(token_idx) * num_hidden_bytes;
-            } else if (sgep_lane_idx == 2) {
-                sqe_word = static_cast<uint64_t>(num_metadata_bytes);
-            } else {
-                sqe_word = reinterpret_cast<uint64_t>(metadata_send_buffer) +
-                    static_cast<uint64_t>(token_idx) * num_metadata_bytes;
+            uint64_t sqe_word = 0;
+            if (lane_idx == 0) {
+                sqe_word = handle::kWriteSQEHeaderTemplate | owner_bit | static_cast<uint64_t>(sq_wqebb_idx);
+                // Request strong order and CQE for the last physical SQE.
+                if (psqe_idx + 1 == num_sqes)
+                    sqe_word |= handle::kWriteSQEFinalFlags;
+            } else if (lane_idx < kNumWriteHeaderLanes) {
+                sqe_word = peer_info_words[lane_idx - 1];
+                if (lane_idx == 1)
+                    sqe_word |= static_cast<uint64_t>(num_sges) << 24;  // num_sges
+                if (lane_idx == 5)
+                    sqe_word += recv_buffer_offset + static_cast<uint64_t>(sqe_dst_slot_idx) * num_token_bytes;  // remote_addr
+            } else if (lane_idx < kNumWriteHeaderLanes + num_sgeps * kNumSGEPairLanes) {
+                const auto sgep_lane_idx = (lane_idx - kNumWriteHeaderLanes) % kNumSGEPairLanes;
+                const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + sgep_entry_idx / kNumTopk;
+                if (sgep_lane_idx == 0) {
+                    sqe_word = static_cast<uint64_t>(num_hidden_bytes);
+                } else if (sgep_lane_idx == 1) {
+                    sqe_word = reinterpret_cast<uint64_t>(x) + static_cast<uint64_t>(token_idx) * num_hidden_bytes;
+                } else if (sgep_lane_idx == 2) {
+                    sqe_word = static_cast<uint64_t>(num_metadata_bytes);
+                } else {
+                    sqe_word = reinterpret_cast<uint64_t>(metadata_send_buffer) +
+                        static_cast<uint64_t>(token_idx) * num_metadata_bytes;
+                }
+            } else if (lane_idx >= num_wqebbs * kNumWQEBBLanes and lane_idx % kNumWQEBBLanes == 0) {
+                sqe_word = handle::kNopSQEHeaderTemplate | owner_bit | static_cast<uint64_t>(sq_wqebb_idx);
             }
-        } else if (lane_idx >= num_wqebbs * kNumWQEBBLanes and lane_idx % kNumWQEBBLanes == 0) {
-            sqe_word = handle::kNopSQEHeaderTemplate | owner_bit | static_cast<uint64_t>(sq_wqebb_idx);
+
+            // TODO: we can assume SQ depth is power of 2
+            // TODO: some of the expression can use i32
+            asc_stcg(
+                reinterpret_cast<__gm__ uint64_t*>(ub_layout->jetty_info.sq_base_addr) +
+                    static_cast<uint64_t>(sq_wqebb_idx) * kNumWQEBBLanes + lane_idx % kNumWQEBBLanes,
+                sqe_word);
+
+            // TODO(Kexing): `syncthreads` and notify doorbell
+            // NOTES: if you do `syncthreads`, please make sure the `i` iteration count is same
         }
-
-        // TODO: we can assume SQ depth is power of 2
-        // TODO: some of the expression can use i32
-        asc_stcg(
-            reinterpret_cast<__gm__ uint64_t*>(ub_layout->jetty_info.sq_base_addr) +
-                static_cast<uint64_t>(sq_wqebb_idx) * kNumWQEBBLanes + lane_idx % kNumWQEBBLanes,
-            sqe_word);
-
-        // TODO(Kexing): `syncthreads` and notify doorbell
-        // NOTES: if you do `syncthreads`, please make sure the `i` iteration count is same
     }
 
     while (ub_layout->metadata_ready != 1)
         simt::nop<15>();
     asc_syncthreads();
-    const auto num_iters = math::max(0, math::min(kNumMaxTokensPerVecCore, num_tokens - vec_core_idx * kNumMaxTokensPerVecCore));
-    for (int i = warp_idx; i < num_iters; i += kNumWarps) {
-        const auto dst_slot_idx = ub_layout->local_copy_dst_slot_idx[i];
-        if (dst_slot_idx >= 0) {
-            const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + i;
-            const auto src = reinterpret_cast<__gm__ const uint64_t*>(metadata_send_buffer + static_cast<int64_t>(token_idx) * num_metadata_bytes);
-            const auto dst = reinterpret_cast<__gm__ uint64_t*>(
-                reinterpret_cast<uint64_t>(&workspace_layout.get_common_signals()) + recv_buffer_offset +
-                static_cast<uint64_t>(dst_slot_idx) * num_token_bytes + num_hidden_bytes);
-            for (int word_idx = lane_idx; word_idx < num_metadata_bytes / sizeof(uint64_t); word_idx += warpSize)
-                asc_stcg(dst + word_idx, src[word_idx]);
+    if constexpr (not kLowLatencyTransport) {
+        const auto num_iters = math::max(0, math::min(kNumMaxTokensPerVecCore, num_tokens - vec_core_idx * kNumMaxTokensPerVecCore));
+        for (int i = warp_idx; i < num_iters; i += kNumWarps) {
+            const auto dst_slot_idx = ub_layout->local_copy_dst_slot_idx[i];
+            if (dst_slot_idx >= 0) {
+                const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + i;
+                const auto src = reinterpret_cast<__gm__ const uint64_t*>(metadata_send_buffer + static_cast<int64_t>(token_idx) * num_metadata_bytes);
+                const auto dst = reinterpret_cast<__gm__ uint64_t*>(
+                    reinterpret_cast<uint64_t>(&workspace_layout.get_common_signals()) + recv_buffer_offset +
+                    static_cast<uint64_t>(dst_slot_idx) * num_token_bytes + num_hidden_bytes);
+                for (int word_idx = lane_idx; word_idx < num_metadata_bytes / sizeof(uint64_t); word_idx += warpSize)
+                    asc_stcg(dst + word_idx, src[word_idx]);
+            }
         }
     }
 
@@ -550,7 +557,7 @@ template <int kNumRanks, int kNumExperts, int kNumTopk,
           int kExpertAlignment, bool kCachedMode, bool kDoCPUSync,
           int kNumVecCores,
           int kNumHiddenBytes, int kNumSFPacks, int kNumMaxTokensPerRank, int kNumUbBytes,
-          int64_t kNumTimeoutCycles, bool kDoBarrier = false,
+          int64_t kNumTimeoutCycles, bool kDoBarrier = false, bool kLowLatencyTransport = false,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumJetties = kNumVecCores,
           int kNumSGEPairsPerSQE = 6>
@@ -583,6 +590,9 @@ __global__ __vector__ void dispatch_impl(
     EP_STATIC_ASSERT(kNumSGEPairsPerSQE <= handle::kNumMaxSGEPairsPerSQE);
     EP_STATIC_ASSERT(kNumRanks <= reduction::kReductionMaxHighCount and kNumVecCores <= reduction::kReductionMaxHighCount,
                      "Reduction arrival count exceeds 8 bits");
+    EP_STATIC_ASSERT(kDispatchReductionMaxArrivals == reduction::kReductionMaxHighCount and
+                     kDispatchReductionMaxValue == reduction::kReductionMaxLowCount,
+                     "Direct dispatch host reduction bounds differ from the device encoding");
     EP_STATIC_ASSERT(static_cast<int64_t>(kNumMaxTokensPerRank) * kNumRanks <= reduction::kReductionMaxLowCount,
                      "Per-expert token count exceeds the 24-bit reduction value");
     EP_STATIC_ASSERT(not kDoCPUSync or math::align<int64_t>(
@@ -622,19 +632,32 @@ __global__ __vector__ void dispatch_impl(
 
     // Assign unified buffer
     using ub_layout_t = DispatchUBLayout<kNumExperts, kNumRanks, kNumMaxTokensPerVecCore * kNumTopk, kNumMaxTokensPerVecCore>;
+    EP_STATIC_ASSERT(sizeof(ub_layout_t) == get_dispatch_routing_workspace_bytes(
+                         kNumRanks, kNumExperts, kNumMaxTokensPerVecCore, kNumTopk),
+                     "Direct dispatch host routing workspace differs from the device layout");
+    EP_STATIC_ASSERT(get_dispatch_token_bytes(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, kCachedMode) ==
+                         layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes(),
+                     "Direct dispatch host token stride differs from the native layout");
     using ub_layout_with_buffer_t = UBLayoutWithBuffer<ub_layout_t, kNumHiddenBytes, kNumSFPacks,
         kNumTopk, kNumMaxTokensPerVecCore, kNumUbBytes, kCachedMode>;
     EP_STATIC_ASSERT(sizeof(ub_layout_with_buffer_t) <= kNumUbBytes, "Dispatch buffers exceed UB capacity");
     constexpr auto kNumMetadataMTEStages = ub_layout_with_buffer_t::kNumMetadataMTEStages;
     constexpr auto kNumHiddenMTEStages = ub_layout_with_buffer_t::kNumHiddenMTEStages;
     constexpr auto kNumTokensPerMetadataMTE = ub_layout_with_buffer_t::kNumTokensPerMetadataMTE;
+    constexpr bool kKeepMetadataInUB = kLowLatencyTransport and kNumSFPacks == 0 and
+        kNumMetadataMTEStages * kNumTokensPerMetadataMTE >= kNumMaxTokensPerVecCore;
+    constexpr auto kDirectTokenBytes = get_dispatch_token_bytes(kNumHiddenBytes, 0, kNumTopk, kCachedMode);
+    constexpr bool kPackDirectTokens = kKeepMetadataInUB and kNumRanks == 16 and
+        kNumMaxTokensPerRank >= 32 and kNumMaxTokensPerRank <= 256 and
+        kNumMaxTokensPerVecCore <= kNumTokensPerMetadataMTE and
+        kNumMaxTokensPerVecCore * kDirectTokenBytes <= sizeof(ub_layout_with_buffer_t::hidden);
     const auto ub = reinterpret_cast<__ubuf__ ub_layout_with_buffer_t*>(0);
     const auto ub_layout = &ub->workspace;
     const auto metadata_token_layout = layout::TokenLayout(
-        0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode);
+        kPackDirectTokens ? kNumHiddenBytes : 0, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode);
     const auto ub_metadata_buffer = layout::BufferLayout(
         metadata_token_layout, kNumMetadataMTEStages, kNumTokensPerMetadataMTE,
-        math::advance_ptr<void>(ub->metadata, 0)
+        kPackDirectTokens ? math::advance_ptr<void>(ub->hidden, 0) : math::advance_ptr<void>(ub->metadata, 0)
     );
 
     // Barrier before dispatch
@@ -668,7 +691,8 @@ __global__ __vector__ void dispatch_impl(
         // TODO(HUAWEI): launching this VF costs 0.5 us, which is slow
         asc_vf_call<
             simt_persistent_worker<kNumMaxTokensPerRank, kNumRanks, kNumExperts, kNumTopk, kExpertAlignment, kCachedMode, kDoCPUSync,
-                                   kNumVecCores, kNumThreads, kNumSGEPairsPerSQE, kNumTimeoutCycles>>(
+                                   kNumVecCores, kNumThreads, kNumSGEPairsPerSQE, kNumTimeoutCycles,
+                                   kLowLatencyTransport>>(
             dim3(kNumThreads, 1, 1),
             workspace_layout, host_workspace_layout, ub_layout,
             static_cast<__gm__ const uint8_t*>(x), metadata_send_buffer,
@@ -685,13 +709,23 @@ __global__ __vector__ void dispatch_impl(
 
     auto preload_metadata = [&](const int token_idx, const int stage_idx) __aicore__ {
         const auto ub_metadata = ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE);
-        const auto num_metadata_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
+        const auto ub_token_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
         const auto num_tokens_in_stage = math::min(
             kNumTokensPerMetadataMTE,
             math::max(0, math::min(num_tokens, (vec_core_idx + 1) * kNumMaxTokensPerVecCore) - token_idx));
 
-        // Copy metadata within this AIV's contiguous token range
+        // Load this AIV's contiguous token range at the selected UB pitch.
         asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
+        if constexpr (kPackDirectTokens) {
+            asc_copy_gm2ub_align(
+                ub_metadata.template get_hidden_ptr<__ubuf__ uint8_t>(),
+                math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
+                /* n_burst= */ static_cast<uint16_t>(num_tokens_in_stage), /* len_burst= */ kNumHiddenBytes,
+                /* left_padding_num= */ 0, /* right_padding_num= */ 0, /* enable_constant_pad= */ false,
+                /* l2_cache_mode= */ asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                /* src_stride= */ static_cast<uint64_t>(kNumHiddenBytes), /* dst_stride= */ ub_token_bytes
+            );
+        }
         if constexpr (kNumSFPacks > 0) {
             const auto gm_sf = math::advance_ptr<__gm__ sf_pack_t>(
                 sf, static_cast<int64_t>(token_idx) * sf_token_stride * sizeof(sf_pack_t));
@@ -704,13 +738,13 @@ __global__ __vector__ void dispatch_impl(
                     /* enable_constant_pad= */ false,
                     /* l2_cache_mode= */ static_cast<uint8_t>(LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV),
                     /* src_stride= */ static_cast<uint64_t>(sf_token_stride) * sizeof(sf_pack_t),
-                    /* dst_stride= */ num_metadata_bytes
+                    /* dst_stride= */ ub_token_bytes
                 );
             } else {
                 const nddma_desc sf_desc(
                     nddma_desc::loop_desc(
                         static_cast<uint32_t>(num_tokens_in_stage),
-                        num_metadata_bytes / sizeof(sf_pack_t),
+                        ub_token_bytes / sizeof(sf_pack_t),
                         static_cast<uint32_t>(sf_token_stride)),
                     nddma_desc::loop_desc(
                         kNumSFPacks, 1, static_cast<uint32_t>(sf_hidden_stride))
@@ -732,7 +766,7 @@ __global__ __vector__ void dispatch_impl(
                 /* enable_constant_pad= */ false,
                 /* l2_cache_mode= */ static_cast<uint8_t>(LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV),
                 /* src_stride= */ static_cast<uint64_t>(kNumTopk) * sizeof(int64_t),
-                /* dst_stride= */ num_metadata_bytes
+                /* dst_stride= */ ub_token_bytes
             );
         }
         if (topk_weights != nullptr) {
@@ -744,7 +778,7 @@ __global__ __vector__ void dispatch_impl(
                 /* enable_constant_pad= */ false,
                 /* l2_cache_mode= */ static_cast<uint8_t>(LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV),
                 /* src_stride= */ static_cast<uint64_t>(kNumTopk) * sizeof(float),
-                /* dst_stride= */ num_metadata_bytes
+                /* dst_stride= */ ub_token_bytes
             );
         }
         asc_sync_notify(PIPE_MTE2, PIPE_S, static_cast<event_t>(stage_idx));
@@ -777,16 +811,19 @@ __global__ __vector__ void dispatch_impl(
                 *ub_metadata.template get_src_token_global_idx_ptr<__ubuf__ int>() = rank_idx * kNumMaxTokensPerRank + token_idx;
             }
         }
-        const auto first_token_idx = vec_core_idx * kNumMaxTokensPerVecCore + first_metadata_idx;
-        const auto num_metadata_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
         asc_sync_notify(PIPE_S, PIPE_MTE3, static_cast<event_t>(stage_idx));
         asc_sync_wait(PIPE_S, PIPE_MTE3, static_cast<event_t>(stage_idx));
-        asc_copy_ub2gm_align(
-            metadata_send_buffer + static_cast<int64_t>(first_token_idx) * num_metadata_bytes,
-            ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE).template get_base_ptr<__ubuf__ uint8_t>(),
-            static_cast<uint16_t>(num_tokens_in_stage), num_metadata_bytes,
-            asc_store_l2_cache_mode::NOTALLOC_CLEAN,
-            static_cast<uint64_t>(num_metadata_bytes), num_metadata_bytes);
+        if constexpr (not kKeepMetadataInUB) {
+            const auto first_token_idx = vec_core_idx * kNumMaxTokensPerVecCore + first_metadata_idx;
+            const auto num_metadata_bytes = static_cast<uint32_t>(metadata_token_layout.get_num_bytes());
+            asc_copy_ub2gm_align(
+                metadata_send_buffer + static_cast<int64_t>(first_token_idx) * num_metadata_bytes,
+                ub_metadata_buffer.get_token_buffer(stage_idx * kNumTokensPerMetadataMTE).template get_base_ptr<__ubuf__ uint8_t>(),
+                /* n_burst= */ static_cast<uint16_t>(num_tokens_in_stage), /* len_burst= */ num_metadata_bytes,
+                /* l2_cache_mode= */ asc_store_l2_cache_mode::NOTALLOC_CLEAN,
+                /* dst_stride= */ static_cast<uint64_t>(num_metadata_bytes), /* src_stride= */ num_metadata_bytes
+            );
+        }
         asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
         const auto next_batch_idx = batch_idx + kNumMetadataMTEStages;
         if (next_batch_idx < num_metadata_batches)
@@ -801,44 +838,124 @@ __global__ __vector__ void dispatch_impl(
     while (ub_layout->local_copy_ready != 1)
         asm volatile("nop");
 
-    for (int stage_idx = 0; stage_idx < kNumHiddenMTEStages; ++ stage_idx)
-        asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
+    const auto get_remote_token = [&](int dst_rank_idx, int dst_slot_idx) __aicore__ {
+        const auto local_slot = recv_buffer.get_token_buffer(dst_slot_idx);
+        return layout::get_sym_ptr(workspace_layout.get_common_signals(),
+                                   local_slot.template get_hidden_ptr<__gm__ uint8_t>(), dst_rank_idx);
+    };
 
-    int hidden_stage_idx = 0;
-    for (int i = 0; i < num_tokens_for_vec_core; ++ i) {
-        const auto dst_slot_idx = ub_layout->local_copy_dst_slot_idx[i];
-        if (dst_slot_idx >= 0) {
+    if constexpr (kPackDirectTokens) {
+        for (int i = 0; i < num_tokens_for_vec_core; ++ i) {
+            const auto packet = ub_metadata_buffer.get_token_buffer(i).template get_hidden_ptr<__ubuf__ uint8_t>();
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const auto entry_idx = i * kNumTopk + k;
+                const auto dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
+                if (dst_rank_idx >= 0)
+                    asc_copy_ub2gm_align(get_remote_token(dst_rank_idx, ub_layout->dst_slot_idx[entry_idx]), packet,
+                                         1, static_cast<uint32_t>(kDirectTokenBytes),
+                                         asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
+            }
+        }
+        asc_sync_notify(PIPE_MTE3, PIPE_S, EVENT_ID0);
+        asc_sync_wait(PIPE_MTE3, PIPE_S, EVENT_ID0);
+    } else if constexpr (kLowLatencyTransport) {
+        // Resident metadata is indexed by token. Streamed metadata reuses each
+        // stage once MTE3 finishes copying the token to all destinations.
+        constexpr auto kNumMTEStages = math::min(
+            math::min(kNumHiddenMTEStages, kNumMetadataMTEStages * kNumTokensPerMetadataMTE),
+            kNumMaxTokensPerVecCore);
+        constexpr auto kMetadataBytes = static_cast<uint32_t>(ub_layout_with_buffer_t::kNumMetadataTokenBytes);
+        EP_STATIC_ASSERT(kNumMTEStages > 0 and kNumMTEStages <= 8, "Insufficient direct dispatch events");
+        EP_STATIC_ASSERT(kNumMTEStages * kMetadataBytes <= sizeof(ub->metadata), "Direct metadata stages exceed UB capacity");
+        EP_STATIC_ASSERT(not kKeepMetadataInUB or static_cast<int64_t>(kNumMaxTokensPerVecCore) * kMetadataBytes <= sizeof(ub->metadata),
+                         "Resident metadata exceeds UB capacity");
+        for (int stage_idx = 0; stage_idx < kNumMTEStages; ++ stage_idx)
+            asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
+        int stage_idx = 0;
+        for (int i = 0; i < num_tokens_for_vec_core; ++ i) {
+            bool has_destination = false;
+            for (int k = 0; k < kNumTopk; ++ k)
+                has_destination |= ub_layout->dst_rank_idx[i * kNumTopk + k] >= 0;
+            if (not has_destination)
+                continue;
+
             const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + i;
-            const auto ub_hidden = ub->hidden[hidden_stage_idx];
-
-            // Copy token data into UB
-            asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(hidden_stage_idx));
+            const auto ub_hidden = ub->hidden[stage_idx];
+            const auto ub_metadata = math::advance_ptr<__ubuf__ uint8_t>(
+                ub->metadata, static_cast<int64_t>(kKeepMetadataInUB ? i : stage_idx) * kMetadataBytes);
+            const auto event_idx = static_cast<event_t>(stage_idx);
+            asc_sync_wait(PIPE_MTE3, PIPE_MTE2, event_idx);
             asc_copy_gm2ub_align(
                 ub_hidden,
                 math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
-                /* n_burst= */ 1, /* len_burst= */ kNumHiddenBytes,
-                /* left_padding_num= */ 0, /* right_padding_num= */ 0,
-                /* enable_constant_pad= */ false,
-                /* l2_cache_mode= */ asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
-                /* src_gap= */ 0, /* dst_gap= */ 0
-            );
-            asc_sync_notify(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(hidden_stage_idx));
+                1, kNumHiddenBytes, 0, 0, false,
+                asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, 0, 0);
+            if constexpr (not kKeepMetadataInUB) {
+                asc_copy_gm2ub_align(
+                    ub_metadata, metadata_send_buffer + static_cast<int64_t>(token_idx) * kMetadataBytes,
+                    1, kMetadataBytes, 0, 0, false,
+                    asc_load_l2_cache_mode::NOTALLOC_KEEP, 0, 0);
+            }
+            asc_sync_notify(PIPE_MTE2, PIPE_MTE3, event_idx);
+            asc_sync_wait(PIPE_MTE2, PIPE_MTE3, event_idx);
 
-            // Copy token data into the local receive buffer
-            asc_sync_wait(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(hidden_stage_idx));
-            asc_copy_ub2gm_align(
-                recv_buffer.get_token_buffer(dst_slot_idx).template get_hidden_ptr<__gm__ uint8_t>(),
-                ub_hidden,
-                /* n_burst= */ 1, /* len_burst= */ kNumHiddenBytes,
-                /* l2_cache_mode= */ asc_store_l2_cache_mode::NOTALLOC_CLEAN,
-                /* dst_gap= */ 0, /* src_gap= */ 0
-            );
-            asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(hidden_stage_idx));
-            hidden_stage_idx = (hidden_stage_idx + 1) % kNumHiddenMTEStages;
+            // The routing plan contains one slot per destination rank.
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const auto entry_idx = i * kNumTopk + k;
+                const auto dst_rank_idx = ub_layout->dst_rank_idx[entry_idx];
+                if (dst_rank_idx < 0)
+                    continue;
+                const auto remote_hidden = get_remote_token(dst_rank_idx, ub_layout->dst_slot_idx[entry_idx]);
+                asc_copy_ub2gm_align(remote_hidden, ub_hidden, 1, kNumHiddenBytes,
+                                     asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
+                asc_copy_ub2gm_align(remote_hidden + kNumHiddenBytes, ub_metadata, 1, kMetadataBytes,
+                                     asc_store_l2_cache_mode::NOTALLOC_CLEAN, 0, 0);
+            }
+            asc_sync_notify(PIPE_MTE3, PIPE_MTE2, event_idx);
+            stage_idx = (stage_idx + 1) % kNumMTEStages;
         }
+        for (int i = 0; i < kNumMTEStages; ++ i)
+            asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(i));
+    } else {
+        for (int stage_idx = 0; stage_idx < kNumHiddenMTEStages; ++ stage_idx)
+            asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
+
+        int hidden_stage_idx = 0;
+        for (int i = 0; i < num_tokens_for_vec_core; ++ i) {
+            const auto dst_slot_idx = ub_layout->local_copy_dst_slot_idx[i];
+            if (dst_slot_idx >= 0) {
+                const auto token_idx = vec_core_idx * kNumMaxTokensPerVecCore + i;
+                const auto ub_hidden = ub->hidden[hidden_stage_idx];
+
+                // Copy token data into UB
+                asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(hidden_stage_idx));
+                asc_copy_gm2ub_align(
+                    ub_hidden,
+                    math::advance_ptr<__gm__ uint8_t>(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
+                    /* n_burst= */ 1, /* len_burst= */ kNumHiddenBytes,
+                    /* left_padding_num= */ 0, /* right_padding_num= */ 0,
+                    /* enable_constant_pad= */ false,
+                    /* l2_cache_mode= */ asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                    /* src_gap= */ 0, /* dst_gap= */ 0
+                );
+                asc_sync_notify(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(hidden_stage_idx));
+
+                // Copy token data into the local receive buffer
+                asc_sync_wait(PIPE_MTE2, PIPE_MTE3, static_cast<event_t>(hidden_stage_idx));
+                asc_copy_ub2gm_align(
+                    recv_buffer.get_token_buffer(dst_slot_idx).template get_hidden_ptr<__gm__ uint8_t>(),
+                    ub_hidden,
+                    /* n_burst= */ 1, /* len_burst= */ kNumHiddenBytes,
+                    /* l2_cache_mode= */ asc_store_l2_cache_mode::NOTALLOC_CLEAN,
+                    /* dst_gap= */ 0, /* src_gap= */ 0
+                );
+                asc_sync_notify(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(hidden_stage_idx));
+                hidden_stage_idx = (hidden_stage_idx + 1) % kNumHiddenMTEStages;
+            }
+        }
+        for (int stage_idx = 0; stage_idx < kNumHiddenMTEStages; ++ stage_idx)
+            asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
     }
-    for (int stage_idx = 0; stage_idx < kNumHiddenMTEStages; ++ stage_idx)
-        asc_sync_wait(PIPE_MTE3, PIPE_MTE2, static_cast<event_t>(stage_idx));
     asc_sync_notify(PIPE_MTE2, PIPE_S, EVENT_ID0);
     asc_sync_wait(PIPE_MTE2, PIPE_S, EVENT_ID0);
 
@@ -846,19 +963,22 @@ __global__ __vector__ void dispatch_impl(
     // TODO: ring DB overlappingly
     asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
     asc_sync_wait(PIPE_V, PIPE_S, EVENT_ID0);
-    if constexpr (kNumRanks > 1)
-        EP_DEVICE_ASSERT(kNumMaxSQEs * kNumWQEBBsPerSQESlot <= handle::kSQDepth);
-    const auto num_sqes = ub_layout->lsqe_counter;
-    if (num_sqes > 0) {
-        jetty.advance_sq(num_sqes * kNumWQEBBsPerSQESlot);
-        EP_DEVICE_ASSERT(static_cast<uint32_t>(ub_layout->jetty_info.packed_head) % kSQEBBAlignment == 0);
-        jetty.ring_doorbell();
+    if constexpr (not kLowLatencyTransport) {
+        if constexpr (kNumRanks > 1)
+            EP_DEVICE_ASSERT(kNumMaxSQEs * kNumWQEBBsPerSQESlot <= handle::kSQDepth);
+        const auto num_sqes = ub_layout->lsqe_counter;
+        if (num_sqes > 0) {
+            jetty.advance_sq(num_sqes * kNumWQEBBsPerSQESlot);
+            EP_DEVICE_ASSERT(static_cast<uint32_t>(ub_layout->jetty_info.packed_head) % kSQEBBAlignment == 0);
+            jetty.ring_doorbell();
+        }
     }
 
-    // benchmark only: wait for all urma traffic to measure URMA latency
+    // Drain URMA writes before publishing completion at the barrier.
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores, kNumJetties>(
+            kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores,
+            kLowLatencyTransport ? 0 : kNumJetties>(
                 workspace_layout.get_common_signals(), vec_core_idx, jetty_ptrs);
 }
 

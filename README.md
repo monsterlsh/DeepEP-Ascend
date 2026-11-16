@@ -6,6 +6,8 @@
 
 ## Performance
 
+The following prefill measurements predate the decode transport described under [Automatic decode transport in EPBuffer](#automatic-decode-transport-in-epbuffer).
+
 Measured on Ascend 950DT NPUs with CANN 9.2.0 and the manually configured PoC HDK described under [Recommended HDK and firmware](#recommended-hdk-and-firmware). All measurements use netlayer 1, the supernode's external Clos network.
 
 The following runs use 16,384 tokens/rank capacity, hidden size 7168, top-6 routing over 256 experts, 32 AI cores / 64 AIVs, expert alignment 128 and no bias. Dispatch uses FP8 with row-major scales; combine uses BF16. Each rank uses 10 warmups and 50 samples with cache flushing.
@@ -28,12 +30,18 @@ Bandwidth ranges cover all ranks, using timings that include issue and drain but
 - Ascend 950 (A5) with UBMEM connectivity and UBC_CTP/URMA channels between the participating ranks.
 - An even number of ranks for multi-rank communication.
 - CANN with Ascend C, the Bisheng compiler, HCCL and HCOMM headers/libraries.
-- Python 3.10 or newer, a matching PyTorch/`torch_npu` installation, and NumPy for the tests.
-- A C++20 compiler and standard library supporting `std::format`.
+- Python 3.10 or newer, matching CPU-build PyTorch/`torch_npu` packages, and NumPy for the tests.
+- A C++20 compiler and standard library supporting `std::format`. For GCC/libstdc++, use GCC 13 or newer with matching development headers and runtime libraries ([GCC 13 release notes](https://gcc.gnu.org/gcc-13/changes.html)).
+- elfutils development headers, including `elfutils/libdwfl.h`, for DeepJIT's host-side exception handling.
 
 The validated stack is Ascend 950DT, CANN 9.2.0, Python 3.12, PyTorch 2.13.0+cpu and torch_npu 2.13.0rc1, with the PoC HDK configuration described below. Kernel support on other Ascend generations or CANN versions has not been established by these measurements.
 
 Installation builds the host extension; device kernels are compiled on first use. Keep the CANN toolkit and Bisheng available at runtime. Set `ASCEND_HOME_PATH` to the active CANN installation, or use `ASCEND_TOOLKIT_HOME`.
+
+Use the CPU build of PyTorch with `torch_npu`. In the Python 3.11 build check,
+PyTorch `2.12.0+cu130` and `torch_npu 2.12.0.post1` failed during import because
+both registered the same allocator configuration keys. Using `2.12.0+cpu`
+resolved that failure; disabling backend autoload alone did not.
 
 ### Recommended HDK and firmware
 
@@ -42,6 +50,29 @@ Use Huawei's Q3 commercial HDK release for Atlas 850E when it becomes publicly a
 The performance results in this README were collected using a PoC HDK supplied to DeepSeek, with additional manual configuration. That configuration is not a publicly distributed release. Users on earlier PoC versions may observe lower bandwidth and should first check their HDK version and configuration. Use the Q3 commercial release, once available, as the recommended public deployment baseline; these measurements are not results from that unreleased commercial version.
 
 ### Installation
+
+Install the elfutils development packages in the host or container where you build the extension. On Ubuntu/Debian:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y libdw-dev libelf-dev
+```
+
+On openEuler/Fedora/RHEL, use the corresponding packages:
+
+```bash
+sudo dnf install -y elfutils-devel elfutils-libelf-devel
+```
+
+On openEuler 24.03 LTS SP4, enable [GCC Toolset 14](https://docs.openeuler.org/zh/docs/25.03/server/development/gcc/gcc-14-secondary-version-compilation-toolchain-user-guide.html) for C++20 `<format>` support. The C++ package in the [SP4 aarch64 repository](https://repo.openeuler.org/openEuler-24.03-LTS-SP4/everything/aarch64/Packages/) is named `gcc-toolset-14-gcc-c++`:
+
+```bash
+sudo dnf install -y gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ \
+    gcc-toolset-14-binutils gcc-toolset-14-libstdc++-devel
+source /opt/openEuler/gcc-toolset-14/enable
+export CC=/opt/openEuler/gcc-toolset-14/root/usr/bin/gcc
+export CXX=/opt/openEuler/gcc-toolset-14/root/usr/bin/g++
+```
 
 Activate the CANN environment and install the matching PyTorch/`torch_npu` packages first, then:
 
@@ -63,7 +94,7 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues |
+| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and native MTE transport for eligible decode dispatch and combine |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
@@ -194,6 +225,62 @@ output, _ = pending.wait()
 ```
 
 Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on their returned events in the same way. See [EP tests](tests/ep/test_ep.py) for complete examples.
+
+## Automatic decode transport in EPBuffer
+
+The native EP interface can select MTE for the following decode workload:
+
+- Ascend950DT_9582 on A5, 32 AI cores (64 vector cores), 216 KiB of UB per vector core
+  and the default 100-second device timeout.
+- EP8, EP16 or EP32, with a common integer capacity `M` from 1 through 256.
+  Rank `r` in the EP group supplies `max(1, M - r)` tokens.
+- BF16 activations, hidden size 7168, top-8 routing over 128 experts, expert alignment 128.
+  Dispatch uses FP32 routing weights, expanded output, zero padding, an asynchronous deferred
+  epilogue and no host count sync, cumulative stats or deterministic sorting. Combine returns
+  the weight side channel and sums the expert outputs with no bias.
+
+Dispatch uses MTE to write each token into the destination rank's registered EP communication
+buffer. The native copy epilogue and cached handle use the same token layout as URMA. The
+table gives the largest eligible capacity for each dispatch mode. Other dispatches use URMA.
+
+| EP | Prologue barrier, fresh | Prologue barrier, cached | Epilogue barrier (default), fresh | Epilogue barrier (default), cached |
+|---|---:|---:|---:|---:|
+| 8 | 256 | 256 | 16 | 8 |
+| 16 | 32 | 16 | 16 | — |
+| 32 | 64 | 32 | 16 | — |
+
+Combine selects its transport independently of the dispatch kernel on a compatible handle:
+
+| EP | Capacities using MTE on every rank | Capacities using MTE on selected ranks |
+|---|---|---|
+| 8 | 1–32 | M=64 on ranks 4–7 |
+| 16 | 1–16 | M=32 on rank 15 |
+| 32 | — | — |
+
+The remaining ranks and capacities use native URMA. For a candidate shape, ranks exchange
+their eligibility on a separate HCCL stream before choosing a transport. This adds a host
+wait on the control stream. A batch distribution outside the specified pattern selects URMA for the group.
+Both fresh and cached handles support the two barrier placements. Collective graph capture
+uses native URMA and requires the same capture and replay order across ranks.
+
+Dispatch and combine both use the communication buffer allocated by `EPBuffer` and registered
+with HCCL. Complete a deferred epilogue with `event.current_stream_wait()` before reusing
+or destroying the buffer.
+
+Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to use URMA for dispatch and combine.
+`EP_MTE_BS_THRESHOLD` can further reduce the combine limits. Use the same settings on all ranks.
+
+For decode calls that return routing weights, pass the `recv_weights` from
+`EPBuffer.dispatch` to `EPBuffer.combine` as `topk_weights`. Combine returns
+these weights in the original token order. The expert computation applies the
+weights to its outputs once, as in [Dispatch and combine](#dispatch-and-combine).
+Run the [EP8 decode test](tests/ep/test_ep_decode_portable.py) with the same command on NVIDIA and Ascend:
+
+```bash
+python tests/ep/test_ep_decode_portable.py --num-processes 8
+```
+
+The [compatibility test guide](tests/ep/README.compat.md) also shows how to verify the selected Ascend transport with a device trace.
 
 ## Other buffer interfaces
 
