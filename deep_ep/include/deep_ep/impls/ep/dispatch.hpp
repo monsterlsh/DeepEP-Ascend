@@ -17,6 +17,7 @@
 #include <deep_ep/common/reduction.hpp>
 #include <deep_ep/common/simt.hpp>
 #include <deep_ep/impls/ep/dispatch_direct_layout.hpp>
+#include <deep_ep/impls/ep/dispatch_relay.hpp>
 
 namespace deep_ep {
 
@@ -76,7 +77,7 @@ template <int kNumMaxTokensPerRank,
           int kNumRanks, int kNumExperts, int kNumTopk, int kExpertAlignment,
           bool kCachedMode, bool kDoCPUSync, int kNumVecCores, int kNumThreads,
           int kNumSGEPairsPerSQE,
-          int64_t kNumTimeoutCycles, bool kLowLatencyTransport = false,
+          int64_t kNumTimeoutCycles, bool kLowLatencyTransport = false, bool kServerRelay = false,
           int kNumExpertsPerRank = kNumExperts / kNumRanks,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumWarps = kNumThreads / warpSize,
@@ -93,7 +94,8 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
     __gm__ int* dst_buffer_slot_idx, __gm__ int* dst_gsge_idx,
     const uint64_t recv_buffer_offset,
     const int num_hidden_bytes, const int num_metadata_bytes, const int num_token_bytes,
-    const int num_tokens, const int vec_core_idx, const int rank_idx) {
+    const int num_tokens, const int vec_core_idx, const int rank_idx,
+    __gm__ const int* server_ids, __gm__ int* relay_slots) {
     // Indices
     // TODO: try intrinsics
     // TODO: reshuffling, but also ensure coalescing
@@ -292,6 +294,14 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumThreads) void simt_persistent_worke
         }
     }
     asc_syncthreads();
+    if constexpr (kServerRelay) {
+        const int local_tokens = math::min(kNumMaxTokensPerVecCore, num_tokens - vec_core_idx * kNumMaxTokensPerVecCore);
+        for (int i = thread_idx; i < local_tokens; i += kNumThreads)
+            publish_dispatch_relay_slots<kNumTopk, kNumMaxTokensPerRank>(
+                ub_layout, workspace_layout.get_common_signals(), server_ids, relay_slots, rank_idx, i);
+        asc_threadfence();
+        asc_syncthreads();
+    }
     if (thread_idx == 0)
         ub_layout->local_copy_ready = 1;
 
@@ -557,7 +567,7 @@ template <int kNumRanks, int kNumExperts, int kNumTopk,
           int kExpertAlignment, bool kCachedMode, bool kDoCPUSync,
           int kNumVecCores,
           int kNumHiddenBytes, int kNumSFPacks, int kNumMaxTokensPerRank, int kNumUbBytes,
-          int64_t kNumTimeoutCycles, bool kDoBarrier = false, bool kLowLatencyTransport = false,
+          int64_t kNumTimeoutCycles, bool kDoBarrier = false, bool kLowLatencyTransport = false, bool kServerRelay = false,
           int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores),
           int kNumJetties = kNumVecCores,
           int kNumSGEPairsPerSQE = 6>
@@ -574,13 +584,15 @@ __global__ __vector__ void dispatch_impl(
     const int rank_idx,
     const int num_tokens,
     const int sf_token_stride,
-    const int sf_hidden_stride) {
+    const int sf_hidden_stride,
+    __gm__ const int* server_ids, __gm__ int* relay_slots) {
     // TODO(HUAWEI): kernel launch & init SoC cost 1.9 us, which is slow
     AscendC::InitSocState();
 
     // Checks
     // NOTES: the one-to-many-rank Jetty is private for this vector core
     EP_STATIC_ASSERT(kNumRanks <= kNumMaxRanks);
+    EP_STATIC_ASSERT(not kServerRelay or kLowLatencyTransport);
     EP_STATIC_ASSERT(kNumExperts % kNumRanks == 0);
     EP_STATIC_ASSERT(math::is_power_of_2(kExpertAlignment));
     EP_STATIC_ASSERT(kNumVecCores > 0);
@@ -593,14 +605,12 @@ __global__ __vector__ void dispatch_impl(
     EP_STATIC_ASSERT(kDispatchReductionMaxArrivals == reduction::kReductionMaxHighCount and
                      kDispatchReductionMaxValue == reduction::kReductionMaxLowCount,
                      "Direct dispatch host reduction bounds differ from the device encoding");
-    EP_STATIC_ASSERT(static_cast<int64_t>(kNumMaxTokensPerRank) * kNumRanks <= reduction::kReductionMaxLowCount,
+    static constexpr int64_t kMaxExpertRows = get_dispatch_max_expert_rows(kNumRanks, kNumMaxTokensPerRank, kNumTopk);
+    EP_STATIC_ASSERT(kMaxExpertRows <= reduction::kReductionMaxLowCount,
                      "Per-expert token count exceeds the 24-bit reduction value");
-    EP_STATIC_ASSERT(not kDoCPUSync or math::align<int64_t>(
-                         static_cast<int64_t>(kNumMaxTokensPerRank) * kNumRanks, kExpertAlignment) <= reduction::kReductionMaxLowCount,
+    EP_STATIC_ASSERT(not kDoCPUSync or math::align<int64_t>(kMaxExpertRows, kExpertAlignment) <= reduction::kReductionMaxLowCount,
                      "Aligned expert count exceeds the 24-bit host notification value");
-    EP_STATIC_ASSERT(math::align<int64_t>(
-                         static_cast<int64_t>(kNumMaxTokensPerRank) * kNumRanks * math::min(kNumTopk, kNumExperts / kNumRanks) +
-                         static_cast<int64_t>(kExpertAlignment - 1) * (kNumExperts / kNumRanks), kExpertAlignment) <= INT_MAX,
+    EP_STATIC_ASSERT(get_dispatch_max_expanded_rows(kMaxExpertRows, kNumExperts / kNumRanks, kExpertAlignment) <= INT_MAX,
                      "Expanded token count including expert padding overflows int");
 
     // Each remote peer can leave one partially filled SQE; all SQEs are written before the doorbell.
@@ -679,7 +689,7 @@ __global__ __vector__ void dispatch_impl(
     handle::HcommJetty jetty(&ub_layout->jetty_info, nullptr, nullptr, vec_core_idx);
 
     {
-        static constexpr int kNumThreads = 512;
+        static constexpr int kNumThreads = kDispatchWorkerThreads;
         ub_layout->local_copy_ready = 0;
         ub_layout->metadata_ready = 0;
 
@@ -692,7 +702,7 @@ __global__ __vector__ void dispatch_impl(
         asc_vf_call<
             simt_persistent_worker<kNumMaxTokensPerRank, kNumRanks, kNumExperts, kNumTopk, kExpertAlignment, kCachedMode, kDoCPUSync,
                                    kNumVecCores, kNumThreads, kNumSGEPairsPerSQE, kNumTimeoutCycles,
-                                   kLowLatencyTransport>>(
+                                   kLowLatencyTransport, kServerRelay>>(
             dim3(kNumThreads, 1, 1),
             workspace_layout, host_workspace_layout, ub_layout,
             static_cast<__gm__ const uint8_t*>(x), metadata_send_buffer,
@@ -703,7 +713,7 @@ __global__ __vector__ void dispatch_impl(
             reinterpret_cast<uint64_t>(recv_buffer.base) - reinterpret_cast<uint64_t>(workspace),
             kNumHiddenBytes, static_cast<int>(token_layout.get_num_bytes(true)),
             static_cast<int>(token_layout.get_num_bytes()),
-            num_tokens, vec_core_idx, rank_idx
+            num_tokens, vec_core_idx, rank_idx, server_ids, relay_slots
         );
     }
 
@@ -974,6 +984,16 @@ __global__ __vector__ void dispatch_impl(
         }
     }
 
+    if constexpr (kServerRelay) {
+        EP_STATIC_ASSERT(get_dispatch_token_bytes(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t),
+                                                 kNumTopk, kCachedMode) <= kNumUbBytes);
+        comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores>(
+            workspace_layout.get_common_signals(), vec_core_idx);
+        gather_dispatch_relay_slots<kNumRanks, kNumMaxTokensPerRank, kNumVecCores>(
+            layout::BufferLayout(token_layout, kNumRanks, kNumMaxTokensPerRank, math::advance_ptr<void>(buffer, 0)),
+            workspace_layout.get_common_signals(), relay_slots, psum_num_recv_tokens_per_rank, vec_core_idx,
+            reinterpret_cast<__ubuf__ uint8_t*>(ub));
+    }
     // Drain URMA writes before publishing completion at the barrier.
     if constexpr (kDoBarrier)
         comm::scalar::barrier<

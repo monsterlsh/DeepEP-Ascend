@@ -66,14 +66,17 @@ struct DecodeAgreement {
     inline static int initial_votes = 0;
     inline static std::vector<uint16_t> proposals;
     bool initialize(int) { return resources; }
-    static bool agree_capability(void*, int, int, bool local) {
-        ++initial_votes;
-        return local && capable_peer;
-    }
     static bool is_capturing() { return capturing; }
     bool matches(void*, int, int, uint16_t proposal) {
         proposals.push_back(proposal);
         return matching_peer && proposal != 0;
+    }
+};
+struct DecodeTopology {
+    bool group_enabled = false;
+    static DecodeTopology discover(const std::string&, int, int, int64_t, int64_t, bool local) {
+        ++DecodeAgreement::initial_votes;
+        return {local && DecodeAgreement::capable_peer};
     }
 };
 }
@@ -86,9 +89,14 @@ using deep_ep::comm::DecodeAgreement;
 using deep_ep::EPLowLatencyState;
 constexpr int64_t buffer_bytes = 1LL << 30;
 
+void initialize(EPLowLatencyState& state, const Context& ctx) {
+    state.initialize("ep", ctx.num_ranks, ctx.num_cpu_timeout_secs,
+                     int(ctx.num_gpu_timeout_cycles / deep_ep::comm::kNumSystemCyclesPerSecond), buffer_bytes, buffer_bytes);
+}
+
 bool dispatch(EPLowLatencyState& state, const Context& ctx, int m = 2, bool cached = false,
-              bool prologue = false, bool options = true, bool fp8 = false) {
-    return state.prepare_dispatch(ctx, m, 7168, 8, 128, 64, 216 * 1024, fp8, cached, prologue, options);
+              bool prologue = false, bool options = true, int num_sf_packs = 0) {
+    return state.prepare_dispatch(ctx, m, 7168, 8, 128, 64, 216 * 1024, num_sf_packs, cached, prologue, options);
 }
 bool combine(EPLowLatencyState& state, const Context& ctx, int m = 2, bool options = true,
              int b = 1, bool prologue = false) {
@@ -117,7 +125,7 @@ void check_admission() {
         const auto votes = DecodeAgreement::initial_votes;
         DecodeAgreement::proposals.clear();
         EPLowLatencyState state(buffer_bytes);
-        state.initialize(ctx);
+        initialize(state, ctx);
         assert(DecodeAgreement::initial_votes == votes + (mode != 8));
         assert(dispatch(state, ctx) == (mode == 9));
         assert(combine(state, ctx) == (mode == 9));
@@ -129,18 +137,20 @@ void check_admission() {
     }
 
     Context ctx;
-    const auto plan = deep_ep::get_dispatch_low_latency_plan(3510, 8, 2, 7168, 8, 128, 64, 216 * 1024, false);
-    for (auto bytes : {plan->buffer_bytes - 1, plan->buffer_bytes}) {
-        EPLowLatencyState state(bytes);
-        state.initialize(ctx);
-        assert(dispatch(state, ctx) == (bytes == plan->buffer_bytes));
+    for (int sf_words : {0, 56, 112}) {
+        const auto plan = deep_ep::get_dispatch_low_latency_plan(3510, 8, 2, 7168, 8, 128, 64, 216 * 1024, sf_words);
+        for (auto bytes : {plan->buffer_bytes - 1, plan->buffer_bytes}) {
+            EPLowLatencyState state(bytes);
+            initialize(state, ctx);
+            assert(dispatch(state, ctx, 2, false, false, true, sf_words) == (bytes == plan->buffer_bytes));
+        }
     }
 }
 
 void check_proposals() {
     Context ctx;
     EPLowLatencyState state(buffer_bytes);
-    state.initialize(ctx);
+    initialize(state, ctx);
     DecodeAgreement::proposals.clear();
     for (bool cached : {false, true})
         for (bool prologue : {false, true}) {
@@ -148,7 +158,8 @@ void check_proposals() {
             assert(DecodeAgreement::proposals.back() == 1 + 2 * cached + prologue);
         }
     assert(!dispatch(state, ctx, 3, false, false, false));
-    assert(!dispatch(state, ctx, 3, false, false, true, true));
+    assert(dispatch(state, ctx, 3, false, false, true, 112));
+    assert(!dispatch(state, ctx, 3, false, false, true, -1));
     assert(dispatch(state, ctx, 9, true));
     assert(dispatch(state, ctx, 9, false));
     assert(!combine(state, ctx, 3, false));
@@ -171,7 +182,7 @@ void check_all_rank_admission() {
             Context ctx;
             ctx.num_ranks = world; ctx.rank_idx = rank;
             EPLowLatencyState state(buffer_bytes);
-            state.initialize(ctx);
+            initialize(state, ctx);
             for (int m = 1; m <= 256; ++m) {
                 for (bool prologue : {false, true}) {
                     assert(dispatch(state, ctx, m, false, prologue));
@@ -195,7 +206,7 @@ void check_threshold_override() {
 #endif
     Context ctx;
     EPLowLatencyState state(buffer_bytes);
-    state.initialize(ctx);
+    initialize(state, ctx);
     assert(combine(state, ctx, 16));
     assert(!combine(state, ctx, 17));
     assert(DecodeAgreement::proposals.back() == 0);
@@ -204,7 +215,7 @@ void check_threshold_override() {
 void check_events() {
     Context ctx;
     EPLowLatencyState state(buffer_bytes);
-    state.initialize(ctx);
+    initialize(state, ctx);
     assert(dispatch(state, ctx));
     state.begin();
     rejects([&] { combine(state, ctx); }, "outstanding");
@@ -231,7 +242,7 @@ void check_failures() {
     Context ctx;
     for (int mode = 0; mode < 3; ++mode) {
         EPLowLatencyState state(buffer_bytes);
-        state.initialize(ctx);
+        initialize(state, ctx);
         assert(dispatch(state, ctx));
         state.begin();
         if (mode == 0) {
@@ -274,7 +285,7 @@ class DispatchLLStateHostTests(unittest.TestCase):
     def test_hccl_agreement(self):
         source = (ROOT / 'tests/ep/decode_agreement_host_test.cpp').read_text()
         headers = {name: '#pragma once\n' for name in (
-            'acl/acl.h', 'hccl/hccl.h', 'torch_npu/csrc/core/npu/NPUStream.h')}
+            'acl/acl.h', 'hccl/hccl.h', 'hccl/hccl_comm.h', 'torch_npu/csrc/core/npu/NPUStream.h')}
         headers['deep_ep/common/exception.hpp'] = (
             '#pragma once\n#define ACL_CHECK(op) do { if ((op) != 0) throw std::runtime_error("ACL"); } while (false)\n'
             '#define HCCL_CHECK(op) ACL_CHECK(op)\n')

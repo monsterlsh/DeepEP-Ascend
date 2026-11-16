@@ -29,7 +29,8 @@ struct RecordingJit {
         return 1;
     }
     void launch(int, Config, void*, void*, void*, void*, void* recv, void* send,
-                void*, void*, int current_rank) {
+                void*, void*, int current_rank, const int* servers, void* scratch) {
+        assert((servers != nullptr) == (scratch != nullptr));
         buffer = recv;
         send_buffer = send;
         rank = current_rank;
@@ -39,20 +40,23 @@ struct RecordingJit {
 auto jit = &recording_jit;
 ''' + launcher + r'''
 int main() {
-    int recv, send, weights;
+    int recv, send, weights, servers[4]{}, scratch;
     for (bool direct : {false, true})
         for (bool barrier : {false, true})
-            for (bool weighted : {false, true}) {
+            for (bool weighted : {false, true})
+              for (bool fp16 : {false, true})
+                for (bool relay : {false, true}) {
+                if (relay && !direct) continue;
                 auto staging = direct ? nullptr : &send;
                 const int before = jit->launches;
                 auto result = launch_combine(nullptr, weighted ? &weights : nullptr, nullptr,
                     nullptr, &recv, staging, nullptr, nullptr, 1, 4, 16, 3, 128,
-                    194560, 64, 100, barrier, direct);
+                    194560, 64, 100, barrier, direct, fp16, relay ? servers : nullptr, relay ? &scratch : nullptr);
                 assert(result == &recv && jit->buffer == &recv && jit->send_buffer == staging);
                 assert(jit->rank == 1 && jit->launches == before + 1);
-                assert(jit->name == (direct ? "combine_mte" : "combine"));
-                auto specialization = std::format("combine_impl<4, 3, 128, 16, 64, 100, 194560, {}, {}, {}>",
-                                                  barrier, weighted, direct);
+                assert(jit->name == (relay ? "combine_mte_relay" : direct ? "combine_mte" : "combine"));
+                auto specialization = std::format("combine_impl<4, 3, 128, 16, 64, 100, 194560, {}, {}, {}, {}, {}>",
+                                                  barrier, weighted, direct, fp16 ? "half" : "bfloat16_t", relay);
                 assert(jit->source.find(specialization) != std::string::npos);
             }
 }
@@ -67,6 +71,7 @@ int main() {
 #include <cstdint>
 
 #define __gm__
+namespace AscendC { void WriteGmByPassDCache(int* ptr, int value) { *ptr = value; } }
 namespace layout {
 struct CommonSignals { uint8_t* native[4]; };
 uint8_t* get_sym_ptr(const CommonSignals& signals, uint8_t* local, int peer) {
@@ -78,6 +83,8 @@ uint8_t* get_sym_ptr(const CommonSignals& signals, uint8_t* local, int peer) {
 template <bool kLowLatencyTransport, int kNumTopk>
 void check_slot(int owner, layout::CommonSignals native,
                 uint8_t* combine_recv_buffer, uint8_t* send_buffer, uint8_t* expected) {
+    constexpr bool kDomainRelay = false;
+    struct { uint8_t* partials; int* masters; } scratch{};
     constexpr int rank_idx = 1, kNumRanks = 4, kNumMaxTokensPerRank = 4;
     constexpr int kNumVecCores = 2, kNumTokenBytes = 32;
     struct { layout::CommonSignals common_signals; } signals{native};

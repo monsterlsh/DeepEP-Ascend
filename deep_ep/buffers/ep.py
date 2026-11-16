@@ -234,10 +234,15 @@ class EPBuffer(BufferBase):
 
         self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
         super().__init__(explicitly_destroy)
+        relay_size = ()
+        if os.environ.get('EP_DECODE_SERVER_ID') and hidden > 0 and num_max_tokens_per_rank > 0:
+            # FP8 dispatch can use a smaller arena than the BF16/FP16 combine partials.
+            capacity = min(num_max_tokens_per_rank, 256)
+            relay_size = (self.get_buffer_size_hint(group, capacity, hidden, num_topk),)
         self.runtime = _C.EPBuffer(
             self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
             num_bytes, num_lb_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
-            explicitly_destroy)
+            explicitly_destroy, *relay_size)
         self.context = self.runtime.context
         if lb_allocation_plan is not None:
             lb_allocation_plan.materialize(self.runtime.lb_storage)
@@ -344,11 +349,11 @@ class EPBuffer(BufferBase):
         Dispatch tokens to different ranks.
 
         Arguments:
-            x: `torch.Tensor` or tuple of `torch.Tensor`. For the first type, the shape must be
-                `[num_tokens, hidden]` with type `torch.bfloat16`; for the second type (FP8 mode),
-                the first element of the tuple must be `[num_tokens, hidden]` with type
-                `torch.float8_e4m3fn`; the second contains SF packs with shape
-                `[num_tokens, num_sf_packs]`.
+            x: BF16 or FP16 tokens shaped `[num_tokens, hidden]`, or an FP8 tuple
+                containing `torch.float8_e4m3fn` tokens and their scales. Scales may
+                be native 16-bit packs, FP32 values per 128 hidden elements, or
+                INT32 words packing four per-32 E8M0 scale bytes per word.
+                Dispatch preserves the scale dtype and columns per token.
             topk_idx: `[num_tokens, num_topk]` with `torch.int64`, the expert indices selected by each
                 token, `-1` means no selections. Must be `None` if `handle` is provided.
                 Stored by reference in the handle; must not be modified until all uses of the handle complete.
@@ -546,14 +551,14 @@ class EPBuffer(BufferBase):
         Combine (reduce) tokens from different ranks back to their original ranks.
 
         Arguments:
-            x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its
-                original ranks.
+            x: BF16 or FP16 expert outputs shaped `[num_tokens, hidden]` to reduce
+                back to their original ranks.
             handle: a must-set communication handle, you can obtain this from the `dispatch` function.
             topk_weights: `[num_tokens]` with `torch.float`. The expanded tokens' top-k weights for
                 restoring to their original ranks as a separate output. These values do not
                 multiply `x`; any model weighting must already be present in the expert outputs.
             bias: `None`, a tensor, or a tuple of 2 `[num_combined_tokens, hidden]` tensors with
-                `torch.bfloat16` final bias to the output.
+                the same dtype as `x`, added to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
             previous_event: compatibility parameter; providing an event selects the native URMA path.
@@ -563,8 +568,8 @@ class EPBuffer(BufferBase):
                 This requires `async_with_compute_stream=True`.
 
         Returns:
-            combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type
-                `torch.bfloat16`. Only returned when `defer_epilogue=False`.
+            combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]`
+                and the dtype of `x`. Only returned when `defer_epilogue=False`.
             combined_topk_weights: the reduced top-k weights, with shape `[num_combined_tokens, num_topk]`
                 and type `torch.float`. Only returned when `defer_epilogue=False`.
             event: the communication event (valid only if `async_with_compute_stream` is set).

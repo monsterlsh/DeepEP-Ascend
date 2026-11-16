@@ -18,7 +18,7 @@ import subprocess
 import sys
 import traceback
 
-from compat_config import DIAGNOSTIC_WORLDS, configure_backend, JsonlReport, parse_args, plan_cases
+from compat_config import DIAGNOSTIC_WORLDS, configure_backend, configure_server_ids, JsonlReport, parse_args, plan_cases
 from compat_trace import TraceCollector
 from ep_reference import agree
 
@@ -42,7 +42,7 @@ def launch(buffer, operation, deferred, **kwargs):
     return result
 
 
-def scale_packs(sources, tokens, hidden=7168, version=0):
+def scale_packs(sources, tokens, hidden=7168, version=0, scale_format="int16"):
     """Finite positive FP32 scale words viewed as the native INT16 transport.
 
     Distinct mantissa bits exercise both halves, row identity and cached updates.
@@ -55,18 +55,23 @@ def scale_packs(sources, tokens, hidden=7168, version=0):
     tokens = torch.as_tensor(tokens, dtype=torch.int64)
     bits = (0x3F000001 + sources[:, None] * 65536 + tokens[:, None] * 128
             + torch.arange(hidden // 128) + version * 1048576)
-    return bits.to(torch.int32).contiguous().view(torch.int16)
+    words = bits.to(torch.int32).contiguous()
+    if scale_format == 'e8m0':
+        # Four distinct exponent bytes per group of 128; every byte is finite.
+        exponent = (sources[:, None] * 3 + tokens[:, None] + torch.arange(hidden // 128) + version) % 8
+        return (0x74757677 + exponent * 0x01010101).to(torch.int32)
+    return words.view(torch.float32 if scale_format == 'fp32' else torch.int16)
 
 
-def make_input(rank, bs, dtype, layout, *, payload_scale=1, scale_version=0, device='npu'):
+def make_input(rank, bs, dtype, layout, *, payload_scale=1, scale_version=0, device='npu', hidden=7168, scale_format='int16'):
     import torch
     from ep_reference import payload
 
-    values = payload([rank] * bs, range(bs), 7168, torch.bfloat16) * payload_scale
-    if dtype == 'bf16':
-        return values.to(device)
+    values = payload([rank] * bs, range(bs), hidden, torch.bfloat16) * payload_scale
+    if dtype != 'fp8':
+        return values.to(device=device, dtype=torch.float16 if dtype == 'fp16' else torch.bfloat16)
     values = values.to(torch.float8_e4m3fn).to(device)
-    scales = scale_packs([rank] * bs, range(bs), version=scale_version).to(device)
+    scales = scale_packs([rank] * bs, range(bs), hidden, scale_version, scale_format).to(device)
     if layout == 'col':
         scales = scales.t().contiguous().t()
     return values, scales
@@ -75,19 +80,19 @@ def make_input(rank, bs, dtype, layout, *, payload_scale=1, scale_version=0, dev
 def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
                    deterministic, *, backend, dtype='bf16', scale_layout='row',
                    weight_scale=1, payload_scale=1, scale_version=0, has_weights=True,
-                   cpu_sync=False):
+                   cpu_sync=False, hidden=7168, experts=128, scale_format="int16"):
     import torch
     from ep_reference import expert_entries, payload
 
-    entries = expert_entries(routes, 128, world, rank)
+    entries = expert_entries(routes, experts, world, rank)
     counts = [len(rows) for rows in entries]
     check_native_contract(handle, 'is_low_latency', backend)
     assert handle.num_unaligned_recv_tokens_per_expert.cpu().tolist() == counts
     valid_aligned = sum((count + alignment - 1) // alignment * alignment for count in counts)
     values, scales = recv if isinstance(recv, tuple) else (recv, None)
     assert (scales is not None) == (dtype == 'fp8')
-    assert values.dtype == (torch.float8_e4m3fn if dtype == 'fp8' else torch.bfloat16)
-    assert tuple(values.shape) == (handle.num_expanded_tokens, 7168)
+    assert values.dtype == (torch.float8_e4m3fn if dtype == 'fp8' else torch.float16 if dtype == 'fp16' else torch.bfloat16)
+    assert tuple(values.shape) == (handle.num_expanded_tokens, hidden)
     assert handle.expert_alignment == alignment
     if cpu_sync:
         assert handle.num_recv_tokens_per_expert_list == [
@@ -100,8 +105,8 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
     weights_cpu = weights[:valid_aligned].cpu() if weights is not None else None
     scales_cpu = scales[:valid_aligned].cpu() if scales is not None else None
     if scales is not None:
-        packs = 7168 // 128 * 2
-        assert scales.dtype == torch.int16
+        packs = hidden // 128 * (2 if scale_format == "int16" else 1)
+        assert scales.dtype == {"int16": torch.int16, "fp32": torch.float32, "e8m0": torch.int32}[scale_format]
         assert tuple(scales.shape) == (handle.num_expanded_tokens, packs)
         expected_stride = (1, handle.num_expanded_tokens) if scale_layout == 'col' else (packs, 1)
         # Empty dimensions can have conventional contiguous strides; there are
@@ -122,10 +127,10 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
             keys = sources * handle.num_max_tokens_per_rank + tokens
             order = keys.argsort()
             expected_sources, expected_tokens = zip(*rows)
-            expected = payload(expected_sources, expected_tokens, 7168, torch.bfloat16) * payload_scale
+            expected = payload(expected_sources, expected_tokens, hidden, torch.bfloat16) * payload_scale
             torch.testing.assert_close(block.float()[order], expected.float(), atol=0, rtol=0)
             if scales_cpu is not None:
-                expected_sf = scale_packs(expected_sources, expected_tokens, version=scale_version)
+                expected_sf = scale_packs(expected_sources, expected_tokens, hidden, scale_version, scale_format)
                 torch.testing.assert_close(scales_cpu[offset:offset + count][order], expected_sf, atol=0, rtol=0)
             if deterministic:
                 assert torch.equal(keys, keys.sort().values)
@@ -138,7 +143,7 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
         offset = next_offset
     assert handle.psum_num_recv_tokens_per_expert.cpu().tolist() == expected_ends
     # Validate reverse-routing slots, deduplicated counts and capacity-strided IDs.
-    expected_counts = [sum(any(rank * (128 // world) <= e < (rank + 1) * (128 // world)
+    expected_counts = [sum(any(rank * (experts // world) <= e < (rank + 1) * (experts // world)
                                for e in selected) for selected in source) for source in routes]
     psum, accumulated = [], 0
     for count in expected_counts:
@@ -155,20 +160,20 @@ def check_dispatch(recv, weights, handle, routes, rank, world, alignment,
         valid = []
         for topk_slot, slot in enumerate(row[:-2]):
             expert = routes[source][token][topk_slot]
-            belongs = rank * (128 // world) <= expert < (rank + 1) * (128 // world)
+            belongs = rank * (experts // world) <= expert < (rank + 1) * (experts // world)
             assert (slot >= 0) == belongs
             if belongs:
                 assert slot not in visited
                 visited.add(slot)
                 valid.append(topk_slot)
                 torch.testing.assert_close(recv_cpu[slot].float(),
-                    (payload([source], [token], 7168, torch.bfloat16)[0] * payload_scale).float(),
+                    (payload([source], [token], hidden, torch.bfloat16)[0] * payload_scale).float(),
                     atol=0, rtol=0)
                 if weights_cpu is not None:
                     assert weights_cpu[slot].item() == (topk_slot + 1) / 32 * weight_scale
                 if scales_cpu is not None:
                     torch.testing.assert_close(scales_cpu[slot],
-                        scale_packs([source], [token], version=scale_version)[0], atol=0, rtol=0)
+                        scale_packs([source], [token], hidden, scale_version, scale_format)[0], atol=0, rtol=0)
         assert row[-1] == max(valid)
     assert len(visited) == sum(counts)
     if cpu_sync:
@@ -179,11 +184,16 @@ def expected_transport(case, backend, runtime, *, has_weights=True, has_stats=Fa
     """Allowed device transports; a missing group capability falls back to URMA."""
     m = case['M']
     world = len(case['rank_bs'])
-    if (backend != 'candidate-auto' or world not in (2, 4, 8, 16, 32, 64, 128) or not 1 <= m <= 256
-            or not all(1 <= batch <= m for batch in case['rank_bs'])
-            or runtime['arch'] != 3510 or runtime['num_vec_cores'] != 64 or runtime['num_ai_cores'] != 32
-            or case['alignment'] != 128 or case['dtype'] != 'bf16' or case['cpu_sync'] is not False
+    if (backend != 'candidate-auto' or not all(1 <= batch <= m for batch in case['rank_bs'])
+            or runtime['num_ai_cores'] != 32 or case['dtype'] not in ('bf16', 'fp16', 'fp8')
+            or case['alignment'] != 128 or case['cpu_sync'] is not False
             or case['deterministic'] or not case['deferred'] or not has_weights or has_stats or has_bias):
+        return 'urma'
+    # The harness emits one FP32 scale (or equivalent packed bits) per 128 columns.
+    # Query the exact kernel geometry/UB policy from the candidate installation.
+    from deep_ep import _C
+    sf_words = 2 * (case['hidden'] // 128) if case['dtype'] == 'fp8' else 0
+    if not _C._decode_shape_supported(world, m, case['hidden'], case['num_topk'], case['num_experts'], sf_words):
         return 'urma'
     return ['urma', 'mte']
 
@@ -194,10 +204,10 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, *,
     metadata = dict(case_id=case['case_id'], backend=backend, rank=rank,
                     operation=operation, cached=kwargs.get('handle') is not None if operation == 'dispatch' else None,
                     weight_side_channel=kwargs.get('topk_weights') is not None,
-                    dtype=case['dtype'] if operation == 'dispatch' else 'bf16',
+                    dtype=case['dtype'] if operation == 'dispatch' else (handle_case or case)['expert_dtype'],
                     M=case['M'], B=case['rank_bs'][rank], deferred=case['deferred'],
-                    barrier_in_prologue=case['barrier_in_prologue'], hidden=7168,
-                    num_topk=8, num_experts=128, num_ranks=len(case['rank_bs']),
+                    barrier_in_prologue=case['barrier_in_prologue'], hidden=case['hidden'],
+                    num_topk=case['num_topk'], num_experts=case['num_experts'], num_ranks=len(case['rank_bs']),
                     num_vec_cores=runtime['num_vec_cores'])
     handle = kwargs.get('handle')
     if operation == 'dispatch':
@@ -208,7 +218,7 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, *,
         data = kwargs['x']
         if isinstance(data, tuple):
             metadata.update(input_scale_shape=list(data[1].shape), input_scale_stride=list(data[1].stride()),
-                            expected_num_sf_packs=data[1].size(1))
+                            expected_num_sf_packs=data[1].size(1) * data[1].element_size() // 2)
         else:
             metadata['expected_num_sf_packs'] = 0
     original_b = handle.topk_idx.size(0) if operation == 'combine' else None
@@ -223,6 +233,9 @@ def invoke(buffer, operation, label, case, rank, backend, runtime, collector, *,
                                   has_bias=kwargs.get('bias') is not None)
     if isinstance(expected, list):
         metadata['optimized_ub_bytes'] = 216 * 1024
+    servers = case.get('server_ids')
+    if servers is not None:
+        metadata['server_relay'] = isinstance(expected, list) and 1 < len(set(servers)) < len(servers)
     if original_b is not None:
         metadata.update(B=original_b, M=capacity)
     result, error, entered = None, None, False
@@ -264,10 +277,25 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     import torch
     from ep_reference import make_routes, expert_entries, prepare_experts, expected_combine
     bs, alignment, sync = case['bs'], case['alignment'], case['cpu_sync']
+    hidden, topk, experts = case['hidden'], case['num_topk'], case['num_experts']
+    input_options = dict(hidden=hidden, scale_format=case['scale_format'])
+    expert_dtype = torch.float16 if case['expert_dtype'] == 'fp16' else torch.bfloat16
     dtype, scale_layout = case['dtype'], case['scale_layout']
-    routes = make_routes(world, bs, 8, 128, case['seed'])
+    routes = make_routes(world, bs, topk, experts, case['seed'])
     if case['route'] == 'hotspot':
-        routes = [[list(range(8)) for _ in range(bs)] for _ in range(world)]
+        routes = [[list(range(topk)) for _ in range(bs)] for _ in range(world)]
+    elif case['route'] == 'duplicates':
+        # Keep every source active so the fast path sees duplicate and masked lanes too.
+        for rows in routes:
+            for token, selected in enumerate(rows):
+                if experts // world < topk:
+                    # All ranks target one expert. With B=M the expanded output
+                    # can exceed R*M*(E/R), even though packets are deduplicated.
+                    selected[:] = [0] * topk
+                elif topk >= 2:
+                    selected[1] = selected[0]
+                if token % 3 == 0:
+                    selected[-1] = -1
     routes = [rows[:size] for rows, size in zip(routes, case['rank_bs'])]
     if case['edge_routes']:
         # Include empty ranks and both sides of the automatic cutoff in one
@@ -275,18 +303,19 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
         for rows in routes:
             for token, selected in enumerate(rows):
                 selected[-1] = -1
-                selected[1] = selected[0]
-                if token % 3 == 0:
+                if topk >= 3:
+                    selected[1] = selected[0]
+                if topk >= 2 and token % 3 == 0:
                     selected[-2] = -1
-    counts = [len(rows) for rows in expert_entries(routes, 128, world, rank)]
+    counts = [len(rows) for rows in expert_entries(routes, experts, world, rank)]
     assert [len(rows) for rows in routes] == case['rank_bs']
     bs = case['rank_bs'][rank]
-    x = make_input(rank, bs, dtype, scale_layout)
-    indices = torch.tensor(routes[rank], dtype=torch.int64, device='npu').reshape(bs, 8)
-    weights = (torch.arange(1, 9, dtype=torch.float32, device='npu') / 32).repeat(bs, 1)
+    x = make_input(rank, bs, dtype, scale_layout, **input_options)
+    indices = torch.tensor(routes[rank], dtype=torch.int64, device='npu').reshape(bs, topk)
+    weights = (torch.arange(1, topk + 1, dtype=torch.float32, device='npu') / 32).repeat(bs, 1)
     weights.masked_fill_(indices < 0, 0)
-    stats = torch.ones(128 // world, dtype=torch.int32, device='npu')
-    dispatch_args = dict(x=x, topk_idx=indices, topk_weights=weights, num_experts=128,
+    stats = torch.ones(experts // world, dtype=torch.int32, device='npu')
+    dispatch_args = dict(x=x, topk_idx=indices, topk_weights=weights, num_experts=experts,
                          num_max_tokens_per_rank=case['M'],
                          expert_alignment=alignment, num_sms=0, do_expand=True,
                          do_cpu_sync=sync, do_zero_padding=True, async_with_compute_stream=True,
@@ -295,7 +324,7 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     def call(operation, label, **kwargs):
         return invoke(buffer, operation, label, case, rank, backend, runtime, collector, **kwargs)
 
-    check_options = dict(backend=backend, dtype=dtype, scale_layout=scale_layout, cpu_sync=sync is not False)
+    check_options = dict(**input_options, experts=experts, backend=backend, dtype=dtype, scale_layout=scale_layout, cpu_sync=sync is not False)
     recv, recv_idx, recv_weights, handle, _ = call('dispatch', 'fresh', **dispatch_args)
     agree(lambda: check_dispatch(recv, recv_weights, handle, routes, rank, world, alignment,
                                  buffer.deterministic, **check_options))
@@ -313,33 +342,53 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
         agree(lambda: torch.testing.assert_close(again_weights[:valid_aligned], recv_weights[:valid_aligned],
                                                  atol=0, rtol=0))
 
-    unweighted_expert = prepare_experts(recv, counts, rank, 128, world, torch.bfloat16,
+    unweighted_expert = prepare_experts(recv, counts, rank, experts, world, expert_dtype,
                                        expert_alignment=alignment)
-    expected_unweighted = expected_combine(routes, rank, 7168, torch.bfloat16,
-                                            experts=128)
+    def reference(weighted=False, bias=0):
+        options = dict(experts=experts, weighted=weighted, bias=bias)
+        flat = expected_combine(routes, rank, hidden, expert_dtype, **options)
+        ids = case.get('server_ids')
+        grouped = (expected_combine(routes, rank, hidden, expert_dtype, **options, server_ids=ids)
+                   if ids and 1 < len(set(ids)) < world and backend == 'candidate-auto' and bias == 0 else flat)
+        return flat, grouped
+
+    def check_output(output, references):
+        flat, grouped = references
+        record = collector.records[-1]
+        if record.get('kernel_parameters'):
+            relay = any(p['server_relay'] for p in record['kernel_parameters'].values())
+            torch.testing.assert_close(output.cpu(), grouped if relay else flat, atol=0, rtol=0)
+        else:
+            # Without a device trace, capability fallback can legitimately change
+            # the reduction tree. Both references model every wire conversion.
+            actual = output.cpu()
+            if record['metadata'].get('server_relay') and grouped is not flat and torch.equal(actual, grouped):
+                torch.testing.assert_close(actual, grouped, atol=0, rtol=0)
+            else:
+                torch.testing.assert_close(actual, flat, atol=0, rtol=0)
+
+    expected_unweighted = reference()
     for weighted in (False, True):
         expert = unweighted_expert.clone()
         if weighted:
             start = 0
             for count in counts:
                 expert[start:start + count] = (expert[start:start + count].float()
-                    * recv_weights[start:start + count, None]).to(torch.bfloat16)
+                    * recv_weights[start:start + count, None]).to(expert_dtype)
                 start += (count + alignment - 1) // alignment * alignment
         saved = expert.clone()
         for num_bias in (0, 1, 2):
-            bias = None if not num_bias else torch.full((bs, 7168), .25, dtype=torch.bfloat16, device='npu')
+            bias = None if not num_bias else torch.full((bs, hidden), .25, dtype=expert_dtype, device='npu')
             if num_bias == 2:
                 bias = (bias, torch.full_like(bias, -.125))
-            expected_biased = expected_combine(routes, rank, 7168, torch.bfloat16, weighted=weighted,
-                experts=128, bias=0 if not num_bias else .25 if num_bias == 1 else .125)
+            expected_biased = reference(weighted, 0 if not num_bias else .25 if num_bias == 1 else .125)
             for send_weights in (False, True):
                 output, output_weights, _ = call('combine',
                     f'weighted_{int(weighted)}_bias_{num_bias}_side_{int(send_weights)}',
                     x=expert, handle=handle, topk_weights=recv_weights if send_weights else None,
                     bias=bias, num_sms=0, async_with_compute_stream=True)
                 torch.npu.synchronize()
-                agree(lambda: torch.testing.assert_close(output.float().cpu(), expected_biased.float(),
-                                                           atol=.125, rtol=.02))
+                agree(lambda: check_output(output, expected_biased))
                 agree(lambda: torch.testing.assert_close(expert, saved, atol=0, rtol=0))
                 if send_weights:
                     agree(lambda: torch.testing.assert_close(output_weights, weights, atol=0, rtol=0))
@@ -352,14 +401,14 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
                        'num_unaligned_recv_tokens_per_expert', 'recv_src_metadata',
                        'dst_buffer_slot_idx', 'dst_gsge_idx')
     saved_metadata = [getattr(handle, name).clone() for name in metadata_fields]
-    updated = make_input(rank, bs, dtype, scale_layout, payload_scale=2, scale_version=1)
+    updated = make_input(rank, bs, dtype, scale_layout, payload_scale=2, scale_version=1, **input_options)
     cached, cached_idx, cached_weights, cached_handle, _ = call('dispatch', 'cached_updated',
         x=updated, handle=handle, topk_weights=weights * 3, do_expand=True, do_cpu_sync=False,
         do_zero_padding=True, async_with_compute_stream=True,
         use_tma_aligned_col_major_sf=scale_layout == 'col')
     agree(lambda: _check_cached_handle(cached_handle, handle, cached_idx))
     agree(lambda: check_dispatch(cached, cached_weights, cached_handle, routes, rank, world, alignment,
-                                 buffer.deterministic, backend=backend, dtype=dtype,
+                                 buffer.deterministic, **input_options, experts=experts, backend=backend, dtype=dtype,
                                  scale_layout=scale_layout, weight_scale=3, payload_scale=2,
                                  scale_version=1))
     for name, saved in zip(metadata_fields, saved_metadata):
@@ -370,7 +419,7 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
         x=unweighted_expert, handle=cached_handle, topk_weights=cached_weights,
         num_sms=0, async_with_compute_stream=True)
     torch.npu.synchronize()
-    agree(lambda: torch.testing.assert_close(output.float().cpu(), expected_unweighted.float(), atol=.125, rtol=.02))
+    agree(lambda: check_output(output, expected_unweighted))
     agree(lambda: torch.testing.assert_close(output_weights, weights * 3, atol=0, rtol=0))
 
     # Omitted weights are part of the baseline public contract, both fresh and
@@ -385,17 +434,17 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
         else:
             # Move every active slot to the next rank. The old handle must still
             # address its own rows after this fresh dispatch reuses the workspace.
-            step = 128 // world
-            check_routes = [[[(e + step) % 128 if e >= 0 else e for e in row]
+            step = experts // world
+            check_routes = [[[(e + step) % experts if e >= 0 else e for e in row]
                              for row in source] for source in routes]
-            new_indices = torch.tensor(check_routes[rank], dtype=torch.int64, device='npu').reshape(bs, 8)
-            no_weight_args.update(topk_idx=new_indices, num_experts=128,
+            new_indices = torch.tensor(check_routes[rank], dtype=torch.int64, device='npu').reshape(bs, topk)
+            no_weight_args.update(topk_idx=new_indices, num_experts=experts,
                                   num_max_tokens_per_rank=case['M'], expert_alignment=alignment)
         no_weight_x, no_idx, no_weights, no_weight_handle, _ = call(
             'dispatch', 'cached_no_weights' if cached_mode else 'fresh_no_weights', **no_weight_args)
         agree(lambda: _check_no_indices(no_idx))
         agree(lambda: check_dispatch(no_weight_x, no_weights, no_weight_handle, check_routes, rank, world, alignment,
-            buffer.deterministic, backend=backend, dtype=dtype, scale_layout=scale_layout,
+            buffer.deterministic, **input_options, experts=experts, backend=backend, dtype=dtype, scale_layout=scale_layout,
             payload_scale=2, scale_version=1, has_weights=False))
 
     if retained is None:
@@ -403,7 +452,7 @@ def run_case(buffer, case, rank, world, retained, backend, runtime, collector):
     old_expert, old_handle, old_expected, old_weights, expected_weights, old_case = retained
     output, output_weights, _ = call('combine', 'old_handle', handle_case=old_case,
         x=old_expert, handle=old_handle, topk_weights=old_weights, async_with_compute_stream=True)
-    agree(lambda: torch.testing.assert_close(output.float().cpu(), old_expected.float(), atol=.125, rtol=.02))
+    agree(lambda: check_output(output, old_expected))
     agree(lambda: torch.testing.assert_close(output_weights, expected_weights, atol=0, rtol=0))
     if rank == 0:
         print(f"PASS {case['case_id']} EP{world} B={case['rank_bs']} M={case['M']} "
@@ -480,6 +529,7 @@ def worker(local_rank, args):
     world = int(os.getenv('WORLD_SIZE', '1')) * args.num_processes
     rank = int(os.getenv('RANK', '0')) * args.num_processes + local_rank
     cases = plan_cases(args, world)
+    configure_server_ids(args.server_ids, rank)
     dist.init_process_group('hccl', rank=rank, world_size=world,
         device_id=torch.device(f'npu:{local_rank}'),
         init_method=f"tcp://{os.getenv('MASTER_ADDR', '127.0.0.1')}:{os.getenv('MASTER_PORT', '8361')}",
@@ -487,7 +537,7 @@ def worker(local_rank, args):
     runtime = dict(arch=deep_ep._C.get_npu_arch(), num_vec_cores=deep_ep._C.get_num_vec_cores(),
                    num_ai_cores=deep_ep._C.get_num_ai_cores(),
                    device_name=torch.npu.get_device_name(local_rank),
-                   local_rank=local_rank, hidden=7168, num_topk=8, num_experts=128)
+                   local_rank=local_rank, hidden=args.hidden, num_topk=args.num_topk, num_experts=args.num_experts)
     identity = {}
     agree(lambda: identity.update(build_identity(deep_ep, torch, torch_npu, args)))
     metadata = dict(backend=args.backend, world=world, runtime=runtime, build=identity,
@@ -523,7 +573,7 @@ def worker(local_rank, args):
                         buffer.destroy()
                     buffer = deep_ep.EPBuffer(
                         dist.group.WORLD, num_max_tokens_per_rank=args.capacity,
-                        hidden=7168, num_topk=8, deterministic=case['deterministic'],
+                        hidden=args.hidden, num_topk=args.num_topk, deterministic=case['deterministic'],
                         explicitly_destroy=True, use_huge1g_page=not args.no_huge1g_page)
                     agree(lambda: check_native_contract(buffer, 'low_latency_mode', args.backend))
                     retained = None

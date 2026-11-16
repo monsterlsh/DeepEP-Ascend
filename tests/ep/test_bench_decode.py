@@ -21,7 +21,7 @@ class BenchmarkComparisonTests(unittest.TestCase):
         self.candidate['rows'][0]['max_rank_us'] = [120, 160, 400]
         output = io.StringIO()
         compare(self.base, self.candidate, output)
-        self.assertEqual(output.getvalue().splitlines()[1], '256,fresh,dispatch,200.00,160.00,-20.00')
+        self.assertEqual(output.getvalue().splitlines()[1], '256,fresh,dispatch,200.00,160.00,-20.00,500.00,400.00,-20.00')
 
     def test_rejects_incomparable_or_incomplete_runs(self):
         for changes in (dict(builds=self.base['builds']), dict(ranks=['another host']),

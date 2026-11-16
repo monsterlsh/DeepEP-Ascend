@@ -28,6 +28,11 @@ def create_parser():
     result.add_argument("--bs", nargs="+", type=int, default=list(DEFAULT_BS))
     result.add_argument("--rank-load", choices=("uniform", "decode"), default="uniform",
                         help="Decode uses B=max(1, bs-rank) on each rank.")
+    result.add_argument("--hidden", type=int, default=7168)
+    result.add_argument("--num-topk", type=int, default=8)
+    result.add_argument("--num-experts", type=int, default=128)
+    result.add_argument("--scale-format", choices=("int16", "fp32", "e8m0"), default="int16")
+    result.add_argument("--fp8-expert-dtype", choices=("bf16", "fp16"), default="bf16")
     result.add_argument("--capacity", type=int, default=256)
     result.add_argument("--capacity-mode", choices=("fixed", "batch", "both"), default="fixed")
     result.add_argument("--cpu-sync", choices=("false", "true", "default", "all"), default="false")
@@ -35,8 +40,9 @@ def create_parser():
     result.add_argument("--alignment", nargs="+", type=int, choices=(1, 16, 128), default=[1, 16])
     result.add_argument("--deferred", choices=("false", "true", "both"), default="both")
     result.add_argument("--deterministic", choices=("false", "true", "both"), default="both")
-    result.add_argument("--route", nargs="+", choices=("random", "hotspot"), default=["random", "hotspot"])
-    result.add_argument("--dtype", nargs="+", choices=("bf16", "fp8"), default=["bf16"])
+    result.add_argument("--route", nargs="+", choices=("random", "hotspot", "duplicates"), default=["random", "hotspot"])
+    result.add_argument("--server-ids", type=int, nargs="+", help="Physical server IDs in EP rank order")
+    result.add_argument("--dtype", nargs="+", choices=("bf16", "fp16", "fp8"), default=["bf16"])
     result.add_argument("--scale-layout", nargs="+", choices=("row", "col"), default=["row"])
     result.add_argument("--edge-routes", choices=("auto", "off", "only"), default="auto")
     result.add_argument("--num-processes", type=int, default=8)
@@ -70,8 +76,11 @@ def _booleans(value):
 
 
 def _validate(args, world):
-    if type(world) is not int or world <= 0 or 128 % world:
-        raise ValueError("EP world size must be positive and divide the fixed 128 experts")
+    if type(world) is not int or world <= 0 or args.num_experts <= 0 or args.num_experts % world:
+        raise ValueError("EP world size must be positive and divide the number of experts")
+    if args.hidden <= 0 or args.hidden % 128 or not 1 <= args.num_topk <= min(32, args.num_experts):
+        raise ValueError("Expected H divisible by 128 and 1 <= K <= min(32, E)")
+    validate_server_ids(args.server_ids, world)
     if args.num_processes <= 0:
         raise ValueError("--num-processes must be positive")
     if args.capacity <= 0:
@@ -93,8 +102,20 @@ def _validate(args, world):
         raise ValueError(
             "BF16 B > 4096 exceeds this test payload's exact row-identity encoding; "
             "this is a test-data restriction, not a library limit")
-    if set(args.dtype) == {"bf16"} and "row" not in args.scale_layout:
-        raise ValueError("Column-major scales require --dtype fp8 (BF16 cases have no scales)")
+    if "fp8" not in args.dtype and "row" not in args.scale_layout:
+        raise ValueError("Column-major scales require --dtype fp8")
+
+
+def validate_server_ids(server_ids, world):
+    if server_ids is not None and (len(server_ids) != world or any(not 0 <= i < 2**31 for i in server_ids)):
+        raise ValueError("Supply one nonnegative int32 server ID per EP rank")
+
+
+def configure_server_ids(server_ids, rank):
+    if server_ids is None:
+        os.environ.pop("EP_DECODE_SERVER_ID", None)
+    else:
+        os.environ["EP_DECODE_SERVER_ID"] = str(server_ids[rank])
 
 
 def plan_cases(args, world=None):
@@ -139,6 +160,12 @@ def plan_cases(args, world=None):
             maximum = max(rank_bs)
             capacity = args.capacity if mode == "fixed" else maximum
             case = {
+                "hidden": args.hidden,
+                "num_topk": args.num_topk,
+                "num_experts": args.num_experts,
+                "server_ids": args.server_ids,
+                "scale_format": args.scale_format if dtype == "fp8" else None,
+                "expert_dtype": args.fp8_expert_dtype if dtype == "fp8" else dtype,
                 "bs": bs,
                 "rank_bs": list(rank_bs),
                 "M": capacity,

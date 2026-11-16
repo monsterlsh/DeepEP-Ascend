@@ -33,6 +33,14 @@ class EPBuffer: public BufferBase {
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
     std::shared_ptr<EPLowLatencyState> low_latency_state;
+    int64_t relay_scratch_bytes = 0;
+    void* relay_scratch = nullptr;
+    const int* server_ids = nullptr;
+
+    bool use_server_relay(bool direct, int capacity, int64_t scratch_bytes_per_token) const {
+        return direct and server_ids and
+               int64_t{context->num_ranks} * capacity * scratch_bytes_per_token <= relay_scratch_bytes;
+    }
 
     static void record_use(const torch::Tensor& tensor, const c10_npu::NPUStream& stream) {
         c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
@@ -58,14 +66,14 @@ class EPBuffer: public BufferBase {
             const std::optional<EventHandle>& previous_event,
             const bool& async_with_compute_stream, const bool& allocate_on_comm_stream,
             const bool& do_cpu_sync, const bool& do_zero_padding,
-            const bool& use_cube_aligned_col_major_sf, const bool& defer_epilogue,
+            const bool& defer_epilogue,
             const bool& decode_handle, const int& num_used_vec_cores, const int& num_ub_bytes) {
         const auto num_tokens = static_cast<int>(x.size(0));
         const auto hidden = static_cast<int>(x.size(1));
         return decode_handle and num_ai_cores == 32 and expert_alignment == 128 and
                topk_weights.has_value() and not cumulative_local_expert_recv_stats and not do_cpu_sync and
                do_zero_padding and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
-               defer_epilogue and not use_cube_aligned_col_major_sf and
+               defer_epilogue and
                is_decode_batch(num_tokens, num_max_tokens_per_rank) and
                is_decode_shape(context.num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
                                num_used_vec_cores, num_ub_bytes, sf.has_value());
@@ -79,18 +87,32 @@ public:
              const int64_t& num_buffer_bytes, const int64_t& num_lb_buffer_bytes,
              const bool& use_huge1g_page,
              const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
-             const bool& explicitly_destroy):
+             const bool& explicitly_destroy, int64_t relay_size_hint = 0):
         BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes),
         low_latency_state(std::make_shared<EPLowLatencyState>(num_buffer_bytes)) {
         EP_HOST_ASSERT(num_buffer_bytes >= 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         EP_HOST_ASSERT(num_lb_buffer_bytes >= 0 and num_lb_buffer_bytes % kNumAllocationAlignmentBytes == 0);
+        EP_HOST_ASSERT(num_buffer_bytes <= std::numeric_limits<int64_t>::max() - num_lb_buffer_bytes);
+        const auto arena_bytes = num_buffer_bytes + num_lb_buffer_bytes;
+        EP_HOST_ASSERT(num_cpu_timeout_secs > 0 and num_gpu_timeout_secs > 0);
+        const auto topology = low_latency_state->initialize(
+            hccl_group_name, num_ranks, num_cpu_timeout_secs, num_gpu_timeout_secs, arena_bytes,
+            relay_size_hint > 0 ? relay_size_hint : num_buffer_bytes);
+        relay_scratch_bytes = topology.scratch_bytes;
+        EP_HOST_ASSERT(relay_scratch_bytes <= std::numeric_limits<int64_t>::max() - arena_bytes -
+                       static_cast<int64_t>(sizeof(layout::EPSignals)) - kNumAllocationAlignmentBytes);
         context = std::make_shared<comm::Context>(
-            hccl_group_name, rank_idx, num_ranks, sizeof(layout::EPSignals), num_buffer_bytes + num_lb_buffer_bytes, 0,
+            hccl_group_name, rank_idx, num_ranks, sizeof(layout::EPSignals), arena_bytes + relay_scratch_bytes, 0,
             use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs);
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
+        if (relay_scratch_bytes > 0) {
+            ACL_CHECK(aclrtMemcpy(workspace.decode_server_ids, sizeof(workspace.decode_server_ids),
+                                  topology.server_ids.data(), num_ranks * sizeof(int), ACL_MEMCPY_HOST_TO_DEVICE));
+            server_ids = workspace.decode_server_ids;
+            relay_scratch = math::advance_ptr<void>(context->buffer, arena_bytes);
+        }
         context->set_common_signals(&workspace.common_signals);
-        low_latency_state->initialize(*context);
         lb_storage = torch::from_blob(
             context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
             torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
@@ -192,27 +214,50 @@ public:
         int sf_token_stride = 0;
         int sf_hidden_stride = 0;
         void* sf_ptr = nullptr;
+        torch::Tensor wire_scales;
         if (sf.has_value()) {
             EP_HOST_ASSERT(x.scalar_type() == torch::kFloat8_e4m3fn);
             EP_HOST_ASSERT(sf->dim() == 2 and sf->size(0) == num_tokens);
-            EP_HOST_ASSERT(sf->element_size() == sizeof(sf_pack_t));
             EP_HOST_ASSERT(sf->device() == x.device());
             EP_HOST_ASSERT(sf->stride(0) == 1 or sf->stride(1) == 1);
-            EP_HOST_ASSERT(sf->stride(0) <= std::numeric_limits<int>::max() and
-                           sf->stride(1) <= std::numeric_limits<int>::max());
-            num_sf_packs = static_cast<int>(sf->size(1));
-            sf_ptr = sf->data_ptr();
-            sf_token_stride = static_cast<int>(sf->stride(0));
-            sf_hidden_stride = static_cast<int>(sf->stride(1));
+            const bool wide = sf->scalar_type() == torch::kFloat32 or sf->scalar_type() == torch::kInt32;
+            EP_HOST_ASSERT(wide or sf->element_size() == sizeof(sf_pack_t));
+            // FP32 per-128 scales and packed E8M0 INT32 use two consecutive
+            // 16-bit wire words per entry. Preserve their bits and public dtype.
+            if (wide)
+                EP_HOST_ASSERT(sf->size(1) == math::ceil_div(hidden, 128));
+            wire_scales = (wide or sf->stride(0) == 0 or sf->stride(1) == 0) ? sf->contiguous() : *sf;
+            const int words_per_scale = wide ? 2 : 1;
+            const auto columns = wire_scales.size(1);
+            // Singleton/empty dimensions can carry arbitrary PyTorch strides.
+            const auto row_stride = num_tokens <= 1 ? columns : wire_scales.stride(0);
+            const auto column_stride = wide or num_tokens == 0 or columns == 1 ? 1 : wire_scales.stride(1);
+            EP_HOST_ASSERT(wire_scales.size(1) > 0 and
+                           columns <= std::numeric_limits<int>::max() / (words_per_scale * static_cast<int>(sizeof(sf_pack_t))) and
+                           row_stride <= std::numeric_limits<int>::max() / words_per_scale and
+                           column_stride <= std::numeric_limits<int>::max());
+            num_sf_packs = static_cast<int>(columns) * words_per_scale;
+            sf_ptr = wire_scales.data_ptr();
+            sf_token_stride = static_cast<int>(row_stride) * words_per_scale;
+            sf_hidden_stride = static_cast<int>(column_stride);
         } else {
-            EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+            EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 or x.scalar_type() == torch::kFloat16);
         }
 
         // Check top-k stuffs
+        EP_HOST_ASSERT(topk_idx.dim() == 2 and 1 <= topk_idx.size(1) and topk_idx.size(1) <= 32);
         const auto num_topk = static_cast<int>(topk_idx.size(1));
         EP_HOST_ASSERT(topk_idx.size(0) == num_tokens);
         EP_HOST_ASSERT(topk_idx.scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(topk_idx.is_contiguous());
+        EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and math::is_power_of_2(expert_alignment));
+        const auto max_expert_rows = get_dispatch_max_expert_rows(context->num_ranks, num_max_tokens_per_rank, num_topk);
+        EP_HOST_ASSERT(max_expert_rows <= kDispatchReductionMaxValue and
+                       "Per-expert route count exceeds the 24-bit dispatch reduction");
+        EP_HOST_ASSERT(not do_cpu_sync or math::align<int64_t>(max_expert_rows, expert_alignment) <= kDispatchReductionMaxValue);
+        const auto max_expanded_rows = get_dispatch_max_expanded_rows(max_expert_rows, num_experts_per_rank, expert_alignment);
+        EP_HOST_ASSERT(max_expanded_rows <= std::numeric_limits<int>::max() and
+                       "Expanded row capacity exceeds the 32-bit dispatch slot index");
 
         // Weights are optional for training backward
         float* topk_weights_ptr = nullptr;
@@ -297,11 +342,11 @@ public:
             *context, x, sf, topk_weights, cumulative_local_expert_recv_stats,
             num_max_tokens_per_rank, num_experts, num_topk, expert_alignment, num_ai_cores,
             previous_event, async_with_compute_stream, allocate_on_comm_stream,
-            do_cpu_sync, do_zero_padding, use_cube_aligned_col_major_sf, defer_epilogue,
+            do_cpu_sync, do_zero_padding, defer_epilogue,
             decode_handle, num_used_vec_cores, num_ub_bytes);
         const bool low_latency_transport = low_latency_state->prepare_dispatch(
             *context, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores,
-            num_ub_bytes, sf.has_value(), cached_mode, barrier_in_prologue, matched_layout);
+            num_ub_bytes, num_sf_packs, cached_mode, barrier_in_prologue, matched_layout);
 
         // Clean host workspace
         const auto host_workspace_layout = layout::EPWorkspaceLayout(host_workspace);
@@ -327,6 +372,7 @@ public:
         }
 
         // Launch dispatch
+        const bool relay = use_server_relay(low_latency_transport, num_max_tokens_per_rank, sizeof(int));
         low_latency_state->begin();
         const auto ll_failure_guard = low_latency_state->failure_guard();
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -354,7 +400,7 @@ public:
                         num_used_vec_cores,
                         context->num_gpu_timeout_cycles,
                         barrier_in_prologue,
-                        low_latency_transport);
+                        low_latency_transport, relay ? server_ids : nullptr, relay ? relay_scratch : nullptr);
 
         // URMA still reads x and metadata_send_buffer after the issue kernel exits.
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
@@ -403,9 +449,7 @@ public:
                     num_recv_tokens_per_expert_list.push_back(count);
                 }
             } else {
-                num_expanded_tokens = context->num_ranks * num_max_tokens_per_rank * std::min(num_topk, num_experts_per_rank);
-                num_expanded_tokens += (expert_alignment - 1) * num_experts_per_rank;
-                num_expanded_tokens = math::align(num_expanded_tokens, expert_alignment);
+                num_expanded_tokens = static_cast<int>(max_expanded_rows);
             }
 
             // Allocate output tensors
@@ -417,10 +461,7 @@ public:
             if (sf.has_value()) {
                 recv_sf_token_stride = num_sf_packs;
                 recv_sf_hidden_stride = 1;
-                recv_sf = torch::empty_strided(
-                    {num_expanded_tokens, num_sf_packs},
-                    {recv_sf_token_stride, recv_sf_hidden_stride},
-                    sf->options());
+                recv_sf = torch::empty({num_expanded_tokens, sf->size(1)}, sf->options());
                 recv_sf_ptr = recv_sf->data_ptr();
             }
             auto recv_topk_weights = std::optional<torch::Tensor>();
@@ -523,7 +564,7 @@ public:
         const auto hidden = static_cast<int>(x.size(1));
         EP_HOST_ASSERT(x.dim() == 2);
         EP_HOST_ASSERT(x.is_contiguous());
-        EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
+        EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 or x.scalar_type() == torch::kFloat16);
 
         // Check metadata from dispatch
         const auto num_combined_tokens = static_cast<int>(combined_topk_idx.size(0));
@@ -580,6 +621,9 @@ public:
             not bias_1 and not previous_event and async_with_compute_stream and not allocate_on_comm_stream and
             defer_epilogue, barrier_in_prologue);
         torch::Tensor send_buffer;
+        const auto relay_row = get_combine_token_layout(hidden * 2, num_topk).get_num_bytes() + sizeof(int32_t);
+        const bool relay = use_server_relay(low_latency_transport, num_max_tokens_per_rank, relay_row);
+        const int* combine_servers = relay ? server_ids : nullptr;
         if (not low_latency_transport) {
             const auto token_layout = get_combine_token_layout(hidden * static_cast<int>(sizeof(uint16_t)), num_topk);
             send_buffer = torch::empty({num_reduced_tokens, token_layout.get_num_bytes()}, x.options().dtype(torch::kByte));
@@ -609,7 +653,8 @@ public:
             num_ub_bytes,
             num_used_vec_cores,
             context->num_gpu_timeout_cycles,
-            barrier_in_prologue, low_latency_transport
+            barrier_in_prologue, low_latency_transport, x.scalar_type() == torch::kFloat16,
+            combine_servers, relay ? relay_scratch : nullptr
         );
 
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
@@ -654,7 +699,7 @@ public:
                 num_ub_bytes,
                 num_used_vec_cores,
                 context->num_gpu_timeout_cycles,
-                not barrier_in_prologue
+                not barrier_in_prologue, x.scalar_type() == torch::kFloat16, combine_servers
             );
 
             low_latency_state->record_completion();

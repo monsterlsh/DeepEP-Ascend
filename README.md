@@ -94,7 +94,7 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and native MTE transport for eligible decode dispatch and combine |
+| `EPBuffer` | Expanded BF16/FP16/FP8 dispatch, BF16/FP16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and native MTE transport with optional cross-server deduplication |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
@@ -153,7 +153,7 @@ Training, prefill and decoding use the same `EPBuffer` dispatch and combine APIs
 ```python
 def dispatch_forward(buffer, x, topk_idx, topk_weights, num_experts,
                      expert_alignment=1, do_cpu_sync=True):
-    """Route BF16 or FP8 inputs to their selected experts."""
+    """Route BF16, FP16 or FP8 inputs to their selected experts."""
     return buffer.dispatch(
         x,
         topk_idx=topk_idx,
@@ -181,7 +181,7 @@ def dispatch_backward(buffer, grad_recv_x, grad_recv_weights, handle, bias=None)
 
 
 def combine_forward(buffer, expert_output, handle, bias=None):
-    """Reduce BF16 expert outputs back to their original ranks."""
+    """Reduce BF16 or FP16 expert outputs back to their original ranks."""
     return buffer.combine(
         expert_output,
         handle=handle,
@@ -234,15 +234,41 @@ The native EP interface can select MTE for the following decode workload:
   and the default 100-second device timeout.
 - EP2, EP4, EP8, EP16, EP32, EP64 or EP128 with a common per-rank capacity
   `1 ≤ M ≤ 256`. Each rank can supply any number of tokens from 1 through `M`.
-- BF16 activations, hidden size 7168, top-8 routing over 128 experts, expert alignment 128.
-  Dispatch uses FP32 routing weights, expanded output, zero padding, an asynchronous deferred
-  epilogue and no host count sync, cumulative stats or deterministic sorting. Combine returns
-  the weight side channel and sums the expert outputs with no bias.
+- BF16/FP16 activations with `H` divisible by 128, or FP8 E4M3 with `H` divisible by 256.
+  FP8 dispatch carries native 16-bit scale packs, FP32 scales per 128 channels, or INT32 words
+  containing four E8M0 scales per 128 channels. The returned scales preserve their dtype and bits.
+- `1 ≤ K ≤ min(E, 32)`, `E ≤ 512`, and `E` evenly divisible by the EP group size. The
+  dispatch stages and the combine reduction ring must fit UB. This covers H7168/K6/E384,
+  as well as H7168/K8/E128. Use expert alignment 128, FP32 routing weights, expanded output,
+  zero padding and an asynchronous deferred epilogue. Host count sync and deterministic sorting
+  use the general path.
+- The expert computation applies the routing weight once to each selected expert output.
+  Combine sums BF16 or FP16 expert rows. Its optional `topk_weights` argument restores the
+  weights in their original routing slots. Bias or an omitted weight side channel uses URMA.
 
 Dispatch writes each token into the destination rank's registered EP communication buffer.
 The native copy epilogue and cached handle use the same token layout as URMA. Fresh and
 cached dispatch and either barrier placement use the full capacity range. Combine selects
 its transport independently on a compatible handle from the same buffer.
+All ranks use the same H/K/E, capacity, payload dtype and scale format. When the host does
+not synchronize receive counts, expanded output reserves up to `world × M × K` expert
+rows plus alignment space. Repeated routing slots can each produce a row even when they
+select the same expert. Exact-count and cached calls reuse their respective receive counts.
+
+For cross-server deduplication, set `EP_DECODE_SERVER_ID` on **each rank** before creating
+the buffer. Use the same nonnegative integer for ranks on one physical server and different
+integers for different servers. EP ranks may be interleaved. The group exchanges IDs at
+initialization. With a multi-server group containing a shared server, dispatch sends the
+full packet once per remote server and its other recipients fetch it within that server.
+Combine reduces rank partials inside each server, merges the per-slot weight bits, then
+sends one partial to the token owner. Each server partial rounds to the expert output dtype,
+so floating-point sums can differ from rank-direct reduction. The default uses rank-direct MTE.
+
+Relay storage shares the HCCL registration and is allocated after the EP and LB regions.
+Dispatch needs one 32-bit descriptor per source capacity slot. Combine needs
+`world × M × (2H + align(4K, 32) + 4)` bytes per rank. The operations reuse the same region.
+If you construct a buffer with an explicit byte size and no model dimensions, that size also
+sets the relay reserve. Each operation uses rank-direct MTE when its staging does not fit.
 
 For eligible geometry, each operation exchanges its current eligibility across all ranks
 on a separate HCCL stream. A local veto, including an empty input rank, selects URMA for

@@ -15,6 +15,7 @@ struct alignas(kNumAllocationAlignmentBytes) EPSignals {
     int host_rank_expert_count[kNumMaxRanks + kNumMaxExperts];
     // Rows are packed with the active number of experts per rank.
     int epilogue_expert_counter[kNumMaxVecCores * kNumMaxExperts];
+    int decode_server_ids[kNumMaxRanks];
 };
 
 struct EPWorkspaceLayout {

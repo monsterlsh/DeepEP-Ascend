@@ -19,6 +19,16 @@ def make_routes(world, b, k, e, seed):
     return result
 
 
+def make_decode_routes(world, capacity, num_topk, num_experts, rank_load):
+    """Use identical per-rank benchmark inputs for timing and offline traffic counts."""
+    routes = make_routes(world, capacity, num_topk, num_experts, seed=capacity)
+    if rank_load == 'uniform':
+        return routes
+    if rank_load == 'decode':
+        return [rows[:max(1, capacity - rank)] for rank, rows in enumerate(routes)]
+    raise ValueError('unknown rank load')
+
+
 def expert_entries(routes, experts, world, rank):
     local = experts // world
     result = [[] for _ in range(local)]
@@ -42,7 +52,7 @@ def payload(sources, tokens, hidden, dtype):
     return values
 
 
-def expected_combine(routes, rank, hidden, dtype, *, experts, weighted=False, bias=0):
+def expected_combine(routes, rank, hidden, dtype, *, experts, weighted=False, bias=0, server_ids=None):
     """Reference sum; routing weights only apply when the caller requests them.
 
     ``weighted=True`` models caller-side multiplication of each expert output
@@ -71,8 +81,18 @@ def expected_combine(routes, rank, hidden, dtype, *, experts, weighted=False, bi
                 if destination in partials:
                     expert_value = partials[destination][1] + expert_value
                 partials[destination] = (slot, expert_value)
-        # Native reverse routing places a rank's partial in its last valid top-k
-        # slot, then the epilogue accumulates these slots in their original order.
+        if server_ids is not None:
+            servers = {}
+            for peer, (slot, value) in sorted(partials.items()):
+                domain = server_ids[peer]
+                value = value.to(dtype).float()
+                if domain in servers:
+                    last_slot, running = servers[domain]
+                    slot, value = max(slot, last_slot), running + value
+                servers[domain] = (slot, value)
+            partials = servers
+        # Each wire partial is rounded to the expert dtype and identified by
+        # the last top-k lane of its contributing rank (or server).
         for _, value in sorted(partials.values(), key=lambda item: item[0]):
             expected[token] += value.to(dtype).float()
     return expected.to(dtype)

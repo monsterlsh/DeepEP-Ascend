@@ -3,9 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <memory>
 #include <stdexcept>
-#include <vector>
 
 #include <acl/acl.h>
 #include <hccl/hccl.h>
@@ -37,29 +35,6 @@ public:
                aclrtMallocHost(&host, recv_bytes) == ACL_SUCCESS and
                aclrtMalloc(&device, sizeof(votes) + recv_bytes, ACL_MEM_MALLOC_NORMAL_ONLY) == ACL_SUCCESS and
                aclrtMemcpy(device, sizeof(votes), votes.data(), sizeof(votes), ACL_MEMCPY_HOST_TO_DEVICE) == ACL_SUCCESS;
-    }
-
-    // Even a rank that could not allocate the per-call vote resources must
-    // participate in the initial capability vote so the group can use URMA.
-    static bool agree_capability(HcclComm comm, int world, int timeout, bool capable) {
-        constexpr int max_timeout_secs = 3600;
-        const uint16_t local = capable and timeout <= max_timeout_secs;
-        const auto bytes = static_cast<size_t>(world) * sizeof(local);
-        std::vector<uint16_t> peers(world);
-        void* raw = nullptr;
-        ACL_CHECK(aclrtMalloc(&raw, bytes + sizeof(local), ACL_MEM_MALLOC_NORMAL_ONLY));
-        std::unique_ptr<void, decltype(&aclrtFree)> owned(raw, &aclrtFree);
-        auto* send = static_cast<char*>(raw) + bytes;
-        ACL_CHECK(aclrtMemcpy(send, sizeof(local), &local, sizeof(local), ACL_MEMCPY_HOST_TO_DEVICE));
-        const auto stream = c10_npu::getCurrentNPUStream();
-        const auto status = HcclAllGather(send, raw, 1, HCCL_DATA_TYPE_UINT16, comm, stream);
-        // A timed-out collective can still access its device allocation.
-        owned.release();
-        ACL_CHECK(aclrtSynchronizeStreamWithTimeout(stream, std::min(timeout, max_timeout_secs) * 1000));
-        owned.reset(raw);
-        HCCL_CHECK(status);
-        ACL_CHECK(aclrtMemcpy(peers.data(), bytes, raw, bytes, ACL_MEMCPY_DEVICE_TO_HOST));
-        return std::all_of(peers.begin(), peers.end(), [](uint16_t vote) { return vote != 0; });
     }
 
     static bool is_capturing() {

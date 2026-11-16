@@ -30,6 +30,10 @@ OFFICIAL_COMBINE = '_ZN7deep_ep12combine_implILi16ELi8ELi7168ELi2ELi64ELl1000000
 DISPATCH_EPILOGUE = '_ZN7deep_ep27dispatch_copy_epilogue_implILi16ELi128ELi8ELi1ELb0ELb0ELi64ELi14336ELi0ELi2ELi221184ELl100000000000ELb0EEEvPvS1_S1_PiS2_S1_PsPfS2_iii'
 COMBINE_EPILOGUE = '_ZN7deep_ep28combine_reduce_epilogue_implILi16ELi128ELi8ELi7168ELi2ELi221184ELi64ELl100000000000ELb0ELi14336EEEvPu6__bf16PfPlS1_S1_S1_PvS4_i'
 
+# Kernel entry symbols from CANN 9.2 dav-3510 offline compilation, EP64 / H7168 / K6 / E384.
+DISPATCH_RELAY = '_ZN7deep_ep13dispatch_implILi64ELi384ELi6ELi128ELb0ELb0ELi64ELi14336ELi0ELi32ELi221184ELl100000000000ELb1ELb1ELb1ELi1ELi64ELi6EEEvPvPsPlPfPhPiS6_S6_S6_S6_S6_S1_S1_S1_S1_iiiiPKiS6_'
+COMBINE_RELAY_FP16 = '_ZN7deep_ep12combine_implILi64ELi6ELi7168ELi32ELi64ELl100000000000ELi221184ELb1ELb1ELb1EDhLb1EEEvPT9_PfPiS4_PhS5_PvS6_iPKiS6_'
+COMBINE_RELAY_BF16 = '_ZN7deep_ep12combine_implILi64ELi6ELi7168ELi33ELi64ELl100000000000ELi221184ELb1ELb1ELb1Eu6__bf16Lb1EEEvPT9_PfPiS4_PhS5_PvS6_iPKiS6_'
 
 # Synthetic demangled symbol for the SHMEM combine device specialization.
 COMBINE_SHMEM = 'deep_ep::combine_impl<16, 8, 7168, 2, 64, 100000000000L, 221184, true, true, true, true>(...)'
@@ -63,6 +67,39 @@ class KernelParserTests(unittest.TestCase):
         self.assertEqual(trace.identify_transport(direct, 'dispatch'), 'mte')
         with self.assertRaises(trace.TraceVerificationError):
             trace.parse_kernel(historical_layout, 'dispatch')
+
+    def test_dispatch_relay_uses_new_call_signature(self):
+        new_abi = DISPATCH_RELAY
+        parameters = trace.parse_kernel(new_abi, 'dispatch')
+        self.assertTrue(parameters['server_relay'])
+        checks = trace.verify_case_metadata({new_abi: parameters}, 'dispatch', {'server_relay': True})
+        self.assertIn('server_relay', checks['checked_fields'])
+        with self.assertRaises(trace.TraceVerificationError):
+            trace.parse_kernel(new_abi.replace('ELb1ELb1ELb1E', 'ELb1ELb0ELb1E'), 'dispatch')
+        old = trace.parse_kernel(DISPATCH_MTE, 'dispatch')
+        with self.assertRaises(trace.TraceVerificationError):
+            trace.verify_case_metadata({DISPATCH_MTE: old}, 'dispatch', {'server_relay': True})
+
+    def test_typed_combine_and_relay(self):
+        name = 'deep_ep::combine_impl<16, 6, 7168, 2, 64, 100000000000L, 221184, true, true, true, half, true>(...)'
+        for typed, expected in ((name, 'fp16'), (name.replace('half', '__bf16'), 'bf16'),
+                                (COMBINE_RELAY_FP16, 'fp16'), (COMBINE_RELAY_BF16, 'bf16')):
+            parsed = trace.parse_kernel(typed, 'combine')
+            self.assertTrue(parsed['server_relay'])
+            result = trace.verify_case_metadata({typed: parsed}, 'combine', {'dtype': expected})
+            self.assertIn('dtype', result['checked_fields'])
+            with self.assertRaises(trace.TraceVerificationError):
+                trace.verify_case_metadata({typed: parsed}, 'combine', {'dtype': 'fp8'})
+        for encoded, dtype in (('Dh', 'fp16'), ('DF16_', 'fp16'), ('u6__bf16', 'bf16')):
+            symbol = COMBINE_MTE.replace('EEEv', f'E{encoded}Lb0EEEv')
+            self.assertEqual(trace.parse_kernel(symbol, 'combine')['dtype'], dtype)
+        for invalid in (name.replace('true, half', 'false, half'), name.replace('half', 'int'),
+                        COMBINE_MTE.replace('EEEv', 'EfEEv')):
+            with self.assertRaises(trace.TraceVerificationError):
+                trace.parse_kernel(invalid, 'combine')
+        with self.assertRaises(trace.TraceVerificationError):
+            trace.verify_case_metadata({COMBINE_MTE: trace.parse_kernel(COMBINE_MTE, 'combine')},
+                                       'combine', {'dtype': 'fp16'})
 
     def test_real_candidate_symbols_and_parameters(self):
         for operation, mte, urma in (('dispatch', DISPATCH_MTE, DISPATCH_URMA),
@@ -122,10 +159,12 @@ class KernelParserTests(unittest.TestCase):
                         alignment=1, num_vec_cores=64, min_num_ub_bytes=190 * 1024,
                         deferred=False, weight_side_channel=True, scale_layout='row')
         checks = trace.verify_case_metadata(parameters, 'dispatch', metadata)
-        self.assertTrue({'M', 'cached', 'cpu_sync', 'dtype', 'hidden', 'barrier_in_prologue'}
+        self.assertTrue({'M', 'cached', 'cpu_sync', 'dtype_width', 'hidden', 'barrier_in_prologue'}
                         <= set(checks['checked_fields']))
         self.assertEqual(checks['not_observable_from_symbol'],
-                         ['B', 'deferred', 'scale_layout', 'weight_side_channel'])
+                         ['B', 'deferred', 'dtype', 'scale_layout', 'weight_side_channel'])
+        self.assertIn('dtype', trace.verify_case_metadata(parameters, 'dispatch', dict(metadata, dtype='fp16'))[
+            'not_observable_from_symbol'])
         for key, bad_value in (('M', 256), ('cached', True), ('cpu_sync', None),
                                ('barrier_in_prologue', False), ('dtype', 'fp8'),
                                ('hidden', 4096), ('min_num_ub_bytes', 240 * 1024)):

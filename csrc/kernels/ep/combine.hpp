@@ -31,22 +31,28 @@ static void* launch_combine(void* x,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
                             const bool& do_barrier = false,
-                            const bool& low_latency_transport = false) {
+                            const bool& low_latency_transport = false, bool use_fp16 = false,
+                            const int* server_ids = nullptr, void* relay_scratch = nullptr) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
+    const bool relay = server_ids != nullptr;
+    EP_HOST_ASSERT(relay == (relay_scratch != nullptr));
+    EP_HOST_ASSERT(not relay or low_latency_transport);
 
     // Compile
-    const auto kernel = jit->compile(low_latency_transport ? "combine_mte" : "combine", std::format(R"(
+    const auto kernel = jit->compile(relay ? "combine_mte_relay" : low_latency_transport ? "combine_mte" : "combine",
+                                     std::format(R"(
 #include <deep_ep/impls/ep/combine.hpp>
 
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_topk, hidden, num_max_tokens_per_rank, num_vec_cores,
-        num_timeout_cycles, num_ub_bytes, do_barrier, topk_weights != nullptr, low_latency_transport));
+        num_timeout_cycles, num_ub_bytes, do_barrier, topk_weights != nullptr, low_latency_transport,
+        use_fp16 ? "half" : "bfloat16_t", relay));
 
     // Launch
     jit->launch(
@@ -59,7 +65,7 @@ static void __instantiate_kernel() {{
         send_buffer,
         workspace,
         jetty_ptrs,
-        rank_idx);
+        rank_idx, server_ids, relay_scratch);
     return buffer;
 }
 
@@ -79,7 +85,8 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_ub_bytes,
                                            const int& num_vec_cores,
                                            const int64_t& num_timeout_cycles,
-                                           const bool& do_barrier = true) {
+                                           const bool& do_barrier = true, bool use_fp16 = false,
+                                           const int* server_ids = nullptr) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -93,10 +100,11 @@ static void launch_combine_reduce_epilogue(void* combined_x,
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_experts, num_topk,
-        hidden, num_max_tokens_per_rank, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier));
+        hidden, num_max_tokens_per_rank, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier,
+        hidden * sizeof(uint16_t), use_fp16 ? "half" : "bfloat16_t", server_ids != nullptr));
 
     // Launch
     jit->launch(
@@ -109,7 +117,7 @@ static void __instantiate_kernel() {{
         bias_1,
         workspace,
         jetty_ptrs,
-        num_combined_tokens);
+        num_combined_tokens, server_ids);
 }
 
 }  // namespace deep_ep

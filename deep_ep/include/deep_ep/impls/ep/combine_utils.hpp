@@ -92,15 +92,77 @@ __simd_vf__ __forceinline__ void combine_reduce_vf(__ubuf__ bfloat16_t* base_ptr
     }
 }
 
+template <int kHidden, int kNumTopk, int kNumStrideElems, int kNumSlots>
+__simd_vf__ __forceinline__ void combine_reduce_vf(__ubuf__ half* base_ptr, __ubuf__ half* output_ptr,
+                                                   const int count, const int slot_start_idx) {
+    constexpr int lanes = AscendC::VECTOR_REG_WIDTH / sizeof(float);
+    EP_STATIC_ASSERT(kHidden % (lanes * 2) == 0);
+    if (count <= 1) {
+        vector_half value;
+        asc_duplicate_scalar(value, static_cast<half>(0));
+        for (int offset = 0; offset < kHidden; offset += lanes * 2) {
+            if (count == 1)
+                asc_loadalign(value, base_ptr + slot_start_idx * kNumStrideElems + offset);
+            asc_storealign(output_ptr + offset, value, asc_create_mask_b16(PAT_ALL));
+        }
+        return;
+    }
+
+    // Accumulate the selected expert rows in FP32, then round once on store.
+    const auto mask = asc_create_mask_b32(PAT_ALL);
+    for (int offset = 0; offset < kHidden; offset += lanes) {
+        int slot = slot_start_idx;
+        vector_float sum;
+        vector_half value;
+        asc_loadalign_unpack(value, base_ptr + slot * kNumStrideElems + offset);
+        asc_half2float(sum, value, mask, ASC_POSITION_EVEN);
+        for (int i = 1; i < count; ++i) {
+            slot = slot + 1 == kNumSlots ? 0 : slot + 1;
+            vector_float contribution;
+            asc_loadalign_unpack(value, base_ptr + slot * kNumStrideElems + offset);
+            asc_half2float(contribution, value, mask, ASC_POSITION_EVEN);
+            asc_add(sum, sum, contribution, mask);
+        }
+        asc_float2half_rn(value, sum, mask, ASC_POSITION_EVEN);
+        asc_storealign_pack(reinterpret_cast<__ubuf__ int32_t*>(output_ptr + offset),
+                            reinterpret_cast<vector_int32_t&>(value), mask);
+    }
+}
+
+template <int kNumTopk, int kNumTokenElems, int kNumSlots, int kNumHiddenElems>
+__simd_vf__ __forceinline__ void restore_combine_weights(
+    __ubuf__ uint32_t* ub_tokens, __ubuf__ uint32_t* ub_output,
+    const int first_token_idx, const int num_tokens) {
+    // A weight row is padded to 32 bytes. A full 256-byte vector load can
+    // extend past the final UB ring slot at higher hidden/top-k geometries.
+    constexpr int kBlockLanes = kNumUbAlignmentBytes / static_cast<int>(sizeof(uint32_t));
+    for (int lane = 0; lane < kNumTopk; lane += kBlockLanes) {
+        uint32_t remaining = math::min(kBlockLanes, kNumTopk - lane);
+        const auto mask = asc_update_mask_b32(remaining);
+        vector_uint32_t result;
+        asc_duplicate_scalar(result, static_cast<uint32_t>(0), mask);
+        int slot = first_token_idx;
+        #pragma unroll 1
+        for (int i = 0; i < num_tokens; ++i) {
+            vector_uint32_t weights;
+            auto input = ub_tokens + (slot * kNumTokenElems + kNumHiddenElems) / 2 + lane;
+            asc_loadalign_brc_v2(weights, input);
+            asc_or(result, result, weights, mask);
+            slot = slot + 1 == kNumSlots ? 0 : slot + 1;
+        }
+        asc_storealign(ub_output + lane, result, mask);
+    }
+}
+
 template <uint32_t kNumHiddenElems, uint32_t kNumTopk, uint32_t kNumMutex = 32, uint32_t kMutexOffset = 0,
-          uint32_t kNumExtraBytes = 0>
+          uint32_t kNumExtraBytes = 0, typename element_t = bfloat16_t>
 struct RingReducer {
-    static constexpr uint32_t kNumHiddenBytes = kNumHiddenElems * sizeof(bfloat16_t);
+    static constexpr uint32_t kNumHiddenBytes = kNumHiddenElems * sizeof(element_t);
     static constexpr uint32_t kNumTokenElems =
-        kNumHiddenElems + math::ceil_div<uint32_t>(kNumExtraBytes, sizeof(bfloat16_t));
+        kNumHiddenElems + math::ceil_div<uint32_t>(kNumExtraBytes, sizeof(element_t));
 
     struct Buffer {
-        bfloat16_t buf[kNumMutex][kNumTokenElems];
+        element_t buf[kNumMutex][kNumTokenElems];
     };
 
     __ubuf__ Buffer* ub;
@@ -108,7 +170,7 @@ struct RingReducer {
 
     __aicore__ __forceinline__ RingReducer(__ubuf__ Buffer* ub): ub(ub), slot_idx(0) {}
 
-    __aicore__ __forceinline__ void load_next_token(__gm__ bfloat16_t* ptr,
+    __aicore__ __forceinline__ void load_next_token(__gm__ element_t* ptr,
                                                     asc_load_l2_cache_mode mode = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
                                                     const uint32_t num_extra_bytes = 0) {
         asc_lock(PIPE_MTE2, kMutexOffset + slot_idx);
@@ -117,7 +179,7 @@ struct RingReducer {
         slot_idx = slot_idx + 1 == kNumMutex ? 0 : slot_idx + 1;
     }
 
-    __aicore__ __forceinline__ void load_first_2_token(__gm__ bfloat16_t* base, int idx_0, int idx_1,
+    __aicore__ __forceinline__ void load_first_2_token(__gm__ element_t* base, int idx_0, int idx_1,
                                                        asc_load_l2_cache_mode mode = asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM) {
         slot_idx = slot_idx == kNumMutex - 1 ? 0 : slot_idx;
         const auto min_idx = idx_0 < idx_1 ? idx_0 : idx_1;
@@ -133,7 +195,7 @@ struct RingReducer {
         slot_idx = slot_idx + 2 == kNumMutex ? 0 : slot_idx + 2;
     }
 
-    __aicore__ __forceinline__ void store_last_token(__gm__ bfloat16_t* output_addr,
+    __aicore__ __forceinline__ void store_last_token(__gm__ element_t* output_addr,
                                                      asc_store_l2_cache_mode mode = asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
                                                      __gm__ uint8_t* extra_output_addr = nullptr,
                                                      const uint32_t num_extra_output_bytes = kNumExtraBytes) {

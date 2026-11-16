@@ -75,7 +75,7 @@ int main() {
                                   ep == 32 || ep == 64 || ep == 128) && m >= 1 && m <= 256;
             assert(is_decode_capacity(ep, m) == in_grid);
             assert(is_decode_shape(ep, m, 7168, 8, 128, 64, 221184, false) == in_grid);
-            const auto plan = get_dispatch_low_latency_plan(3510, ep, m, 7168, 8, 128, 64, 221184, false);
+            const auto plan = get_dispatch_low_latency_plan(3510, ep, m, 7168, 8, 128, 64, 221184, 0);
             assert(bool(plan) == in_grid);
             if (plan)
                 assert(plan->buffer_bytes == int64_t(ep) * m * (14336 + 128));
@@ -85,21 +85,55 @@ int main() {
         for (int b = -1; b <= m + 1; ++b)
             assert(is_decode_batch(b, m) == (b >= 1 && b <= m));
     }
-    const auto plan = [](int arch, int h, int k, int e, int cores, int ub, bool fp8) {
-        return get_dispatch_low_latency_plan(arch, 8, 64, h, k, e, cores, ub, fp8);
+    const auto plan = [](int arch, int h, int k, int e, int cores, int ub, int sf_words) {
+        return get_dispatch_low_latency_plan(arch, 8, 64, h, k, e, cores, ub, sf_words);
     };
-    assert(!plan(2201,7168,8,128,64,221184,false));
-    assert(!plan(3510,4096,8,128,64,221184,false));
-    assert(!plan(3510,7168,4,128,64,221184,false));
-    assert(!plan(3510,7168,8,256,64,221184,false));
-    assert(!plan(3510,7168,8,128,32,221184,false));
-    assert(!plan(3510,7168,8,128,64,221183,false));
-    assert(!plan(3510,7168,8,128,64,221185,false));
-    assert(!plan(3510,7168,8,128,64,221184,true));
+    assert(!plan(2201, 7168, 8, 128, 64, 221184, 0));
+    assert(plan(3510, 4096, 8, 128, 64, 221184, 0));
+    assert(plan(3510, 7168, 4, 128, 64, 221184, 0));
+    assert(plan(3510, 7168, 8, 256, 64, 221184, 0));
+    assert(!plan(3510, 7168, 8, 128, 32, 221184, 0));
+    assert(!plan(3510, 7168, 8, 128, 64, 221183, 0));
+    assert(!plan(3510, 7168, 8, 128, 64, 221185, 0));
+    for (int ranks : {8, 16, 32, 64, 128}) {
+        const auto model = get_dispatch_low_latency_plan(3510, ranks, 256, 7168, 6, 384, 64, 221184, 112);
+        assert(model && model->buffer_bytes == int64_t(ranks) * 256 * (7168 + 224 + 96));
+    }
+    assert(plan(3510, 384, 8, 128, 64, 221184, 0));
+    assert(!plan(3510, 384, 8, 128, 64, 221184, 6));  // FP8 zero padding is one 256-byte vector
+    assert(!plan(3510, 7169, 8, 128, 64, 221184, 0));
+    assert(!plan(3510, 0, 8, 128, 64, 221184, 0));
+    assert(!plan(3510, 7168, 0, 128, 64, 221184, 0));
+    assert(!plan(3510, 4096, 9, 8, 64, 221184, 0));
+    assert(!plan(3510, 4096, 8, 130, 64, 221184, 0));
+    assert(!plan(3510, 4096, 8, 520, 64, 221184, 0));
+    assert(!plan(3510, 4096, 8, 128, 64, 221184, -1));
+    assert(!plan(3510, 4096, 8, 128, 64, 221184, std::numeric_limits<int>::max()));
+    assert(!plan(3510, 4096, 8, 128, 64, 221184, 27000));
+    // 32 routes fit the issue ring for a small hidden size. Same shape with
+    // EP32 needs 34 reduction slots, exceeding the 32 available mutex IDs.
+    assert(plan(3510, 2048, 32, 512, 64, 221184, 0));
+    assert(!plan(3510, 4096, 32, 512, 64, 221184, 0));
+    assert(!is_decode_shape(32, 64, 2048, 32, 512, 64, 221184, false));
+    assert(!plan(3510, 2048, 33, 512, 64, 221184, 0));
+    assert(!plan(3510, std::numeric_limits<int>::max() - 127, 8, 128, 64, 221184, 0));
     check_workspace_size<128, 2, 1, 8>();
     check_workspace_size<128, 128, 4, 8>();
+    check_workspace_size<384, 64, 4, 6>();
+    // All six lanes of every token may route to one expert. Only the wire
+    // packet is deduplicated. Each lane keeps a separate expanded slot.
+    constexpr auto rows = get_dispatch_max_expert_rows(128, 256, 6);
+    static_assert(rows == 196608);
+    static_assert(get_dispatch_max_expanded_rows(rows, 3, 1) == rows);
+    static_assert(get_dispatch_max_expanded_rows(rows, 3, 128) == 196992);
+    // Reduction and slot counts must remain in range even for generic URMA.
+    static_assert(get_dispatch_max_expert_rows(128, 16383, 8) <= kDispatchReductionMaxValue);
+    static_assert(get_dispatch_max_expert_rows(128, 16384, 8) > kDispatchReductionMaxValue);
+    static_assert(get_dispatch_max_expanded_rows(1, 2, 1 << 30) > std::numeric_limits<int>::max());
     const auto routing = get_dispatch_routing_workspace_bytes(8, 128, 4, 8);
-    assert(!dispatch_direct_ub_fits(routing, 4, 14336, 8, routing + 14336 + 4 * 128 - 1, false));
-    assert(dispatch_direct_ub_fits(routing, 4, 14336, 8, routing + 14336 + 4 * 128, false));
-    assert(dispatch_direct_ub_fits(routing, 4, 14336, 8, routing + 14336 + 4 * 32, true));
+    assert(!dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128 - 1, false));
+    assert(dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128, false));
+    assert(dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 32, true));
+    assert(!dispatch_direct_ub_fits(routing, 4, 7168, 224, 8, routing + 7168 + 4 * (128 + 224) - 1, false));
+    assert(dispatch_direct_ub_fits(routing, 4, 7168, 224, 8, routing + 7168 + 4 * (128 + 224), false));
 }

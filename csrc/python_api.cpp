@@ -32,6 +32,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     py::class_<EPBuffer, BufferBase>(m, "EPBuffer")
         .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool>())
+        .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool, int64_t>())
         .def_readonly("context", &EPBuffer::context)
         .def_readonly("lb_storage", &EPBuffer::lb_storage)
         .def("lb_prefetch_weights", &EPBuffer::lb_prefetch_weights)
@@ -78,6 +79,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("all_gather", &BucketBuffer::all_gather);
 
     m.def("calculate_ep_buffer_size", &EPBuffer::calculate_buffer_size);
+    // Local resource admission for the compatibility profiler. Group agreement is still required.
+    m.def("_decode_shape_supported", [](int world, int capacity, int hidden, int topk, int experts, int sf_words) {
+        return get_dispatch_low_latency_plan(runtime->get_npu_arch(), world, capacity, hidden, topk, experts,
+            runtime->get_num_vec_cores(), runtime->get_num_ubuf_bytes_per_vec_core(), sf_words).has_value();
+    });
     m.def("get_num_allocation_alignment", []() {
         return kNumAllocationAlignmentBytes;
     });

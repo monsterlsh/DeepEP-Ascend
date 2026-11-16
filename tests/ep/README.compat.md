@@ -74,14 +74,38 @@ planner、结果状态机和 profiler 解析测试只需标准库。合成 tenso
 | `--alignment 1 16 128` | 选择需要的专家对齐值，默认 1/16 |
 | `--deferred false/true/both` | 默认 both，所有操作开启有效异步事件；deferred 检查 hook 只执行一次 |
 | `--deterministic false/true/both` | 默认 both，分别创建对应 buffer |
-| `--route random hotspot` | 默认两种；随机参考可复现 |
-| `--dtype bf16 fp8` | 默认 BF16；FP8 使用原生 INT16 scale packs，之后 combine 为 BF16 |
+| `--route random hotspot duplicates` | 前两种为默认。duplicates 保留正 batch，并插入重复和 masked 槽，可以覆盖 MTE |
+| `--hidden --num-topk --num-experts` | H/K/E，默认 7168/8/128 |
+| `--dtype bf16 fp16 fp8` | 默认 BF16。FP16 用例检查 FP16 专家输出与归约 |
+| `--scale-format int16/fp32/e8m0` | 原生 16 位字、每 128 通道一个 FP32，或每 128 通道一个含四个 E8M0 的 INT32 |
+| `--fp8-expert-dtype bf16/fp16` | FP8 dispatch 后专家输出与 combine 的类型，默认 BF16，可对三个 scale 格式分别切换 |
+| `--server-ids` | 按 EP 组 rank 顺序给出实际物理 server ID。候选的每个进程使用自己的 ID；省略时对测 rank 直连 |
 | `--scale-layout row col` | FP8 输入和返回 scales 的行/列布局；BF16 无 scales |
 | `--edge-routes auto/off/only` | edge 使用逐 rank B=(0,2,128,32) 循环，含 masked/duplicate；M 为统一容量，不能各 rank 分别传各自 B |
 | `--profile-paths` | 每个操作采集真实设备 kernel 证据；默认关闭并明确标记 unverified |
 | `--output-dir` | 每 rank 独占创建日志，已有文件拒绝覆盖；三个 backend 和每次复跑使用不同目录 |
 
-测试固定 H7168/K8/E128。候选策略允许 EP2/4/8/16/32/64/128、共享容量 1≤M≤256 和各 rank 任意 1≤B≤M，既可均匀也可不均匀。目标配置为 Ascend950DT、架构 3510、32 个 AI Core、64 个向量核、每核 216 KiB UB，BF16 输入、FP32 路由权重、alignment=128，关闭 deterministic 和 CPU sync，启用 deferred、异步、expand 和 zero padding。使用 stats、bias、缺失权重、FP8 或任一空 rank 的用例验证全组 URMA 回退。同一 buffer 产生的旧 handle 用于检查跨 dispatch 复用。FP8 测试数据要求 B≤256，BF16 要求 B≤4096，以保证 payload 身份字段可精确表示。
+候选策略允许 EP2/4/8/16/32/64/128、共享容量 1≤M≤256 和各 rank 任意 1≤B≤M。目标配置为 Ascend950DT_9582、架构 3510、32 个 AI Core、64 个向量核、每核 216 KiB UB。使用 FP32 路由权重和 alignment=128，关闭 deterministic 和 CPU sync，启用 deferred、异步、expand 和 zero padding。stats、bias、缺失权重或空 rank 触发相应调用回退。用同一 buffer 复用旧 handle 时也要核对其原始路由。H/K/E 和 UB 准入规则见仓库 README。
+
+两台物理服务器各 8 卡，且 EP rank 0–7 和 8–15 分别位于这两台机器时，下面的配置覆盖 H7168/K6/E384、两跳传输和三个容量边界。在每个节点使用相同命令并配置本页约定的启动环境。若 rank 交错，按实际顺序修改 ID。
+
+```bash
+shape=(--hidden 7168 --num-topk 6 --num-experts 384)
+servers=(--server-ids 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1)
+check=(--num-processes 8 --bs 32 33 256 --capacity 256 --capacity-mode batch
+       --rank-load decode --cpu-sync false --alignment 128 --deferred true
+       --deterministic false --edge-routes off --route random duplicates --profile-paths)
+python tests/ep/test_ep_auto_compat.py "${shape[@]}" "${servers[@]}" "${check[@]}" \
+  --backend candidate-auto --dtype bf16 fp16 --output-dir /tmp/ep-relay-16bit
+for format in int16 fp32 e8m0; do
+  python tests/ep/test_ep_auto_compat.py "${shape[@]}" "${servers[@]}" "${check[@]}" \
+    --backend candidate-auto --dtype fp8 --scale-format "$format" --scale-layout row col \
+    --output-dir "/tmp/ep-relay-fp8-$format"
+done
+python tests/ep/summarize_compat.py --input-dir /tmp/ep-relay-16bit --require-mte-dispatch --require-mte-combine
+```
+
+在 `evidence.json` 查看 `server_relay` 和实际 transport。对比 rank MTE 和 server MTE 时，在同一候选构建上去掉或加入 `--server-ids`，使用新的输出目录。对比 main 时使用双方支持的数据类型；FP16 和两种 32 位 scale 格式在候选环境单独做参考数值验证。
 
 dispatch 的 fresh/cached 与前置/后置 barrier 共用同一容量范围。第 14 个显式模板参数标识 direct MTE，设备 trace 的 `actual_transport=mte` 表示本次调用确实使用该内核。解析器同时支持 main 的 13 参数 dispatch。本分支 combine 的第 10 个模板参数标识 native MTE。解析器也识别父分支带第 11 个 SHMEM 参数的历史 trace。
 
@@ -154,7 +178,7 @@ FP8 payload 和非单位 scales 用于检查通信字节、stride、padding 及�
 
 ```bash
 bench=(--num-processes 8 --capacity 256 --bs 1 2 3 8 16 32 33 64 128 255 256
-       --rank-load decode --warmup 15 --samples 60)
+       --rank-load decode --warmup 15 --samples 200)
 # 在 main 环境执行
 python tests/ep/bench_decode.py run "${bench[@]}" --backend official \
   --expected-source-commit "$MAIN_SHA" --output /tmp/ep-main.json
@@ -165,7 +189,9 @@ python tests/ep/bench_decode.py run "${bench[@]}" --backend candidate-auto \
 python tests/ep/bench_decode.py compare /tmp/ep-main.json /tmp/ep-candidate.json
 ```
 
-脚本固定 H7168、Top-8、128 专家和 alignment 128；每个 M 的路由、BF16 输入、FP32 权重和测试矩阵一致。两版均校验恒等专家的 reduction 以及回传权重。`fresh` 提供路由，`cached` 复用本轮 M 的 handle。各模式分别计时 dispatch、使用该模式返回值的独立 combine，以及不在两步之间同步的 dispatch→combine 整轮。每次计时包含 deferred 回调和末尾 NPU 同步，进程组 barrier、预热、校验及 profiler 都在计时区间外。先逐次取最慢 rank，再计算 P50；CSV 的百分比为 `100 × (候选延迟 / main 延迟 − 1)`，正值表示变慢。JSON 保留每次最慢 rank 耗时及构建身份。包从 wheel 导入且无对应 Git checkout 时，省略 `--expected-source-commit`，对照 JSON 中的扩展 SHA256 与实际构建产物。
+脚本默认 H7168/K8/E128 和 alignment 128。验收模型形状时，将相同的 `"${shape[@]}" "${servers[@]}"` 加入两边的 bench 参数。每个 M 的路由、BF16 输入、FP32 权重和测试矩阵一致。两版均校验恒等专家的归约以及回传权重。`fresh` 提供路由，`cached` 复用本轮 M 的 handle。各模式分别计时 dispatch、独立 combine，以及两步之间不做同步的往返。每次计时包含 deferred 回调和末尾 NPU 同步，进程组 barrier、预热、校验和 profiler 都在计时区间外。先逐次取最慢 rank，再计算 P50 和最近秩 P99；CSV 的变化率为 `100 × (候选延迟 / main 延迟 − 1)`，正值表示变慢。JSON 保留每次最慢 rank 耗时及构建身份。包从 wheel 导入且无对应 Git checkout 时，省略 `--expected-source-commit`，对照 JSON 中的扩展 SHA256 与实际构建产物。
+
+`python tests/ep/decode_domain_traffic.py /tmp/ep-candidate.json` 可按同一份路由和 server 映射重放，计算跨域 hidden 的逻辑字节。端口实际流量还包含描述符、scales 和同步开销。以未开 profiler 的 P50/P99 评估域内拷贝、额外归约与 barrier 的代价。
 
 要逐整数扫描，可将两边的 `--bs` 都改为 `--bs $(seq 1 256)`。用 `--barrier-in-prologue` 和 `--rank-load uniform` 分别对比前置 barrier 和等长负载。稳态样本接近时，在相同硬件上反转两版的运行顺序并使用新的输出文件。设备选路另用上面的 `test_ep_auto_compat.py` 命令，指定同一批 `--bs`、`--capacity 256 --capacity-mode batch`、rank 负载及 barrier 选项。候选日志以 `--require-mte-dispatch --require-mte-combine` 严格验收。未采到设备 trace 的延迟数据只能说明公共 API 的实际耗时。
 

@@ -8,6 +8,20 @@ namespace deep_ep {
 // dispatch_impl checks these host-side bounds against the device reduction encoding.
 static constexpr int kDispatchReductionMaxArrivals = 255;
 static constexpr int kDispatchReductionMaxValue = (1 << 24) - 1;
+static constexpr int kDispatchWorkerThreads = 512;
+
+// Rank deduplication applies to the packet, while every top-k lane contributes
+// an expert row. All lanes, including repeats, can select the same local expert.
+constexpr __aicore__ __forceinline__ int64_t get_dispatch_max_expert_rows(
+        int num_ranks, int capacity, int num_topk) {
+    return static_cast<int64_t>(num_ranks) * capacity * num_topk;
+}
+
+constexpr __aicore__ __forceinline__ int64_t get_dispatch_max_expanded_rows(
+        int64_t max_expert_rows, int num_local_experts, int expert_alignment) {
+    return math::align<int64_t>(max_expert_rows +
+        static_cast<int64_t>(expert_alignment - 1) * num_local_experts, expert_alignment);
+}
 
 constexpr __aicore__ __forceinline__ int64_t get_dispatch_routing_workspace_bytes(
     const int num_ranks, const int num_experts, const int tokens_per_core, const int num_topk) {

@@ -1,8 +1,11 @@
 #include <cassert>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 using aclrtStream = void*;
 using HcclComm = void*;
@@ -10,6 +13,9 @@ constexpr int ACL_MEM_MALLOC_NORMAL_ONLY = 0;
 constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
 constexpr int ACL_MEMCPY_DEVICE_TO_HOST = 2;
 constexpr int HCCL_DATA_TYPE_UINT16 = 0;
+constexpr int HCCL_DATA_TYPE_INT64 = 1;
+using TopologyRecord = std::array<int64_t, 4>;
+static std::vector<TopologyRecord> peer_topology;
 static bool fail_collective = false, fail_wait = false;
 static uint16_t remote_capabilities = UINT16_MAX;
 // DecodeAgreement uses a dedicated stream and pinned host staging for a rank-wide vote.
@@ -66,8 +72,21 @@ int aclrtSynchronizeStreamWithTimeout(aclrtStream, int) {
     return fail_wait ? 1 : 0;
 }
 
-int HcclAllGather(void* send, void* receive, uint64_t count, int, HcclComm, aclrtStream) {
+int HcclCommGetHandleWithName(const char* group, HcclComm* comm) {
+    assert(std::string(group) == "ep");
+    *comm = reinterpret_cast<HcclComm>(2);
+    return 0;
+}
+
+int HcclAllGather(void* send, void* receive, uint64_t count, int dtype, HcclComm, aclrtStream) {
     ++gathers;
+    if (dtype == HCCL_DATA_TYPE_INT64) {
+        assert(count == 4);
+        auto* output = static_cast<TopologyRecord*>(receive);
+        std::memcpy(output, send, sizeof(TopologyRecord));
+        std::memcpy(output + 1, peer_topology.data(), peer_topology.size() * sizeof(TopologyRecord));
+        return fail_collective ? 1 : 0;
+    }
     assert(count == 1);
     auto* peers = static_cast<uint16_t*>(receive);
     peers[0] = *static_cast<uint16_t*>(send);
@@ -83,6 +102,7 @@ aclrtStream getCurrentNPUStream() {
 }  // namespace c10_npu
 
 #include "csrc/comm/decode_agreement.hpp"
+#include "csrc/comm/decode_topology.hpp"
 
 template <typename F>
 void throws(F function) {
@@ -95,19 +115,64 @@ void throws(F function) {
     assert(caught);
 }
 
+void check_topology() {
+    using deep_ep::comm::DecodeTopology;
+    const auto set_id = [](const char* id) {
+#ifdef _WIN32
+        assert(_putenv_s("EP_DECODE_SERVER_ID", id) == 0);
+#else
+        assert((*id ? setenv("EP_DECODE_SERVER_ID", id, 1) : unsetenv("EP_DECODE_SERVER_ID")) == 0);
+#endif
+    };
+    const auto discover = [](const std::vector<int>& peers, bool same_offset = true,
+                             bool capable = true, int timeout = 120, bool peers_capable = true) {
+        peer_topology.clear();
+        int64_t scratch = 128;
+        for (int id : peers) {
+            peer_topology.push_back({id, same_offset ? 1024 : 512, scratch, peers_capable});
+            scratch *= 2;
+        }
+        const int before = gathers;
+        auto topology = DecodeTopology::discover("ep", static_cast<int>(peers.size()) + 1, timeout, 1024, 16, capable);
+        assert(gathers == before + 1);
+        return topology;
+    };
+    set_id("");
+    assert(discover({-1,-1,-1}).server_ids.empty());
+    set_id("17");
+    auto interleaved = discover({9,17,9});
+    assert(interleaved.group_enabled && interleaved.server_ids == std::vector<int>({17,9,17,9})
+           && interleaved.scratch_bytes == 512);
+    assert(discover({17,17,17}).scratch_bytes == 0);
+    assert(discover({9,13,21}).server_ids.empty());
+    for (const char* local : {"", "unknown", "-2", "2147483648", "7x"}) {
+        set_id(local);
+        try { (void) discover({9,17,9}); assert(false); }
+        catch (const std::invalid_argument&) {}
+    }
+    set_id("0");
+    try { (void) discover({0,-1,17}); assert(false); }
+    catch (const std::invalid_argument&) {}
+    try { (void) discover({0,17,17}, false); assert(false); }
+    catch (const std::invalid_argument&) {}
+    set_id("");
+    for (bool local : {true, false})
+        for (bool peer : {true, false})
+            assert(discover({-1}, true, local, 120, peer).group_enabled == (local && peer));
+    assert(!discover({-1}, true, true, 7200).group_enabled);
+    set_id("9");
+    assert(discover({17,9}, true, true, 120, false).scratch_bytes == 0);
+    fail_collective = true;
+    throws([&] { discover({17,9}); });
+    fail_collective = false;
+    set_id("");
+    assert(devices == 0);
+}
+
 int main() {
+    check_topology();
     using deep_ep::comm::DecodeAgreement;
     const auto comm = reinterpret_cast<HcclComm>(2);
-    for (bool local : {false, true})
-        for (uint16_t peer : {0, 1}) {
-            remote_capabilities = peer;
-            assert(DecodeAgreement::agree_capability(comm, 2, 120, local) == (local && peer));
-        }
-    assert(!DecodeAgreement::agree_capability(comm, 2, 7200, true));
-    fail_collective = true;
-    throws([&] { DecodeAgreement::agree_capability(comm, 2, 120, true); });
-    assert(devices == 0);
-    fail_collective = false;
 
     assert(!DecodeAgreement::is_capturing());
     capturing = true;

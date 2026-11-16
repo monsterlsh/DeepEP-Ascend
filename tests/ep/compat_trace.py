@@ -53,17 +53,28 @@ def _is_main(name, operation):
 
 
 def template_values(name, operation):
-    """Parse integral Itanium template arguments or a demangled specialization."""
+    """Parse the complete argument list, including the combine element type."""
     _operation(operation)
     symbol = operation + '_impl'
     if not _is_main(name, operation):
         return []
     if symbol + 'I' in name:
         tail = name.split(symbol + 'I', 1)[1]
-        found = re.match(r"((?:L[bilmjy][n0-9]+E)+)", tail)
-        if found:
-            return [(kind, int(value.replace('n', '-')))
-                    for kind, value in re.findall(r"L([bilmjy])([n0-9]+)E", found.group(1))]
+        result = []
+        # Itanium encodings used by clang for __fp16, _Float16 and __bf16.
+        encoded_types = {'Dh': 'fp16', 'DF16_': 'fp16', 'u6__bf16': 'bf16', 'DF16b': 'bf16'}
+        while tail and not tail.startswith('E'):
+            integral = re.match(r"L([bilmjy])(n?\d+)E", tail)
+            if integral:
+                result.append((integral[1], int(integral[2].replace('n', '-'))))
+                tail = tail[integral.end():]
+                continue
+            encoded = next((prefix for prefix in encoded_types if tail.startswith(prefix)), None)
+            if encoded is None:
+                return []
+            result.append(('type', encoded_types[encoded]))
+            tail = tail[len(encoded):]
+        return result if tail.startswith('E') else []
     found = re.search(re.escape(symbol) + r"<([^<>]+)>", name)
     if found:
         result = []
@@ -73,10 +84,24 @@ def template_values(name, operation):
                 result.append(('b', int(token == 'true')))
             elif re.fullmatch(r"-?\d+[uUlL]*", token):
                 result.append(('i', int(re.sub(r"[uUlL]+$", '', token))))
+            elif token in ('half', '__fp16', '_Float16'):
+                result.append(('type', 'fp16'))
+            elif token in ('bfloat16_t', '__bf16', 'std::bfloat16_t'):
+                result.append(('type', 'bf16'))
             else:
                 return []
         return result
     return []
+
+
+def _has_dispatch_relay_arguments(name):
+    # Historical dispatch builds also had two bools after the barrier flag.
+    # Only the relay ABI appends server_ids and relay_slots after four stride/rank ints.
+    if 'dispatch_implI' in name:
+        return re.search(r'iiiiPKi(?:S[0-9A-Z]*_|Pi)(?:$|\s)', name) is not None
+    parameters = name.rsplit('>(', 1)[-1].split(')', 1)[0].split(',')
+    return len(parameters) >= 6 and all(re.fullmatch(r'\s*(?:const\s+)?int\s*', p) for p in parameters[-6:-2]) and all(
+        '*' in p and 'int' in p for p in parameters[-2:])
 
 
 def parse_kernel(name, operation, backend='candidate'):
@@ -88,7 +113,7 @@ def parse_kernel(name, operation, backend='candidate'):
 
     def integer(index, label, *, positive=False):
         kind, value = values[index]
-        _require(kind != 'b', f"Unexpected bool for {label}: {name}")
+        _require(kind not in ('b', 'type'), f"Expected integer for {label}: {name}")
         _require(not positive or value > 0, f"Invalid {label}: {name}")
         return value
 
@@ -122,13 +147,25 @@ def parse_kernel(name, operation, backend='candidate'):
                       has_topk_weights=boolean(8, 'has_topk_weights'))
         transport_index = 9
 
+    if operation == 'dispatch':
+        _require(result['num_sf_packs'] >= 0, f"Invalid dispatch scale-word count: {name}")
     if backend == 'candidate':
         _require(len(values) > transport_index,
                  f"Missing candidate MTE template argument: {name}")
         low_latency = boolean(transport_index, 'low_latency_transport')
         if operation == 'dispatch':
-            _require(len(values) in (14, 17) and all(kind != 'b' for kind, _ in values[14:]),
+            tail = values[14:]
+            if tail and tail[0][0] == 'b':
+                _require(_has_dispatch_relay_arguments(name), f"Ambiguous dispatch relay ABI: {name}")
+                result['server_relay'] = boolean(14, 'server_relay')
+                tail = tail[1:]
+            _require(len(tail) in (0, 3) and all(kind not in ('b', 'type') for kind, _ in tail),
                      f"Unknown candidate dispatch template layout: {name}")
+        elif len(values) > 10 and values[10][0] == 'type':
+            _require(len(values) in (11, 12), f"Unknown typed combine template layout: {name}")
+            result['dtype'] = values[10][1]
+            if len(values) == 12:
+                result['server_relay'] = boolean(11, 'server_relay')
         else:
             _require(len(values) in (10, 11), f"Unknown candidate combine template layout: {name}")
             # Older candidate builds appended a SHMEM flag to the native signature.
@@ -136,17 +173,23 @@ def parse_kernel(name, operation, backend='candidate'):
                 result['shmem_transport'] = boolean(10, 'shmem_transport')
                 _require(not result['shmem_transport'] or low_latency,
                          f"SHMEM combine requires low-latency transport: {name}")
+        _require(not result.get('server_relay') or low_latency,
+                 f"Server relay requires low-latency transport: {name}")
     else:
         # Official dispatch has three integral derived defaults after arg 12;
         # candidate dispatch inserted a bool at arg 13. Official combine has 9
         # arguments. Reject a candidate symbol labelled as an official run.
         if operation == 'dispatch':
-            _require(len(values) in (13, 16) and all(kind != 'b' for kind, _ in values[13:]),
+            _require(len(values) in (13, 16) and all(kind not in ('b', 'type') for kind, _ in values[13:]),
                      f"Kernel does not match the pinned official dispatch template: {name}")
         else:
             _require(len(values) == 9,
                      f"Kernel does not match the pinned official combine template: {name}")
         low_latency = False
+    if operation == 'combine':
+        # Both historical signatures had a fixed bfloat16_t* expert input.
+        result.setdefault('dtype', 'bf16')
+    result.setdefault('server_relay', False)
     result.update(low_latency_transport=low_latency, transport='mte' if low_latency else 'urma')
     if result.get('shmem_transport'):
         result['transport'] = 'shmem'
@@ -264,12 +307,13 @@ def verify_case_metadata(kernel_parameters, operation, metadata):
         ('num_vec_cores', 'num_vec_cores'),
         ('num_ub_bytes', 'num_ub_bytes'),
         ('barrier_in_prologue', 'barrier_in_prologue'),
+        ('server_relay', 'server_relay'),
     )
     if operation == 'dispatch':
         fields += (('cached', 'cached_mode'), ('alignment', 'expert_alignment'),
                    ('num_experts', 'num_experts'))
     else:
-        fields += (('hidden', 'hidden'), ('weight_side_channel', 'has_topk_weights'))
+        fields += (('hidden', 'hidden'), ('weight_side_channel', 'has_topk_weights'), ('dtype', 'dtype'))
 
     for name, parameters in kernel_parameters.items():
         for case_field, parameter in fields:
@@ -298,12 +342,16 @@ def verify_case_metadata(kernel_parameters, operation, metadata):
                 checked.add('cpu_sync')
             if 'dtype' in metadata:
                 dtype = metadata['dtype']
-                _require(dtype in ('bf16', 'fp8'), f"Unsupported native dispatch metadata dtype: {dtype}")
+                _require(dtype in ('bf16', 'fp16', 'fp8'), f"Unsupported native dispatch metadata dtype: {dtype}")
                 has_scales = parameters['num_sf_packs'] > 0
                 _require(has_scales == (dtype == 'fp8'),
                          f"dispatch template num_sf_packs={parameters['num_sf_packs']} "
                          f"does not match dtype={dtype}")
-                checked.add('dtype')
+                if has_scales:
+                    checked.add('dtype')
+                else:
+                    # Dispatch copies raw bytes. Its signature is identical for FP16 and BF16.
+                    checked.add('dtype_width')
                 if 'hidden' in metadata:
                     expected_bytes = metadata['hidden'] * (1 if dtype == 'fp8' else 2)
                     _require(parameters['num_hidden_bytes'] == expected_bytes,
@@ -318,7 +366,7 @@ def verify_case_metadata(kernel_parameters, operation, metadata):
     semantic_fields = {'B', 'M', 'cached', 'dtype', 'hidden', 'num_ranks', 'num_topk',
                        'num_experts', 'num_vec_cores', 'num_ub_bytes', 'min_num_ub_bytes',
                        'barrier_in_prologue', 'cpu_sync', 'alignment', 'weight_side_channel',
-                       'deferred', 'scale_layout', 'expected_num_sf_packs'}
+                       'deferred', 'scale_layout', 'expected_num_sf_packs', 'server_relay'}
     not_observable = sorted((semantic_fields & set(metadata)) - checked)
     return dict(checked_fields=sorted(checked), not_observable_from_symbol=not_observable)
 

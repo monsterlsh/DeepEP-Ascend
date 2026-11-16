@@ -4,6 +4,8 @@
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/comm/handle.hpp>
 #include <deep_ep/impls/ep/combine_utils.hpp>
+#include <deep_ep/impls/ep/combine_layout.hpp>
+#include <deep_ep/impls/ep/combine_relay.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
 #include <deep_ep/common/bitset.hpp>
 #include <deep_ep/common/exception.hpp>
@@ -23,11 +25,11 @@ struct CombineTask {
 };
 
 template <int kNumRanks, int kNumTopk, int kHidden, int kNumTokensPerTask, int kNumStages, int kNumUbBytes,
-          bool kLowLatencyTransport = false>
+          bool kLowLatencyTransport = false, typename element_t = bfloat16_t>
 struct CombineUBLayout {
     static constexpr int kNumMetadataElems = kNumTopk + 2;
     static constexpr int kNumHiddenBytes = kHidden * sizeof(bfloat16_t);
-    static constexpr int kNumTopkWeightBytes = math::align<int>(kNumTopk * sizeof(float), kNumUbAlignmentBytes);
+    static constexpr int kNumTopkWeightBytes = get_combine_weight_bytes(kNumTopk);
     static constexpr int kNumTopkWeightElems = kNumTopkWeightBytes / sizeof(float);
     static constexpr int kNumBaseMetadataElems = math::max(warpSize, kNumMetadataElems + 1);
     static constexpr int kNumSlotsMetadataIdx = kNumBaseMetadataElems - 1;
@@ -53,15 +55,16 @@ struct CombineUBLayout {
         2 * math::align(kNumRanks * static_cast<int>(sizeof(int)), kNumUbAlignmentBytes) +
         math::align(kNumStages * kNumTokensPerTask * kNumUbMetadataElems * static_cast<int>(sizeof(int)), kNumUbAlignmentBytes);
     static constexpr int kNumAvailableHiddenBytes = math::max(0, math::align<int, false>(kNumUbBytes, kNumUbAlignmentBytes) - kNumFixedBytes);
-    static constexpr int kNumHiddenRingSlots = math::min(32, kNumAvailableHiddenBytes / kNumHiddenBytes);
-    using HiddenReducer = RingReducer<kHidden, kNumTopk, kNumHiddenRingSlots>;
+    static constexpr int kNumHiddenRingSlots = get_combine_hidden_slots(kNumAvailableHiddenBytes, kNumHiddenBytes);
+    using Element = element_t;
+    using HiddenReducer = RingReducer<kHidden, kNumTopk, kNumHiddenRingSlots, 0, 0, element_t>;
     alignas(kNumUbAlignmentBytes) typename HiddenReducer::Buffer hidden;
 };
 
 template <int kNumRanks, int kNumTopk, int kNumMaxTokensPerRank, int kNumVecCores,
           int kNumTokensPerTask, typename ub_layout_t, bool kHasTopkWeights, bool kLowLatencyTransport>
 __simt_vf__ __aicore__ __launch_bounds__(kNumTokensPerTask * warpSize) void load_meta_issue_wqe(
-        __ubuf__ ub_layout_t* ub, __gm__ const int* src_metadata, __gm__ const bfloat16_t* x, __gm__ uint8_t* send_buffer, __gm__ uint8_t* combine_recv_buffer, __gm__ const uint32_t* topk_weights,
+        __ubuf__ ub_layout_t* ub, __gm__ const int* src_metadata, __gm__ const typename ub_layout_t::Element* x, __gm__ uint8_t* send_buffer, __gm__ uint8_t* combine_recv_buffer, __gm__ const uint32_t* topk_weights,
         const uint64_t combine_recv_buffer_offset, const CombineTask task, const uint32_t task_sqebb_idx,
         const int stage_idx, const int rank_idx, const bool issue_wqe) {
     EP_STATIC_ASSERT(kNumTopk > 0 and kNumTopk <= warpSize);
@@ -171,22 +174,24 @@ void load_combine_peers(__ubuf__ handle::HcommPeerInfo* peers, __gm__ void* jett
 
 template <int kNumRanks, int kNumTopk, int kHidden, int kNumMaxTokensPerRank, int kNumVecCores,
           int64_t kNumTimeoutCycles, int kNumUbBytes,
-          bool kDoBarrier = false, bool kHasTopkWeights = true, bool kLowLatencyTransport = false>
-__global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk_weights, __gm__ int* src_metadata,
+          bool kDoBarrier = false, bool kHasTopkWeights = true, bool kLowLatencyTransport = false,
+          typename element_t = bfloat16_t, bool kDomainRelay = false>
+__global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_weights, __gm__ int* src_metadata,
                                         __gm__ int* psum_num_recv_tokens_per_rank, __gm__ uint8_t* combine_recv_buffer,
                                         __gm__ uint8_t* send_buffer, __gm__ void* workspace, __gm__ void* jetty_ptrs,
-                                        const int rank_idx) {
+                                        const int rank_idx, __gm__ const int* server_ids, __gm__ void* relay_scratch) {
     AscendC::InitSocState();
 
-    constexpr auto kNumTokensPerTask = 8;
-    constexpr auto kNumStages = 2;
+    constexpr auto kNumTokensPerTask = kCombineTokensPerTask;
+    constexpr auto kNumStages = kCombineStages;
     constexpr auto kNumTasksPerDoorbell = 8;
 
     EP_STATIC_ASSERT(math::is_power_of_2(kNumTasksPerDoorbell));
 
     using UBLayout = CombineUBLayout<kNumRanks, kNumTopk, kHidden, kNumTokensPerTask, kNumStages, kNumUbBytes,
-                                    kLowLatencyTransport>;
+                                    kLowLatencyTransport, element_t>;
     using HiddenReducer = typename UBLayout::HiddenReducer;
+    EP_STATIC_ASSERT(UBLayout::kNumFixedBytes == get_combine_fixed_bytes(kNumRanks, kNumTopk, kLowLatencyTransport));
     constexpr auto kNumTokenBytes = UBLayout::kNumTokenBytes;
     constexpr auto kNumWQEBBsPerToken = UBLayout::kNumWQEBBsPerToken;
     constexpr auto kNumWQEBBsPerTask = UBLayout::kNumWQEBBsPerTask;
@@ -218,6 +223,12 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
     __ubuf__ UBLayout* ub = 0;
 
     comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, false>(signals.common_signals, vec_core_idx);
+    CombineRelayScratch<kNumRanks, kNumMaxTokensPerRank, kNumTokenBytes> scratch(relay_scratch);
+    if constexpr (kDomainRelay) {
+        EP_STATIC_ASSERT(kLowLatencyTransport);
+        scratch.template clear_masters<kNumVecCores>(vec_core_idx);
+        AscendC::SyncAll<true>();
+    }
 
     handle::HcommJetty jetty(&ub->jetty_info, nullptr, kLowLatencyTransport ? nullptr : jetty_ptrs, vec_core_idx);
     if constexpr (kUseRemoteQueue) {
@@ -318,12 +329,16 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
             asc_sync_wait(PIPE_V, PIPE_MTE3, event_idx);
         }
         auto task_recv_buffer = combine_recv_buffer;
-        if constexpr (kLowLatencyTransport)
+        if constexpr (kLowLatencyTransport and not kDomainRelay)
             task_recv_buffer = layout::get_sym_ptr(signals.common_signals, combine_recv_buffer, current_task.rank_idx);
         for (int token_idx = 0; token_idx < num_stage_tokens; ++ token_idx) {
             const auto meta = ub->metadata[stage_idx][token_idx];
             __gm__ uint8_t* output;
-            if (is_local or kLowLatencyTransport) {
+            if constexpr (kDomainRelay) {
+                const int global_token = meta[kNumTopk];
+                output = scratch.partials + static_cast<int64_t>(global_token) * kNumTokenBytes;
+                AscendC::WriteGmByPassDCache(scratch.masters + global_token, meta[kNumTopk + 1]);
+            } else if (is_local or kLowLatencyTransport) {
                 const auto src_token_idx = meta[kNumTopk] - current_task.rank_idx * kNumMaxTokensPerRank;
                 const auto subslot_idx = kNumRanks < kNumTopk ? rank_idx : meta[kNumTopk + 1];
                 const auto combine_slot_idx = subslot_idx * kNumMaxTokensPerRank + src_token_idx;
@@ -332,7 +347,7 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
                 const auto recv_slot_idx = current_task.rank_slot_idx + token_idx * kNumVecCores;
                 output = send_buffer + static_cast<int64_t>(recv_slot_idx) * kNumTokenBytes;
             }
-            const auto output_addr = reinterpret_cast<__gm__ bfloat16_t*>(output);
+            const auto output_addr = reinterpret_cast<__gm__ element_t*>(output);
             const auto num_slots = meta[UBLayout::kNumSlotsMetadataIdx];
             const auto first_slot_idx = num_slots > 0 ? meta[0] : -1;
             if (num_slots >= 2) {
@@ -399,6 +414,14 @@ __global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk
 
     // URMA's drain also joins all AIVs. Direct MTE has no drain, so explicitly
     // join them before core zero advertises this rank's completed remote writes.
+    if constexpr (kDomainRelay) {
+        // All rank partials must be visible before any relay inspects their master slots.
+        comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores>(
+            signals.common_signals, vec_core_idx);
+        relay_combine_partials<kNumRanks, kNumMaxTokensPerRank, kHidden, kNumTopk,
+                               kNumUbBytes, kNumVecCores, kHasTopkWeights, element_t>(
+            signals.common_signals, server_ids, relay_scratch, combine_recv_buffer, rank_idx, vec_core_idx, ub);
+    }
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
             kNumRanks, kNumTimeoutCycles, true, kLowLatencyTransport, true,

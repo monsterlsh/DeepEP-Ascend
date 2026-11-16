@@ -41,7 +41,8 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
                             const bool& do_barrier = false,
-                            const bool& low_latency_transport = false) {
+                            const bool& low_latency_transport = false,
+                            const int* server_ids = nullptr, void* relay_scratch = nullptr) {
     // Calculate configs
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -50,19 +51,21 @@ static void launch_dispatch(void* x, void* sf,
     EP_HOST_ASSERT(16 <= num_vec_cores);
 
     // Compile
-    const auto kernel = jit->compile(low_latency_transport ? "dispatch_mte" : "dispatch", std::format(R"(
+    const bool server_relay = server_ids != nullptr;
+    EP_HOST_ASSERT(not server_relay or (low_latency_transport and relay_scratch != nullptr));
+    const auto kernel = jit->compile(server_relay ? "dispatch_mte_relay" : low_latency_transport ? "dispatch_mte" : "dispatch", std::format(R"(
 #include <deep_ep/impls/ep/dispatch.hpp>
 
 using namespace deep_ep;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )", num_ranks, num_experts, num_topk,
         expert_alignment, cached_mode, do_cpu_sync,
         num_vec_cores,
         num_hidden_bytes, num_sf_packs, num_max_tokens_per_rank, num_ub_bytes,
-        num_timeout_cycles, do_barrier, low_latency_transport));
+        num_timeout_cycles, do_barrier, low_latency_transport, server_relay));
 
     // Launch
     jit->launch(
@@ -79,7 +82,7 @@ static void __instantiate_kernel() {{
         jetty_ptrs,
         rank_idx,
         num_tokens,
-        sf_token_stride, sf_hidden_stride);
+        sf_token_stride, sf_hidden_stride, server_ids, relay_scratch);
 }
 
 static void launch_dispatch_copy_epilogue(void* buffer,

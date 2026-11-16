@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "../comm/decode_agreement.hpp"
+#include "../comm/decode_topology.hpp"
 #include "../kernels/comm/api.hpp"
 #include "../kernels/ep/dispatch_low_latency_policy.hpp"
 #include "../utils/event.hpp"
@@ -48,17 +49,19 @@ public:
         return {this};
     }
 
-    void initialize(const comm::Context& context) {
-        if (not is_decode_capacity(context.num_ranks, 1))
-            return;
+    comm::DecodeTopology initialize(const std::string& group, int world, int cpu_timeout_secs,
+                                    int gpu_timeout_secs, int64_t arena_bytes, int64_t scratch_hint) {
+        if (not is_decode_capacity(world, 1))
+            return {};
         const auto* soc = aclrtGetSocName();
         const bool local = soc and std::string_view(soc) == "Ascend950DT_9582" and
             runtime->get_npu_arch() == 3510 and
-            context.num_gpu_timeout_cycles == 100 * comm::kNumSystemCyclesPerSecond and
+            gpu_timeout_secs == 100 and
             runtime->get_num_vec_cores() >= 64 and runtime->get_num_vec_cores_per_ai_core() == 2 and
-            runtime->get_num_ubuf_bytes_per_vec_core() == 216 * 1024 and agreement.initialize(context.num_ranks);
-        group_enabled = comm::DecodeAgreement::agree_capability(
-            context.hccl_context->comm, context.num_ranks, context.num_cpu_timeout_secs, local);
+            runtime->get_num_ubuf_bytes_per_vec_core() == 216 * 1024 and agreement.initialize(world);
+        auto topology = comm::DecodeTopology::discover(group, world, cpu_timeout_secs, arena_bytes, scratch_hint, local);
+        group_enabled = topology.group_enabled;
+        return topology;
     }
 
     void require_idle() const {
@@ -70,7 +73,7 @@ public:
 
     bool prepare_dispatch(
             const comm::Context& context, int capacity, int hidden,
-            int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes, bool use_fp8,
+            int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes, int num_sf_packs,
             bool cached_mode, bool barrier_in_prologue, bool matched_options) {
         require_idle();
         const auto guard = failure_guard();
@@ -82,7 +85,7 @@ public:
             return false;
 
         const auto plan = get_dispatch_low_latency_plan(runtime->get_npu_arch(), world, capacity,
-            hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, use_fp8);
+            hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, num_sf_packs);
         const bool match = plan and num_buffer_bytes >= plan->buffer_bytes and
             low_latency_transport_enabled() and matched_options;
         const uint16_t proposal = match ? 1 + 2 * cached_mode + barrier_in_prologue : 0;
