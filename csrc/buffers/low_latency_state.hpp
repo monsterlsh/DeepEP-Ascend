@@ -96,7 +96,12 @@ public:
         }
     };
 
-    FailureGuard failure_guard() {
+    FailureGuard epilogue_guard(bool deferred) {
+        // The caller can hold the callback beyond the lifetime of the buffer.
+        if (deferred) {
+            require_healthy();
+            resources->context->check_available();
+        }
         return {this, true};
     }
 
@@ -118,7 +123,7 @@ public:
         require_healthy();
         EP_HOST_ASSERT(not pending and "Complete the outstanding EP epilogue before reusing the EPBuffer");
         if (last_completion and last_completion->stream != c10_npu::getCurrentNPUStream()) {
-            const auto guard = failure_guard();
+            const FailureGuard guard{this, true};
             last_completion->event.current_stream_wait();
         }
     }

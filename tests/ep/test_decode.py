@@ -144,16 +144,7 @@ def worker(local_rank, num_processes):
         checks.append((returned_weights.cpu() if returned_weights is not None else None,
                        None if rank == 3 else weights))
 
-    # Cancel an outstanding native dispatch collectively, keeping its event alive.
-    pending = buffer.dispatch(x, topk_idx=routes, defer_epilogue=True,
-                              **dict(options, num_max_tokens_per_rank=17))
     buffer.destroy()
-    try:
-        pending.wait()
-    except RuntimeError as error:
-        assert 'cancelled by buffer destruction' in str(error), str(error)
-    else:
-        raise AssertionError('A deferred dispatch ran after its buffer was destroyed')
     dist.destroy_process_group()
     # Compare after the last collective so a rank-local mismatch cannot strand peers.
     for actual, expected in checks:

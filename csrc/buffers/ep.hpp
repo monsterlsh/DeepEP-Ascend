@@ -34,8 +34,6 @@ class EPBuffer: public BufferBase {
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
     std::shared_ptr<EPLowLatencyState> low_latency_state;
-    using Epilogue = std::function<pybind11::object()>;
-    mutable std::shared_ptr<Epilogue> deferred_epilogue;
 
     static int get_num_used_vec_cores(int num_ai_cores) {
         const auto cores = static_cast<int64_t>(num_ai_cores) * runtime->get_num_vec_cores_per_ai_core();
@@ -46,20 +44,6 @@ class EPBuffer: public BufferBase {
     static void record_use(const torch::Tensor& tensor, const c10_npu::NPUStream& stream) {
         if (tensor.numel() != 0)
             c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
-    }
-
-    pybind11::tuple defer(Epilogue epilogue) const {
-        // A direct runtime caller may release the buffer before invoking the callback.
-        auto owner = pybind11::cast(this, pybind11::return_value_policy::reference);
-        deferred_epilogue = std::make_shared<Epilogue>(std::move(epilogue));
-        Epilogue hook = [this, owner = std::move(owner), pending = std::weak_ptr(deferred_epilogue)] {
-            EP_HOST_ASSERT(not destroyed and "EP epilogue cancelled by buffer destruction");
-            low_latency_state->require_healthy();
-            EP_HOST_ASSERT(deferred_epilogue and pending.lock() == deferred_epilogue and "EP epilogue already consumed");
-            auto once = std::move(deferred_epilogue);
-            return (*once)();
-        };
-        return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(hook));
     }
 
 public:
@@ -114,9 +98,6 @@ public:
         low_latency_state->require_healthy();
         try {
             comm::barrier(*context, true);
-            // All ranks have drained the issuing kernels and their remote writes.
-            // Release even an abandoned epilogue's tensor captures only after this point.
-            deferred_epilogue.reset();
             low_latency_state->record_completion(false);
             ACL_CHECK(aclrtHostUnregister(host_workspace));
             ACL_CHECK(aclrtFreeHost(host_workspace));
@@ -407,7 +388,7 @@ public:
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
                          low_latency_state = low_latency_state]() {
-            const auto ll_failure_guard = low_latency_state->failure_guard();
+            const auto ll_failure_guard = low_latency_state->epilogue_guard(defer_epilogue);
             if (issue_stream.has_value()) {
                 const auto copy_stream = c10_npu::getCurrentNPUStream();
                 const bool cross_stream = copy_stream != *issue_stream;
@@ -525,8 +506,10 @@ public:
         };
 
         // Defer epilogue and host sync
-        if (defer_epilogue)
-            return defer(std::move(epilogue));
+        if (defer_epilogue) {
+            std::function<pybind11::object()> epilogue_hook = std::move(epilogue);
+            return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(epilogue_hook));
+        }
 
         // Do epilogue immediately
         const auto result = epilogue();
@@ -661,7 +644,7 @@ public:
         // No NPU stream tracks that traffic; capture its sources until the epilogue queues the drain.
         auto epilogue = [=, x = x, send_buffer = send_buffer, context = context,
                          low_latency_state = low_latency_state]() {
-            const auto ll_failure_guard = low_latency_state->failure_guard();
+            const auto ll_failure_guard = low_latency_state->epilogue_guard(defer_epilogue);
             if (issue_stream.has_value()) {
                 const auto reduce_stream = c10_npu::getCurrentNPUStream();
                 const bool cross_stream = reduce_stream != *issue_stream;
@@ -712,8 +695,10 @@ public:
         };
 
         // Defer epilogue
-        if (defer_epilogue)
-            return defer(std::move(epilogue));
+        if (defer_epilogue) {
+            std::function<pybind11::object()> epilogue_hook = std::move(epilogue);
+            return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(epilogue_hook));
+        }
 
         // Do epilogue immediately
         const auto result = epilogue();

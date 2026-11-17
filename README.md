@@ -118,7 +118,7 @@ Hybrid communication, CPU-backed Engram storage and graph capture remain unsuppo
 
 ### Buffer initialization
 
-Create one long-lived buffer per EP group and reuse it across layers or microbatches. All ranks must agree on the token capacity. Complete outstanding operations before resizing or reusing the buffer.
+Create one long-lived buffer per EP group and reuse it across layers or microbatches. All ranks must agree on the token capacity. Complete outstanding operations before resizing, reusing or destroying a buffer.
 
 ```python
 import torch
@@ -293,9 +293,8 @@ and work may still be outstanding, restart the distributed job. Releasing the fa
 its registered memory and outstanding URMA sources until process exit. Explicit destruction reports the failure to the caller.
 
 Dispatch and combine both use the communication buffer allocated by `EPBuffer` and registered
-with HCCL. Complete a deferred epilogue with `event.current_stream_wait()` before reusing
-the buffer. If all ranks discard the deferred result, they can call `buffer.destroy()`
-collectively. Destruction drains outstanding communication and invalidates the pending callback.
+with HCCL. Keep the returned event and call `event.current_stream_wait()` to run its deferred
+epilogue before reusing or destroying the buffer.
 If a call with `M > 16` does not request an event or defer its epilogue,
 establish a stream dependency yourself before reusing that buffer on another stream. For example,
 record an event on the producer stream immediately after the call and wait on it in the consumer stream.

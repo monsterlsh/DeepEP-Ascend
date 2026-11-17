@@ -90,7 +90,9 @@ struct Context {
     int num_ranks = 8, num_cpu_timeout_secs = 300;
     int64_t num_gpu_timeout_cycles = 100 * kNumSystemCyclesPerSecond;
     void* workspace = nullptr;
-    void finalize_ep() {}
+    bool finalized = false;
+    void check_available() const { EP_HOST_ASSERT(not finalized); }
+    void finalize_ep() { finalized = true; }
 };
 }
 }
@@ -297,7 +299,7 @@ void check_failures() {
         } else if (mode == 1) {
             state.submission_guard().begin_submission();
             mock::event_failure = true;
-            rejects([&] { auto guard = state.failure_guard(); state.record_completion(true); }, "record");
+            rejects([&] { auto guard = state.epilogue_guard(false); state.record_completion(true); }, "record");
             mock::event_failure = false;
         } else {
             state.submission_guard().begin_submission();
@@ -366,26 +368,15 @@ class DispatchLLStateHostTests(unittest.TestCase):
         ep = (ROOT / 'csrc/buffers/ep.hpp').read_text()
         cleanup = base[base.index('    void destroy_on_destruction'):base.index('public:')]
         destructor = ep[ep.index('    ~EPBuffer()'):ep.index('    EventHandle lb_prefetch_weights')]
-        deferred_state = ep[ep.index('    using Epilogue ='):ep.index('    static int get_num_used_vec_cores')]
-        defer = ep[ep.index('    pybind11::tuple defer('):ep.index('\npublic:')]
         stubs = r'''
-using deep_ep::EventHandle;
-namespace pybind11 {
-using object = int;
-using tuple = std::function<object()>;
-enum class return_value_policy { reference };
-auto cast(auto* owner, return_value_policy) { return owner->shared_from_this(); }
-object none() { return 0; }
-tuple make_tuple(object, EventHandle, tuple hook) { return hook; }
-}
 namespace comm {
 int drains = 0;
 bool drain_failed = false;
-std::weak_ptr<int> callback_tensor;
-bool check_callback_tensor = false;
+std::weak_ptr<int> send_source;
+bool check_send_source = false;
 void barrier(Context&, bool) {
     ++drains;
-    if (check_callback_tensor) assert(!callback_tensor.expired());
+    if (check_send_source) assert(!send_source.expired());
     if (drain_failed) throw std::runtime_error("drain");
 }
 }
@@ -399,7 +390,7 @@ struct Base {
 '''
         fixture = r'''
 };
-struct EPBuffer : Base, std::enable_shared_from_this<EPBuffer> {
+struct EPBuffer : Base {
     std::shared_ptr<Context> context = std::make_shared<Context>();
     std::shared_ptr<EPLowLatencyState> low_latency_state = std::make_shared<EPLowLatencyState>();
     void* host_workspace = nullptr;
@@ -410,14 +401,11 @@ struct EPBuffer : Base, std::enable_shared_from_this<EPBuffer> {
 '''
         cases = r'''
 };
-std::function<int()> defer(EPBuffer& buffer, int& calls) {
-    auto capture = std::make_shared<int>(0);
-    comm::callback_tensor = capture;
-    buffer.low_latency_state->submission_guard().begin_submission();
-    return buffer.defer([capture, &calls, &state = *buffer.low_latency_state] {
-        state.record_completion(false);
-        return ++calls;
-    });
+void submit_send(EPBuffer& buffer) {
+    torch::Tensor source{std::make_shared<int>(1)}, staging{std::make_shared<int>(2)};
+    comm::send_source = source.allocation;
+    comm::check_send_source = true;
+    buffer.low_latency_state->submission_guard(source, staging).begin_submission();
 }
 int main() {
     static_assert(std::is_nothrow_destructible_v<EPBuffer>);
@@ -438,40 +426,29 @@ int main() {
     { auto buffer = std::make_unique<EPBuffer>(); }
     assert(comm::drains == 2);
     comm::drain_failed = false;
-    int calls = 0;
     {
-        auto buffer = std::make_shared<EPBuffer>();
+        auto buffer = std::make_unique<EPBuffer>();
         buffer->explicitly_destroy = true;
-        auto consumed = defer(*buffer, calls);
-        assert(consumed() == 1);
-        auto cancelled = defer(*buffer, calls);
-        rejects([&] { consumed(); }, "already consumed");
-        comm::check_callback_tensor = true;
+        submit_send(*buffer);
+        auto state = buffer->low_latency_state;
         buffer->destroy();
-        assert(comm::drains == 3 && comm::callback_tensor.expired());
-        rejects([&] { cancelled(); }, "cancelled by buffer destruction");
-        assert(calls == 1 && !buffer->low_latency_state->unfinished());
-    }
-    {
-        auto buffer = std::make_shared<EPBuffer>();
-        auto outstanding = defer(*buffer, calls);
         buffer.reset();
-        outstanding = {};
-        assert(comm::drains == 4 && comm::callback_tensor.expired());
+        assert(comm::drains == 3 && comm::send_source.expired());
+        assert(!state->unfinished());
+        rejects([&] { state->epilogue_guard(true); }, "not finalized");
     }
     {
-        auto buffer = std::make_shared<EPBuffer>();
-        auto outstanding = defer(*buffer, calls);
+        auto buffer = std::make_unique<EPBuffer>();
+        submit_send(*buffer);
         comm::drain_failed = true;
         rejects([&] { buffer->destroy(); }, "drain");
-        assert(!comm::callback_tensor.expired());
-        rejects([&] { outstanding(); }, "operation failed");
-        assert(calls == 1 && buffer->low_latency_state->unfinished());
+        assert(!comm::send_source.expired() && buffer->low_latency_state->unfinished());
+        rejects([&] { buffer->low_latency_state->epilogue_guard(true); }, "operation failed");
     }
-    assert(comm::drains == 5);
+    assert(comm::drains == 4);
 }
 '''
-        source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + deferred_state + defer + destructor + cases
+        source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + destructor + cases
         run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
     def test_group_topology_and_transport_limits(self):
