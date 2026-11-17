@@ -100,6 +100,10 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
 | `BufferAllocator`, `BufferBase`, `deep_ep.comm` | Allocation planning, buffer lifecycle, communicator queries, barriers and stream access |
 
+An HCOMM cleanup error can leave channels or endpoint memory registrations active.
+When the destructor reports that it retained registered resources, the affected
+window and registration data remain allocated until the process exits.
+
 PP, Engram and Bucket are experimental; remaining work is listed under [Ongoing](#ongoing). EP requires `do_expand=True` and `allow_multiple_reduction=True`; `do_handle_copy` must remain `False`.
 
 Routing indices use `deep_ep.topk_idx_t`, currently fixed to `torch.int64`. Explicit RDMA service levels and QP counts are unsupported; leave `sl_idx=None` and QP arguments at their defaults. The NV-compatible `num_sms` argument selects AI cores on Ascend EP, with `0` selecting the default; cached dispatch and combine reuse the count saved in the handle.
@@ -241,8 +245,9 @@ range from zero to `M`.
 For BF16 H7168/K6/E384 and alignment 128, the EP64 combine measurement at `M=16` was
 55.479 µs on `7004d16` and 53.774 µs on `main@4dfccac` (+3.17%).
 
-For decode FP8 dispatch with FP32 or packed INT32 scales, the hidden row must be a multiple
-of 32 bytes so both ends of the transfer use the same scale offset.
+Decode FP16 dispatch requires `H` to be a multiple of 16 so the routing metadata starts
+on a 32-byte boundary. For decode FP8 dispatch with FP32 or packed INT32 scales, the hidden
+row must also be a multiple of 32 bytes so both ends of the transfer use the same scale offset.
 
 Within the decode implementation, dispatch and combine select MTE automatically when their
 device and launch requirements are met. Other supported decode configurations use URMA
@@ -281,8 +286,10 @@ The owner applies biases and reduces rank partials in the same routing-slot orde
 Each contributing rank returns its own optional weights directly to the corresponding slots.
 
 Dispatch relay descriptors occupy reserved space in the existing registered EP workspace.
-During buffer construction, ranks exchange server locations and device capabilities
-alongside their communication ports.
+Use the same DeepEP build on all ranks. During multi-rank EP buffer construction,
+a one-word AllGather checks that peers support the topology exchange. Mixing this build
+with `main@4dfccac` fails at this check. Compatible ranks then exchange their ports,
+server locations and device capabilities together.
 Dispatch and combine select their transport from this group configuration and the shared launch
 geometry. Use the same vector core count, fresh/cached mode and barrier placement on all ranks.
 Empty ranks participate in the collective. Local token count, statistics, bias and deferred
@@ -313,10 +320,6 @@ to confirm which MTE kernels were selected.
 python tests/ep/test_ep.py --num-processes 8 --num-ai-cores 32 \
     --num-tokens 16 --hidden 7168 --num-topk 6 --num-experts 384 --dispatch-dtype bf16
 ```
-
-Run [the decode regression](tests/ep/test_decode.py) for empty ranks, deferred combine
-across streams, capacity overrides, FP16 activations and 32-bit FP8 scales. With at
-least four ranks it also checks BF16 rounding and optional routing weights byte for byte.
 
 ## Other buffer interfaces
 

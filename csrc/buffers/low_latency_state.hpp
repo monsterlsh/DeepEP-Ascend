@@ -11,7 +11,7 @@
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
 #include "../kernels/comm/api.hpp"
-#include "../kernels/ep/dispatch_low_latency_policy.hpp"
+#include "../kernels/ep/low_latency_policy.hpp"
 #include "../utils/event.hpp"
 
 namespace deep_ep {
@@ -69,12 +69,10 @@ public:
         mte_enabled = topology.mte_enabled;
     }
 
-    bool unfinished() const noexcept { return pending or failed; }
-
     ~EPLowLatencyState() {
         // An unconfirmed collective may still access the registered window and URMA
         // sources. Only process teardown can reclaim them safely in this state.
-        if (unfinished())
+        if (pending or failed)
             resources.release();
     }
 
@@ -116,7 +114,7 @@ public:
         return {this, true};
     }
 
-    FailureGuard submission_guard(const torch::Tensor& source = {}, const torch::Tensor& staging = {}) {
+    FailureGuard submission_guard(const torch::Tensor& source, const torch::Tensor& staging) {
         if (staging.defined()) {
             resources->source = source;
             resources->staging = staging;
@@ -142,7 +140,7 @@ public:
     bool prepare_dispatch(int world, int capacity, int hidden, int num_topk, int num_experts,
                           int num_vec_cores, int num_ub_bytes, int num_sf_packs, bool fp8) const {
         return mte_enabled and (not fp8 or num_sf_packs > 0) and
-            supports_dispatch_mte(3510, world, capacity, hidden, num_topk, num_experts,
+            supports_dispatch_mte(world, capacity, hidden, num_topk, num_experts,
                                   num_vec_cores, num_ub_bytes, num_sf_packs) and not stream_is_captured();
     }
 

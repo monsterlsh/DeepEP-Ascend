@@ -131,6 +131,40 @@ static void launch_dispatch(void* x, void* sf,
                        sf_hidden_stride, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier);
 }
 
+static auto prepare_dispatch_copy_epilogue(bool cached_mode, bool do_zero_padding, int num_ranks,
+                                           int num_max_tokens_per_rank, int num_experts, int num_topk,
+                                           int expert_alignment, int num_hidden_bytes, int num_sf_packs,
+                                           int recv_sf_token_stride, int recv_sf_hidden_stride,
+                                           int num_ub_bytes, int num_vec_cores, int64_t num_timeout_cycles,
+                                           bool do_barrier) {
+    EP_HOST_ASSERT(num_vec_cores > 0);
+    EP_HOST_ASSERT(num_ub_bytes > 0);
+    EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
+    EP_HOST_ASSERT(num_sf_packs == 0 or
+                   (recv_sf_token_stride == num_sf_packs and recv_sf_hidden_stride == 1));
+    const auto kernel = jit->compile("dispatch_copy_epilogue", std::format(R"(
+#include <deep_ep/impls/ep/dispatch_copy_epilogue.hpp>
+
+using namespace deep_ep;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+}}
+)", num_ranks, num_experts, num_topk,
+        expert_alignment, cached_mode, do_zero_padding, num_vec_cores, num_hidden_bytes, num_sf_packs,
+        num_max_tokens_per_rank, num_ub_bytes, num_timeout_cycles, do_barrier));
+
+    return [kernel, num_vec_cores, num_ub_bytes, recv_sf_token_stride, recv_sf_hidden_stride](
+        void* buffer, void* workspace, void* jetty_ptrs, void* psum_num_recv_tokens_per_rank,
+        void* psum_num_recv_tokens_per_expert, void* recv_x, void* recv_sf, void* recv_topk_weights,
+        void* recv_src_metadata, int rank_idx) {
+        jit->launch(kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
+                    buffer, workspace, jetty_ptrs, psum_num_recv_tokens_per_rank,
+                    psum_num_recv_tokens_per_expert, recv_x, recv_sf, recv_topk_weights,
+                    recv_src_metadata, rank_idx, recv_sf_token_stride, recv_sf_hidden_stride);
+    };
+}
+
 static void launch_dispatch_copy_epilogue(void* buffer,
                                           void* workspace,
                                           void* jetty_ptrs,
@@ -152,40 +186,11 @@ static void launch_dispatch_copy_epilogue(void* buffer,
                                           const int& num_vec_cores,
                                           const int64_t& num_timeout_cycles,
                                           const bool& do_barrier = true) {
-    // Ascend dispatch epilogue is expand-only and non-hybrid.
-    EP_HOST_ASSERT(num_vec_cores > 0);
-    EP_HOST_ASSERT(num_ub_bytes > 0);
-    EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
-    EP_HOST_ASSERT(num_sf_packs == 0 or
-                   (recv_sf_token_stride == num_sf_packs and recv_sf_hidden_stride == 1));
-
-    // Compile
-    const auto kernel = jit->compile("dispatch_copy_epilogue", std::format(R"(
-#include <deep_ep/impls/ep/dispatch_copy_epilogue.hpp>
-
-using namespace deep_ep;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
-}}
-)", num_ranks, num_experts, num_topk,
-        expert_alignment, cached_mode, do_zero_padding,
-        num_vec_cores,
-        num_hidden_bytes, num_sf_packs,
-        num_max_tokens_per_rank, num_ub_bytes, num_timeout_cycles, do_barrier));
-
-    // Launch
-    jit->launch(
-        kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
-        buffer,
-        workspace,
-        jetty_ptrs,
-        psum_num_recv_tokens_per_rank,
-        psum_num_recv_tokens_per_expert,
-        recv_x, recv_sf, recv_topk_weights,
-        recv_src_metadata,
-        rank_idx,
-        recv_sf_token_stride, recv_sf_hidden_stride);
+    const auto launch = prepare_dispatch_copy_epilogue(cached_mode, do_zero_padding, num_ranks,
+        num_max_tokens_per_rank, num_experts, num_topk, expert_alignment, num_hidden_bytes,
+        num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier);
+    launch(buffer, workspace, jetty_ptrs, psum_num_recv_tokens_per_rank, psum_num_recv_tokens_per_expert,
+           recv_x, recv_sf, recv_topk_weights, recv_src_metadata, rank_idx);
 }
 
 }  // namespace deep_ep

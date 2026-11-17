@@ -30,7 +30,23 @@
 namespace deep_ep {
 
 struct HCCLContext {
-    std::shared_ptr<symmetric::SymmetricMemory> memory;
+private:
+    struct Registrations {
+        std::shared_ptr<symmetric::SymmetricMemory> memory;
+        HcclMemHandle mem_handle = nullptr;
+        std::vector<EndpointHandle> jetty_endpoints;
+        std::vector<HcommMemHandle> jetty_mem_handles;
+        std::vector<ChannelHandle> channel_handles;
+        // HCOMM shallow-copies channelName pointers until channel destruction.
+        std::vector<std::string> channel_names;
+    };
+    std::unique_ptr<Registrations> registrations = std::make_unique<Registrations>();
+    HcommResult close_status = 0;
+
+public:
+    const std::shared_ptr<symmetric::SymmetricMemory>& registered_memory() const { return registrations->memory; }
+    int num_jetties() const { return static_cast<int>(registrations->jetty_endpoints.size()); }
+
     HcclComm comm = nullptr;
     void* buffer = nullptr;
     int64_t num_bytes = 0;
@@ -39,13 +55,7 @@ struct HCCLContext {
     int rank_idx = 0;
     std::vector<int64_t> peer_ptrs;
 
-    // HCCL registration for UB_MEM address discovery
-    HcclMemHandle mem_handle = nullptr;
-
-    // Jetty endpoints, peer channels and their device lookup table
-    std::vector<EndpointHandle> jetty_endpoints;
-    std::vector<ChannelHandle> channel_handles;
-    void* jetty_device_ptrs = nullptr;  // Device copy of `channel_handles`
+    void* jetty_device_ptrs = nullptr;  // Device copy of the channel handles
 
     HCCLContext(const std::string& hccl_group_name, const int& rank_idx,
                 const int& num_ranks, const int64_t& num_bytes,
@@ -72,6 +82,7 @@ struct HCCLContext {
         const auto buffer_uid = "deep_ep/" + hccl_group_name + "/" + std::to_string(buffer_idx);
 
         // Share the allocation when registering the same storage with another group.
+        auto& memory = registrations->memory;
         memory = shared_memory == nullptr ? std::make_shared<symmetric::SymmetricMemory>(num_bytes, use_huge1g_page) : shared_memory;
         EP_HOST_ASSERT(memory->num_bytes == num_bytes);
         buffer = memory->ptr;
@@ -83,7 +94,7 @@ struct HCCLContext {
         mem.addr = buffer;
         mem.size = static_cast<uint64_t>(this->num_bytes);
         HCCL_CHECK(HcclCommGetHandleWithName(hccl_group_name.c_str(), &comm));
-        HCCL_CHECK(HcclCommMemReg(comm, buffer_uid.c_str(), &mem, &mem_handle));
+        HCCL_CHECK(HcclCommMemReg(comm, buffer_uid.c_str(), &mem, &registrations->mem_handle));
         // TODO: do we need a barrier after member reg?
 
         // Discover peer buffer pointers
@@ -110,6 +121,9 @@ struct HCCLContext {
         // TODO: do we have to destroy the connections as well?
         // HCOMM can consume handles before returning an error. Never resubmit those handles.
         HCOMM_CHECK(close_status);
+        auto& channel_handles = registrations->channel_handles;
+        auto& jetty_endpoints = registrations->jetty_endpoints;
+        auto& jetty_mem_handles = registrations->jetty_mem_handles;
         if (jetty_device_ptrs != nullptr) {
             ACL_CHECK(aclrtFree(jetty_device_ptrs));
             jetty_device_ptrs = nullptr;
@@ -120,34 +134,35 @@ struct HCCLContext {
             channel_handles.clear();
         }
         while (not jetty_endpoints.empty()) {
-            if (jetty_mem_handles.size() == jetty_endpoints.size()) {
-                close_status = HcommMemUnreg(jetty_endpoints.back(), jetty_mem_handles.back());
-                HCOMM_CHECK(close_status);
-                jetty_mem_handles.pop_back();
-            }
+            close_status = HcommMemUnreg(jetty_endpoints.back(), jetty_mem_handles.back());
+            HCOMM_CHECK(close_status);
             close_status = HcommEndpointDestroy(jetty_endpoints.back());
             HCOMM_CHECK(close_status);
+            jetty_mem_handles.pop_back();
             jetty_endpoints.pop_back();
         }
-        memory.reset();
+        registrations->memory.reset();
         buffer = nullptr;
     }
 
     ~HCCLContext() noexcept {
-        try {
-            close();
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "DeepEP: HCOMM cleanup failed: %s\n", e.what());
-        } catch (...) {
-            std::fputs("DeepEP: HCOMM cleanup failed.\n", stderr);
-        }
+        close_noexcept();
     }
 
 private:
-    HcommResult close_status = 0;
-    std::vector<HcommMemHandle> jetty_mem_handles;
-    // HCOMM shallow-copies channelName pointers; keep channel_names until channel destruction.
-    std::vector<std::string> channel_names;
+    void close_noexcept() noexcept {
+        try {
+            close();
+        } catch (const std::exception& e) {
+            // Outstanding registrations may still refer to the window and channel metadata.
+            // Leave their owners intact through process exit, without allocating on this path.
+            (void)registrations.release();
+            std::fprintf(stderr, "DeepEP: HCOMM cleanup failed; retaining registered resources: %s\n", e.what());
+        } catch (...) {
+            (void)registrations.release();
+            std::fputs("DeepEP: HCOMM cleanup failed; retaining registered resources.\n", stderr);
+        }
+    }
 
     // Build a channel desc for the first link to `peer_rank_idx` on `layer` whose
     // protocol satisfies `accept`. Returns nullptr if no such link exists.
@@ -175,7 +190,7 @@ private:
             // TODO: what do the magic numbers (3 and 1) mean?
             desc.notifyNum               = 3;
             // Attach our registered workspace so peers' writes land in our region.
-            desc.memHandles              = &mem_handle;
+            desc.memHandles              = &registrations->mem_handle;
             desc.memHandleNum            = 1;
             return desc;
         }
@@ -252,6 +267,8 @@ private:
         mem.type = COMM_MEM_TYPE_DEVICE;
         mem.addr = buffer;
         mem.size = static_cast<uint64_t>(num_bytes);
+        auto& jetty_endpoints = registrations->jetty_endpoints;
+        auto& jetty_mem_handles = registrations->jetty_mem_handles;
         jetty_endpoints.resize(num_jetties);
         jetty_mem_handles.resize(num_jetties);
         for (int i = 0; i < num_jetties; ++ i) {
@@ -271,6 +288,8 @@ private:
         HcommChannelConfig config = nullptr;
         HCOMM_CHECK(HcommChannelConfigCreate(&config));
         HCOMM_CHECK(HcommChannelConfigSetInt(config, HCOMM_CHANNEL_CONFIG_TYPE_IS_SHARED_QUEUE, 1));
+        auto& channel_handles = registrations->channel_handles;
+        auto& channel_names = registrations->channel_names;
         channel_handles.resize(num_channels);
         channel_names.resize(num_channels);
         for (int channel_idx = 0; channel_idx < num_channels; ++ channel_idx) {
@@ -314,9 +333,7 @@ private:
     }
 
     std::vector<uint16_t> gather_listen_ports(uint16_t listen_port, int num_cpu_timeout_secs,
-                                             comm::DecodeTopology* decode_topology) const {
-        // The collective count is identical across a buffer's ranks, including when a
-        // local EP rank cannot use MTE. Other buffer types keep the native port payload.
+                                             comm::DecodeTopology* decode_topology) {
         const auto gather = [&]<typename T>(const T& local) {
             static_assert(sizeof(T) % sizeof(uint16_t) == 0);
             std::vector<T> peers(num_ranks);
@@ -343,13 +360,28 @@ private:
             ACL_CHECK(aclrtFree(allocation.release()));
             return peers;
         };
-        auto listen_ports = decode_topology ? decode_topology->gather_ports(listen_port, gather) : gather(listen_port);
-        for (const auto& port: listen_ports)
-            EP_HOST_ASSERT(port > 0);
-        return listen_ports;
+        try {
+            // Main exchanges one uint16_t and rejects port zero before creating channels.
+            // Use that same count so both sides reject a mixed group in the first collective.
+            auto listen_ports = gather(decode_topology ? uint16_t{0} : listen_port);
+            if (decode_topology != nullptr) {
+                EP_HOST_ASSERT(std::all_of(listen_ports.begin(), listen_ports.end(), [](uint16_t port) { return port == 0; })
+                               and "All EP ranks must use the same topology exchange protocol");
+                listen_ports = decode_topology->gather_ports(listen_port, gather);
+            }
+            for (const auto& port: listen_ports)
+                EP_HOST_ASSERT(port > 0);
+            return listen_ports;
+        } catch (...) {
+            // Every local Jetty has registered the window before EP negotiation.
+            if (decode_topology != nullptr)
+                close_noexcept();
+            throw;
+        }
     }
 
     void wait_for_channels(const int& num_cpu_timeout_secs) const {
+        const auto& channel_handles = registrations->channel_handles;
         // State values from the `HcommChannelGetStatus` contract.
         // TODO(HUAWEI): do not hardcode
         static constexpr int kChannelReady = 0;

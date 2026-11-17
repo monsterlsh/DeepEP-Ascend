@@ -89,23 +89,10 @@ static void* launch_combine(void* x,
                              num_topk, hidden, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier);
 }
 
-static void launch_ep_combine_reduce_epilogue(EPKernelMode mode, void* combined_x,
-                                              void* combined_topk_weights,
-                                              void* combined_topk_idx,
-                                              void* reduce_buffer,
-                                              void* bias_0,
-                                              void* bias_1,
-                                              void* workspace,
-                                              void* jetty_ptrs,
-                                              const int& num_ranks,
-                                              const int& num_combined_tokens,
-                                              const int& num_max_tokens_per_rank,
-                                              const int& num_experts, const int& num_topk,
-                                              const int& hidden,
-                                              const int& num_ub_bytes,
-                                              const int& num_vec_cores,
-                                              const int64_t& num_timeout_cycles,
-                                              const bool& do_barrier = true, bool use_fp16 = false) {
+static auto prepare_combine_reduce_epilogue(EPKernelMode mode, int num_ranks, int num_max_tokens_per_rank,
+                                            int num_experts, int num_topk, int hidden, int num_ub_bytes,
+                                            int num_vec_cores, int64_t num_timeout_cycles, bool do_barrier,
+                                            bool use_fp16) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -127,18 +114,13 @@ static void __instantiate_kernel() {{
         num_ranks, num_experts, num_topk,
         hidden, num_max_tokens_per_rank, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier, decode_args));
 
-    // Launch
-    jit->launch(
-        kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
-        combined_x,
-        combined_topk_weights,
-        combined_topk_idx,
-        reduce_buffer,
-        bias_0,
-        bias_1,
-        workspace,
-        jetty_ptrs,
-        num_combined_tokens);
+    return [kernel, num_vec_cores, num_ub_bytes](
+        void* combined_x, void* combined_topk_weights, void* combined_topk_idx, void* reduce_buffer,
+        void* bias_0, void* bias_1, void* workspace, void* jetty_ptrs, int num_combined_tokens) {
+        jit->launch(kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
+                    combined_x, combined_topk_weights, combined_topk_idx, reduce_buffer,
+                    bias_0, bias_1, workspace, jetty_ptrs, num_combined_tokens);
+    };
 }
 
 static void launch_combine_reduce_epilogue(void* combined_x,
@@ -158,10 +140,10 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& num_vec_cores,
                                            const int64_t& num_timeout_cycles,
                                            const bool& do_barrier = true) {
-    launch_ep_combine_reduce_epilogue(EPKernelMode::Native, combined_x, combined_topk_weights, combined_topk_idx,
-        reduce_buffer, bias_0, bias_1, workspace, jetty_ptrs, num_ranks, num_combined_tokens,
-        num_max_tokens_per_rank, num_experts, num_topk, hidden, num_ub_bytes, num_vec_cores,
-        num_timeout_cycles, do_barrier);
+    const auto launch = prepare_combine_reduce_epilogue(EPKernelMode::Native, num_ranks, num_max_tokens_per_rank,
+        num_experts, num_topk, hidden, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier, false);
+    launch(combined_x, combined_topk_weights, combined_topk_idx, reduce_buffer, bias_0, bias_1,
+           workspace, jetty_ptrs, num_combined_tokens);
 }
 
 }  // namespace deep_ep

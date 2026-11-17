@@ -46,6 +46,18 @@ class EPBuffer: public BufferBase {
             c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
     }
 
+    pybind11::tuple run_epilogue(auto&& epilogue, bool deferred, bool async_with_compute_stream) const {
+        if (deferred) {
+            std::function<pybind11::object()> hook =
+                EPLowLatencyState::make_deferred_epilogue(std::move(epilogue));
+            return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(hook));
+        }
+        const auto result = epilogue();
+        const auto event = async_with_compute_stream ?
+            std::optional<EventHandle>(low_latency_state->completion_event()) : std::nullopt;
+        return pybind11::make_tuple(result, event, pybind11::none());
+    }
+
 public:
     std::shared_ptr<comm::Context> context;
     torch::Tensor lb_storage;
@@ -214,6 +226,9 @@ public:
             sf_hidden_stride = static_cast<int>(column_stride);
         } else {
             EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 or (decode and x.scalar_type() == torch::kFloat16));
+            // FP16 uses the same wire packet for fresh and cached dispatch. Every UB token starts on a block boundary.
+            EP_HOST_ASSERT((x.scalar_type() != torch::kFloat16 or num_hidden_bytes % kNumUbAlignmentBytes == 0) and
+                           "FP16 dispatch requires a 32-byte aligned hidden row");
         }
 
         // Check top-k stuffs
@@ -359,9 +374,18 @@ public:
         const auto wire_scales = pack_scales ? std::optional{sf->contiguous()} : sf;
         const bool relay = low_latency_transport and low_latency_state->server_relay_enabled();
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
+        const auto mode = get_ep_kernel_mode(decode, low_latency_transport);
+        const int recv_sf_hidden_stride = sf.has_value() ? 1 : 0;
+        const auto copy_epilogue = make_epilogue_launcher(mode, [=, ranks = context->num_ranks,
+                                                                timeout = context->num_gpu_timeout_cycles] {
+            return prepare_dispatch_copy_epilogue(cached_mode, do_zero_padding, ranks,
+                num_max_tokens_per_rank, num_experts, num_topk, expert_alignment, num_hidden_bytes,
+                num_sf_packs, num_sf_packs, recv_sf_hidden_stride, num_ub_bytes, num_used_vec_cores,
+                timeout, not barrier_in_prologue);
+        });
         auto submission = low_latency_state->submission_guard(x, metadata_send_buffer);
         launch_ep_dispatch(
-            get_ep_kernel_mode(decode, low_latency_transport), [&] { submission.begin_submission(); },
+            mode, [&] { submission.begin_submission(); },
             x.data_ptr(), wire_scales.has_value() ? wire_scales->data_ptr() : nullptr,
             topk_idx.data_ptr(), topk_weights_ptr,
             metadata_send_buffer.defined() ? metadata_send_buffer.data_ptr() : nullptr,
@@ -439,12 +463,8 @@ public:
             // Allocate output tensors
             auto recv_x = torch::empty({num_expanded_tokens, hidden}, x.options());
             auto recv_sf = std::optional<torch::Tensor>();
-            int recv_sf_token_stride = 0;
-            int recv_sf_hidden_stride = 0;
             void* recv_sf_ptr = nullptr;
             if (sf.has_value()) {
-                recv_sf_token_stride = num_sf_packs;
-                recv_sf_hidden_stride = 1;
                 const auto columns = sf->size(1);
                 recv_sf = torch::empty_strided({num_expanded_tokens, columns}, {columns, 1}, sf->options());
                 recv_sf_ptr = recv_sf->data_ptr();
@@ -459,7 +479,7 @@ public:
                 cached_recv_src_metadata.value() :
                 torch::empty({num_recv_tokens, num_topk + 2}, int_options);
 
-            launch_dispatch_copy_epilogue(
+            copy_epilogue(
                 context->buffer,
                 context->workspace,
                 low_latency_transport ? nullptr : context->hccl_context->jetty_device_ptrs,
@@ -469,20 +489,7 @@ public:
                 recv_sf_ptr,
                 recv_topk_weights.has_value() ? recv_topk_weights->data_ptr() : nullptr,
                 recv_src_metadata.data_ptr<int>(),
-                cached_mode,
-                do_zero_padding,
-                context->rank_idx, context->num_ranks,
-                num_max_tokens_per_rank,
-                num_experts, num_topk,
-                expert_alignment,
-                num_hidden_bytes,
-                num_sf_packs,
-                recv_sf_token_stride,
-                recv_sf_hidden_stride,
-                num_ub_bytes,
-                num_used_vec_cores,
-                context->num_gpu_timeout_cycles,
-                not barrier_in_prologue
+                context->rank_idx
             );
 
             // Convert row-major epilogue output to column-major
@@ -504,18 +511,7 @@ public:
                 dst_gsge_idx);
         };
 
-        // Defer epilogue and host sync
-        if (defer_epilogue) {
-            std::function<pybind11::object()> epilogue_hook =
-                EPLowLatencyState::make_deferred_epilogue(std::move(epilogue));
-            return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(epilogue_hook));
-        }
-
-        // Do epilogue immediately
-        const auto result = epilogue();
-        const auto event = async_with_compute_stream ?
-            std::optional<EventHandle>(low_latency_state->completion_event()) : std::nullopt;
-        return pybind11::make_tuple(result, event, pybind11::none());
+        return run_epilogue(std::move(epilogue), defer_epilogue, async_with_compute_stream);
     }
 
     pybind11::tuple
@@ -619,8 +615,14 @@ public:
             if (topk_weights.has_value())
                 record_use(*topk_weights, *issue_stream);
         }
-        auto submission = low_latency_state->submission_guard(x, send_buffer);
         const auto mode = get_ep_kernel_mode(decode, low_latency_transport);
+        const bool use_fp16 = x.scalar_type() == torch::kFloat16;
+        const auto reduce_epilogue = make_epilogue_launcher(mode, [=, ranks = context->num_ranks,
+                                                                  timeout = context->num_gpu_timeout_cycles] {
+            return prepare_combine_reduce_epilogue(mode, ranks, num_max_tokens_per_rank, num_experts,
+                num_topk, hidden, num_ub_bytes, num_used_vec_cores, timeout, not barrier_in_prologue, use_fp16);
+        });
+        auto submission = low_latency_state->submission_guard(x, send_buffer);
         const auto reduce_buffer = launch_ep_combine(
             mode, [&] { submission.begin_submission(); }, x.data_ptr(),
             topk_weights_ptr, topk_weights.has_value(),
@@ -637,7 +639,7 @@ public:
             num_ub_bytes,
             num_used_vec_cores,
             context->num_gpu_timeout_cycles,
-            barrier_in_prologue, x.scalar_type() == torch::kFloat16
+            barrier_in_prologue, use_fp16
         );
 
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
@@ -670,8 +672,8 @@ public:
             }
 
             // Reduce pushed data
-            launch_ep_combine_reduce_epilogue(
-                mode, combined_x.data_ptr(),
+            reduce_epilogue(
+                combined_x.data_ptr(),
                 combined_topk_weights_ptr,
                 combined_topk_idx.data_ptr<int64_t>(),
                 reduce_buffer,
@@ -679,33 +681,14 @@ public:
                 bias_1.has_value() ? bias_1->data_ptr() : nullptr,
                 context->workspace,
                 context->hccl_context->jetty_device_ptrs,
-                context->num_ranks,
-                num_combined_tokens,
-                num_max_tokens_per_rank,
-                num_experts, num_topk,
-                hidden,
-                num_ub_bytes,
-                num_used_vec_cores,
-                context->num_gpu_timeout_cycles,
-                not barrier_in_prologue, x.scalar_type() == torch::kFloat16
+                num_combined_tokens
             );
 
             low_latency_state->record_completion(decode or async_with_compute_stream);
             return pybind11::make_tuple(combined_x, combined_topk_weights);
         };
 
-        // Defer epilogue
-        if (defer_epilogue) {
-            std::function<pybind11::object()> epilogue_hook =
-                EPLowLatencyState::make_deferred_epilogue(std::move(epilogue));
-            return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(epilogue_hook));
-        }
-
-        // Do epilogue immediately
-        const auto result = epilogue();
-        const auto event = async_with_compute_stream ?
-            std::optional<EventHandle>(low_latency_state->completion_event()) : std::nullopt;
-        return pybind11::make_tuple(result, event, pybind11::none());
+        return run_epilogue(std::move(epilogue), defer_epilogue, async_with_compute_stream);
     }
 
     static int64_t get_dispatch_buffer_size(const int& num_max_tokens_per_rank,

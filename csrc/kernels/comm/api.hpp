@@ -65,7 +65,7 @@ public:
             hccl_group_name, rank_idx, num_ranks, num_bytes, runtime->get_num_vec_cores(),
             num_cpu_timeout_secs, use_huge1g_page,
             main_context == nullptr ? nullptr : main_context->symmetric_memory, decode_topology);
-        symmetric_memory = hccl_context->memory;
+        symmetric_memory = hccl_context->registered_memory();
         workspace = symmetric_memory->ptr;
         EP_HOST_ASSERT(reinterpret_cast<uintptr_t>(workspace) % kNumAllocationAlignmentBytes == 0);
         buffer = math::advance_ptr<void>(symmetric_memory->ptr, num_workspace_bytes);
