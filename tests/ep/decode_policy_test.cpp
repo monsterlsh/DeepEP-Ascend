@@ -41,7 +41,7 @@ int main() {
                                   ep == 32 || ep == 64 || ep == 128) && m >= 1 && m <= 16;
             assert(use_decode_implementation(m) == (m >= 1 && m <= 16));
             assert(is_decode_capacity(ep, m) == in_grid);
-            assert(is_decode_shape(ep, m, 7168, 8, 128, 64, 221184, false) == in_grid);
+            assert(supports_combine_mte(ep, m, 7168, 8, 128, 64, 221184) == in_grid);
             assert(supports_dispatch_mte(3510, ep, m, 7168, 8, 128, 64, 221184, 0) == in_grid);
         }
     }
@@ -69,11 +69,15 @@ int main() {
     assert(!plan(3510, 4096, 8, 128, 64, 221184, -1));
     assert(!plan(3510, 4096, 8, 128, 64, 221184, std::numeric_limits<int>::max()));
     assert(!plan(3510, 4096, 8, 128, 64, 221184, 27000));
-    // 32 routes fit the issue ring for a small hidden size. Same shape with
-    // EP32 needs 34 reduction slots, exceeding the 32 available mutex IDs.
     assert(plan(3510, 2048, 32, 512, 64, 221184, 0));
-    assert(!plan(3510, 4096, 32, 512, 64, 221184, 0));
-    assert(!is_decode_shape(32, 16, 2048, 32, 512, 64, 221184, false));
+    assert(supports_combine_mte(8, 16, 2048, 32, 512, 64, 221184));
+    // Dispatch stages fit even when the combine issue or reduction ring is too small.
+    assert(plan(3510, 7168, 16, 128, 64, 221184, 0));
+    assert(!supports_combine_mte(8, 16, 7168, 16, 128, 64, 221184));
+    assert(plan(3510, 4096, 32, 512, 64, 221184, 0));
+    assert(!supports_combine_mte(8, 16, 4096, 32, 512, 64, 221184));
+    assert(supports_dispatch_mte(3510, 32, 16, 2048, 32, 512, 64, 221184, 0));
+    assert(!supports_combine_mte(32, 16, 2048, 32, 512, 64, 221184));
     assert(!plan(3510, 2048, 33, 512, 64, 221184, 0));
     assert(!plan(3510, std::numeric_limits<int>::max() - 127, 8, 128, 64, 221184, 0));
     check_workspace_size<128, 2, 1, 8>();

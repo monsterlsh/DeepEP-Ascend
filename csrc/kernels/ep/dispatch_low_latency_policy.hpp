@@ -26,7 +26,8 @@ inline bool supports_dispatch_mte(
         int num_vec_cores, int num_ub_bytes, int num_sf_packs) {
     const bool use_fp8 = num_sf_packs > 0;
     if (arch != 3510 or num_sf_packs < 0 or num_sf_packs > num_ub_bytes / static_cast<int>(sizeof(sf_pack_t)) or
-        not is_decode_shape(num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, use_fp8))
+        not is_decode_geometry(num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes) or
+        (use_fp8 and hidden % kNumVectorRegisterBytes != 0))
         return false;
 
     static_assert(kMaxDecodeRanks <= kNumMaxRanks and kMaxDecodeRanks <= reduction::kReductionMaxHighCount);

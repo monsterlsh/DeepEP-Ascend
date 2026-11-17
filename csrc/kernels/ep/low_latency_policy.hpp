@@ -19,18 +19,17 @@ constexpr bool is_decode_capacity(int num_ranks, int capacity) {
            use_decode_implementation(capacity);
 }
 
-constexpr bool is_decode_geometry(int num_ranks, int capacity, int hidden, int num_topk, int num_experts) {
-    return is_decode_capacity(num_ranks, capacity) and
+constexpr bool is_decode_geometry(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
+                                  int num_vec_cores, int num_ub_bytes) {
+    return is_decode_capacity(num_ranks, capacity) and num_vec_cores == 64 and num_ub_bytes == 216 * 1024 and
            hidden > 0 and hidden % (kNumVectorRegisterBytes / 2) == 0 and
            num_experts > 0 and num_experts <= kDispatchWorkerThreads and num_experts % num_ranks == 0 and
            num_topk > 0 and num_topk <= 32 and num_topk <= num_experts;
 }
 
-constexpr bool is_decode_shape(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
-                               int num_vec_cores, int num_ub_bytes, bool use_fp8) {
-    if (not is_decode_geometry(num_ranks, capacity, hidden, num_topk, num_experts) or
-        num_vec_cores != 64 or num_ub_bytes != 216 * 1024 or
-        (use_fp8 and hidden % kNumVectorRegisterBytes != 0))
+constexpr bool supports_combine_mte(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
+                                    int num_vec_cores, int num_ub_bytes) {
+    if (not is_decode_geometry(num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes))
         return false;
     // BF16 and FP16 expert outputs use two bytes per element after any dispatch dtype.
     const int64_t hidden_bytes = int64_t{2} * hidden;

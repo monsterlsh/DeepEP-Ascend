@@ -241,6 +241,9 @@ range from zero to `M`.
 For BF16 H7168/K6/E384 and alignment 128, the EP64 combine measurement at `M=16` was
 55.479 µs on `7004d16` and 53.774 µs on `main@4dfccac` (+3.17%).
 
+For decode FP8 dispatch with FP32 or packed INT32 scales, the hidden row must be a multiple
+of 32 bytes so both ends of the transfer use the same scale offset.
+
 Within the decode implementation, dispatch and combine select MTE automatically when their
 device and launch requirements are met. Other supported decode configurations use URMA
 internally, including for decode-specific formats such as FP16. Both transports respect the
@@ -251,8 +254,8 @@ buffer's configured device timeout. The MTE requirements are:
 - BF16/FP16 activations with `H` divisible by 128, or FP8 E4M3 with `H` divisible by 256.
   FP8 dispatch carries native 16-bit scale packs, FP32 scales per 128 channels, or INT32 words
   containing four E8M0 scales per 128 channels. The returned scales preserve their dtype and bits.
-- `1 ≤ K ≤ min(E, 32)`, `E ≤ 512`, and `E` evenly divisible by the EP group size. The
-  dispatch stages and the combine reduction ring must fit UB. This covers H7168/K6/E384,
+- `1 ≤ K ≤ min(E, 32)`, `E ≤ 512`, and `E` evenly divisible by the EP group size. Dispatch
+  checks its UB stages. Combine checks its issue and reduction rings. This covers H7168/K6/E384,
   as well as H7168/K8/E128. Alignment, host count sync, padding and epilogue scheduling
   keep their usual expanded dispatch semantics. With `deterministic=True`, the dispatch
   epilogue sorts the received rows within each expert for both MTE and URMA.

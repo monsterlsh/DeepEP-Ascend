@@ -325,9 +325,14 @@ private:
             // If the wait times out, the collective may still access this allocation.
             allocation.release();
             const auto timeout_ms = std::min<int64_t>(int64_t{num_cpu_timeout_secs} * 1000, std::numeric_limits<int32_t>::max());
-            ACL_CHECK(aclrtSynchronizeStreamWithTimeout(stream, static_cast<int32_t>(timeout_ms)));
-            allocation.reset(raw);
+            const auto wait_status = aclrtSynchronizeStreamWithTimeout(stream, static_cast<int32_t>(timeout_ms));
+            if (wait_status == ACL_SUCCESS)
+                allocation.reset(raw);
+            else if (status != HCCL_SUCCESS)
+                std::fprintf(stderr, "DeepEP: stream synchronization after failed HcclAllGather returned ACL error %d\n",
+                             static_cast<int>(wait_status));
             HCCL_CHECK(status);
+            ACL_CHECK(wait_status);
             ACL_CHECK(aclrtMemcpy(peers.data(), bytes, raw, bytes, ACL_MEMCPY_DEVICE_TO_HOST));
             ACL_CHECK(aclrtFree(allocation.release()));
             return peers;

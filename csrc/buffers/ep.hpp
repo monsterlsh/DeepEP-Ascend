@@ -120,7 +120,7 @@ public:
             low_latency_state->record_completion(false);
             ACL_CHECK(aclrtHostUnregister(host_workspace));
             ACL_CHECK(aclrtFreeHost(host_workspace));
-            context->finalize();
+            context->finalize_ep();
             lb_storage = torch::Tensor();
             destroyed = true;
         } catch (...) {
@@ -199,12 +199,13 @@ public:
         const auto hidden = static_cast<int>(x.size(1));
         const auto num_hidden_bytes = hidden * static_cast<int>(x.element_size());
         const auto num_experts_per_rank = num_experts / context->num_ranks;
+        EP_HOST_ASSERT((not do_zero_padding or num_hidden_bytes % kNumVectorRegisterBytes == 0) and
+                       "Zero padding requires a vector-aligned hidden row");
 
         int num_sf_packs = 0;
         int sf_token_stride = 0;
         int sf_hidden_stride = 0;
-        void* sf_ptr = nullptr;
-        torch::Tensor wire_scales;
+        bool pack_scales = false;
         if (sf.has_value()) {
             EP_HOST_ASSERT(x.scalar_type() == torch::kFloat8_e4m3fn);
             EP_HOST_ASSERT(sf->dim() == 2 and sf->size(0) == num_tokens);
@@ -214,19 +215,21 @@ public:
             EP_HOST_ASSERT(wide or sf->element_size() == sizeof(sf_pack_t));
             // FP32 per-128 scales and packed E8M0 INT32 use two consecutive
             // 16-bit wire words per entry. Preserve their bits and public dtype.
-            if (wide)
-                EP_HOST_ASSERT(sf->size(1) == math::ceil_div(hidden, 128));
-            wire_scales = (wide or (decode and (sf->stride(0) == 0 or sf->stride(1) == 0))) ? sf->contiguous() : *sf;
+            if (wide) {
+                EP_HOST_ASSERT(num_hidden_bytes % kNumUbAlignmentBytes == 0 and
+                               "32-bit FP8 scales require a 32-byte aligned hidden row");
+                EP_HOST_ASSERT(sf->size(1) == math::ceil_div<int64_t>(hidden, 128));
+            }
+            pack_scales = wide or (decode and (sf->stride(0) == 0 or sf->stride(1) == 0));
             const int words_per_scale = wide ? 2 : 1;
-            const auto columns = wire_scales.size(1);
+            const auto columns = sf->size(1);
             // Singleton/empty dimensions can carry arbitrary PyTorch strides.
-            const auto row_stride = (decode and (num_tokens <= 1 or columns == 0)) ? columns : wire_scales.stride(0);
-            const auto column_stride = (decode and (wide or num_tokens == 0 or columns <= 1)) ? 1 : wire_scales.stride(1);
+            const auto row_stride = (pack_scales or (decode and (num_tokens <= 1 or columns == 0))) ? columns : sf->stride(0);
+            const auto column_stride = (pack_scales or (decode and (num_tokens == 0 or columns <= 1))) ? 1 : sf->stride(1);
             EP_HOST_ASSERT(columns <= std::numeric_limits<int>::max() / (words_per_scale * static_cast<int>(sizeof(sf_pack_t))) and
                            row_stride <= std::numeric_limits<int>::max() / words_per_scale and
                            column_stride <= std::numeric_limits<int>::max());
             num_sf_packs = static_cast<int>(columns) * words_per_scale;
-            sf_ptr = wire_scales.data_ptr();
             sf_token_stride = static_cast<int>(row_stride) * words_per_scale;
             sf_hidden_stride = static_cast<int>(column_stride);
         } else {
@@ -372,12 +375,14 @@ public:
         }
 
         // Launch dispatch
+        // A previous dispatch on this buffer may have produced the scales on another stream.
+        const auto wire_scales = pack_scales ? std::optional{sf->contiguous()} : sf;
         const bool relay = low_latency_transport and low_latency_state->server_relay_enabled();
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         auto submission = low_latency_state->submission_guard(x, metadata_send_buffer);
         launch_ep_dispatch(
             get_ep_kernel_mode(decode, low_latency_transport), [&] { submission.begin_submission(); },
-            x.data_ptr(), sf_ptr,
+            x.data_ptr(), wire_scales.has_value() ? wire_scales->data_ptr() : nullptr,
             topk_idx.data_ptr(), topk_weights_ptr,
             metadata_send_buffer.defined() ? metadata_send_buffer.data_ptr() : nullptr,
             cumulative_local_expert_recv_stats_ptr,

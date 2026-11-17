@@ -132,8 +132,8 @@ public:
 
     bool prepare_combine(int world, int capacity, int hidden, int num_topk, int num_experts,
                          int num_vec_cores, int num_ub_bytes) const {
-        return mte_enabled and is_decode_shape(world, capacity, hidden, num_topk, num_experts,
-            num_vec_cores, num_ub_bytes, false) and not stream_is_captured();
+        return mte_enabled and supports_combine_mte(world, capacity, hidden, num_topk, num_experts,
+            num_vec_cores, num_ub_bytes) and not stream_is_captured();
     }
 
     void fail() noexcept { failed = true; }

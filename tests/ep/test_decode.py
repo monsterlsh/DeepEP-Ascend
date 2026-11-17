@@ -37,6 +37,20 @@ def worker(local_rank, num_processes):
     options = dict(num_experts=2 * world, num_max_tokens_per_rank=16, do_expand=True,
                    do_cpu_sync=True, async_with_compute_stream=True)
 
+    # All ranks reject these shapes before submission and then reuse this buffer.
+    bad_padding = torch.empty((2, 192), dtype=torch.bfloat16, device='npu')
+    bad_fp8 = (torch.empty((2, 264), dtype=torch.float8_e4m3fn, device='npu'),
+               torch.empty((2, 3), dtype=torch.float32, device='npu'))
+    for payload, padding, message in (
+            (bad_padding, True, 'Zero padding requires a vector-aligned hidden row'),
+            (bad_fp8, False, '32-bit FP8 scales require a 32-byte aligned hidden row')):
+        try:
+            buffer.dispatch(payload, topk_idx=routes, do_zero_padding=padding, defer_epilogue=True, **options)
+        except RuntimeError as error:
+            assert message in str(error), str(error)
+        else:
+            raise AssertionError('Invalid dispatch geometry reached submission')
+
     batch = 2 * (rank % 2)
     original = tokens(rank, batch)
     pending = buffer.dispatch(original.npu(), topk_idx=routes[:batch], defer_epilogue=True, **options)
@@ -46,6 +60,20 @@ def worker(local_rank, num_processes):
         combined = buffer.combine(recv, handle, async_with_compute_stream=True, defer_epilogue=True)
     output, _ = combined.wait()
     checks = [(recv.cpu(), tokens(source, 2 * (source % 2))), (output.cpu(), original)]
+
+    # Rank 0 reduces experts 0 and 1 to FP16. The source then adds its bias and rank 1's expert 2.
+    first = (1 + torch.arange(256, dtype=torch.float32, device='cpu') / 1024).half().reshape(1, 256)
+    half_ulp = 1 / 2048
+    routing = torch.tensor([[0, 1, 2]], dtype=torch.int64, device='npu')
+    received, _, _, handle, _ = launch(buffer, 'dispatch', 1, x=first.npu(), topk_idx=routing, **options)
+    if rank == 0:
+        received[world:].fill_(half_ulp)  # Expert-major layout, one row per source per expert.
+    elif rank == 1:
+        received.fill_(-1)
+    returned, _, _ = launch(buffer, 'combine', 1, x=received, handle=handle,
+                            bias=torch.full_like(first, half_ulp).npu(), async_with_compute_stream=True)
+    local_partial = (first.float() + half_ulp).half()
+    checks.append((returned.cpu(), (half_ulp + local_partial.float() - 1).half()))
 
     # An empty sender can supply CPU weights while its peers send weights to its NPU.
     cpu_weights = torch.tensor([[0.25], [0.75]], dtype=torch.float32, device='cpu')
@@ -66,7 +94,13 @@ def worker(local_rank, num_processes):
     for dtype in (torch.float32, torch.int32):
         x = tokens(rank, 2).to(torch.float8_e4m3fn)
         (values, received_scales), _, _, _, _ = launch(
-            buffer, 'dispatch', 1, x=(x.npu(), scales(rank, dtype).npu()), topk_idx=routes, **options)
+            buffer, 'dispatch', 1, x=(x.npu(), scales(rank, dtype).npu()), topk_idx=routes,
+            use_tma_aligned_col_major_sf=True, **options)
+        # The next dispatch materializes the column-major scales on its own stream.
+        with torch.npu.stream(consumer):
+            (_, forwarded_scales), _, _, _, _ = launch(
+                buffer, 'dispatch', 1, x=(values, received_scales), topk_idx=routes, **options)
+            checks.append((forwarded_scales.cpu(), scales((source - 1) % world, dtype)))
         checks.append((values.cpu(), tokens(source, 2).to(torch.float8_e4m3fn)))
         checks.append((received_scales.cpu(), scales(source, dtype)))
 

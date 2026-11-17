@@ -102,15 +102,26 @@ public:
     }
 
     void finalize() {
+        release_resources(false);
+    }
+
+    void finalize_ep() {
+        release_resources(true);
+    }
+
+private:
+    void release_resources(bool report_cleanup_errors) {
         EP_HOST_ASSERT(not finalized);
-        // Release shared registrations and memory only when their last owner finishes.
-        if (hccl_context.use_count() == 1)
-            hccl_context->close();
-        if (symmetric_memory.use_count() == 1)
-            symmetric_memory->close();
+        finalized = true;
+        // EP retains its failed context if explicit cleanup cannot complete.
+        if (report_cleanup_errors) {
+            if (hccl_context.use_count() == 1)
+                hccl_context->close();
+            if (symmetric_memory.use_count() == 1)
+                symmetric_memory->close();
+        }
         hccl_context.reset();
         symmetric_memory.reset();
-        finalized = true;
     }
 };
 

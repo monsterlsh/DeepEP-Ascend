@@ -90,7 +90,7 @@ struct Context {
     int num_ranks = 8, num_cpu_timeout_secs = 300;
     int64_t num_gpu_timeout_cycles = 100 * kNumSystemCyclesPerSecond;
     void* workspace = nullptr;
-    void finalize() {}
+    void finalize_ep() {}
 };
 }
 }
