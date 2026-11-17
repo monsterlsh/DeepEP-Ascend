@@ -36,7 +36,8 @@ using namespace deep_ep;
 template<int SFPacks, bool Cached>
 void check() {
     constexpr int kNumTopk = 8, kNumSFPacks = SFPacks;
-    constexpr int kNumMaxTokensPerVecCore = math::ceil_div(16, 64);
+    constexpr int kNumMaxTokensPerRank = 16, kNumVecCores = 64;
+    constexpr int kNumMaxTokensPerVecCore = math::ceil_div(kNumMaxTokensPerRank, kNumVecCores);
     constexpr bool kLowLatencyTransport = true;
     constexpr int hidden_bytes = SFPacks ? 7168 : 2 * 7168;
     struct alignas(32) Workspace {
@@ -68,6 +69,10 @@ void check() {
         assert(reinterpret_cast<uint8_t*>(ub->hidden)[byte] == 0xcd);
 }
 int main() {
+    constexpr auto stages = get_dispatch_buffer_stages(1024 + 256, 1024, 32, 8);
+    static_assert(stages.keeps_metadata_in_ub(0, 8));
+    static_assert(!stages.keeps_metadata_in_ub(0, 9));
+    static_assert(!stages.keeps_metadata_in_ub(1, 8));
     check<0, false>();
     check<0, true>();
     check<112, false>();

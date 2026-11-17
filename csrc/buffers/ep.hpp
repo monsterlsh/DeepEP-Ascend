@@ -34,6 +34,8 @@ class EPBuffer: public BufferBase {
     void* host_workspace = nullptr;
     void* mapped_host_workspace = nullptr;
     std::shared_ptr<EPLowLatencyState> low_latency_state;
+    using Epilogue = std::function<pybind11::object()>;
+    mutable std::shared_ptr<Epilogue> deferred_epilogue;
 
     static int get_num_used_vec_cores(int num_ai_cores) {
         const auto cores = static_cast<int64_t>(num_ai_cores) * runtime->get_num_vec_cores_per_ai_core();
@@ -46,14 +48,16 @@ class EPBuffer: public BufferBase {
             c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
     }
 
-    pybind11::tuple defer(std::function<pybind11::object()> epilogue) const {
+    pybind11::tuple defer(Epilogue epilogue) const {
         // A direct runtime caller may release the buffer before invoking the callback.
         auto owner = pybind11::cast(this, pybind11::return_value_policy::reference);
-        std::function<pybind11::object()> hook = [owner = std::move(owner), epilogue = std::move(epilogue)]() mutable {
-            // Consume before launch so a saved Python callback cannot replay an old collective.
-            auto once = std::exchange(epilogue, nullptr);
-            EP_HOST_ASSERT(once and "EP epilogue already consumed");
-            return once();
+        deferred_epilogue = std::make_shared<Epilogue>(std::move(epilogue));
+        Epilogue hook = [this, owner = std::move(owner), pending = std::weak_ptr(deferred_epilogue)] {
+            EP_HOST_ASSERT(not destroyed and "EP epilogue cancelled by buffer destruction");
+            low_latency_state->require_healthy();
+            EP_HOST_ASSERT(deferred_epilogue and pending.lock() == deferred_epilogue and "EP epilogue already consumed");
+            auto once = std::move(deferred_epilogue);
+            return (*once)();
         };
         return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(hook));
     }
@@ -96,10 +100,6 @@ public:
     }
 
     ~EPBuffer() noexcept override {
-        if (low_latency_state->unfinished()) {
-            std::fputs("DeepEP: EP communication is unfinished; retaining its resources until process exit.\n", stderr);
-            return;
-        }
         try {
             destroy_on_destruction("EP");
         } catch (const std::exception& e) {
@@ -111,10 +111,13 @@ public:
 
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
-        low_latency_state->require_idle();
+        low_latency_state->require_healthy();
         try {
             comm::barrier(*context, true);
-            low_latency_state->close();
+            // All ranks have drained the issuing kernels and their remote writes.
+            // Release even an abandoned epilogue's tensor captures only after this point.
+            deferred_epilogue.reset();
+            low_latency_state->record_completion(false);
             ACL_CHECK(aclrtHostUnregister(host_workspace));
             ACL_CHECK(aclrtFreeHost(host_workspace));
             context->finalize();
@@ -279,9 +282,6 @@ public:
 
         // Handle tensors written by the dispatch notify path
         const auto int_options = at::TensorOptions(x.device()).dtype(torch::kInt);
-        const auto metadata_send_buffer = torch::empty(
-            {num_tokens, get_dispatch_token_layout(num_hidden_bytes, num_sf_packs, num_topk).get_num_bytes(true)},
-            x.options().dtype(torch::kByte));
         const auto psum_num_recv_tokens_per_rank = cached_mode ?
             cached_psum_num_recv_tokens_per_rank.value() :
             torch::empty({context->num_ranks}, int_options);
@@ -335,6 +335,15 @@ public:
         const bool low_latency_transport = decode and low_latency_state->prepare_dispatch(
             context->num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
             num_used_vec_cores, num_ub_bytes, num_sf_packs, sf.has_value());
+        torch::Tensor metadata_send_buffer;
+        const auto tokens_per_core = math::ceil_div<int64_t>(num_max_tokens_per_rank, num_used_vec_cores);
+        if (not low_latency_transport or not get_dispatch_mte_stages(
+                context->num_ranks, num_experts, tokens_per_core, num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t),
+                num_topk, num_ub_bytes, cached_mode).keeps_metadata_in_ub(num_sf_packs, tokens_per_core)) {
+            metadata_send_buffer = torch::empty(
+                {num_tokens, get_dispatch_token_layout(num_hidden_bytes, num_sf_packs, num_topk).get_num_bytes(true)},
+                x.options().dtype(torch::kByte));
+        }
 
         // Clean host workspace
         const auto host_workspace_layout = layout::EPWorkspaceLayout(host_workspace);
@@ -370,7 +379,7 @@ public:
             get_ep_kernel_mode(decode, low_latency_transport), [&] { submission.begin_submission(); },
             x.data_ptr(), sf_ptr,
             topk_idx.data_ptr(), topk_weights_ptr,
-            metadata_send_buffer.data_ptr(),
+            metadata_send_buffer.defined() ? metadata_send_buffer.data_ptr() : nullptr,
             cumulative_local_expert_recv_stats_ptr,
             psum_num_recv_tokens_per_rank.data_ptr<int>(),
             psum_num_recv_tokens_per_expert.data_ptr<int>(),
@@ -457,8 +466,9 @@ public:
             }
             auto recv_topk_weights = std::optional<torch::Tensor>();
             if (topk_weights.has_value()) {
-                EP_HOST_ASSERT(num_expanded_tokens == 0 or topk_weights->device() == x.device());
-                recv_topk_weights = torch::empty({num_expanded_tokens}, topk_weights->options());
+                // An empty sender can receive weights from peers on the EP device.
+                const auto device = num_expanded_tokens > 0 ? x.device() : topk_weights->device();
+                recv_topk_weights = torch::empty({num_expanded_tokens}, topk_weights->options().device(device));
             }
             auto recv_src_metadata = cached_mode ?
                 cached_recv_src_metadata.value() :
@@ -467,7 +477,7 @@ public:
             launch_dispatch_copy_epilogue(
                 context->buffer,
                 context->workspace,
-                context->hccl_context->jetty_device_ptrs,
+                low_latency_transport ? nullptr : context->hccl_context->jetty_device_ptrs,
                 psum_num_recv_tokens_per_rank.data_ptr<int>(),
                 psum_num_recv_tokens_per_expert.data_ptr<int>(),
                 recv_x.data_ptr(),

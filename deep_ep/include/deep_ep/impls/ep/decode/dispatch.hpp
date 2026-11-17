@@ -668,8 +668,8 @@ __global__ __vector__ void dispatch_impl(
     constexpr auto kNumMetadataMTEStages = ub_layout_with_buffer_t::kNumMetadataMTEStages;
     constexpr auto kNumHiddenMTEStages = ub_layout_with_buffer_t::kNumHiddenMTEStages;
     constexpr auto kNumTokensPerMetadataMTE = ub_layout_with_buffer_t::kNumTokensPerMetadataMTE;
-    constexpr bool kKeepMetadataInUB = kLowLatencyTransport and kNumSFPacks == 0 and
-        kNumMetadataMTEStages * kNumTokensPerMetadataMTE >= kNumMaxTokensPerVecCore;
+    constexpr bool kKeepMetadataInUB = kLowLatencyTransport and
+        ub_layout_with_buffer_t::kStages.keeps_metadata_in_ub(kNumSFPacks, kNumMaxTokensPerVecCore);
     const auto ub = reinterpret_cast<__ubuf__ ub_layout_with_buffer_t*>(0);
     const auto ub_layout = &ub->workspace;
     const auto metadata_token_layout = layout::TokenLayout(

@@ -35,6 +35,14 @@ struct DispatchBufferStages {
     int64_t tokens_per_metadata_stage;
     int64_t num_metadata_stages;
     int64_t num_hidden_stages;
+
+    constexpr __aicore__ __forceinline__ bool fits() const {
+        return num_metadata_stages > 0 and num_hidden_stages > 0;
+    }
+
+    constexpr __aicore__ __forceinline__ bool keeps_metadata_in_ub(int num_sf_packs, int64_t tokens_per_core) const {
+        return num_sf_packs == 0 and num_metadata_stages * tokens_per_metadata_stage >= tokens_per_core;
+    }
 };
 
 constexpr __aicore__ __forceinline__ DispatchBufferStages get_dispatch_buffer_stages(

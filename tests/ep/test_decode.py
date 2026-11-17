@@ -47,6 +47,22 @@ def worker(local_rank, num_processes):
     output, _ = combined.wait()
     checks = [(recv.cpu(), tokens(source, 2 * (source % 2))), (output.cpu(), original)]
 
+    # An empty sender can supply CPU weights while its peers send weights to its NPU.
+    cpu_weights = torch.tensor([[0.25], [0.75]], dtype=torch.float32, device='cpu')
+    local_weights = cpu_weights.npu() if batch else cpu_weights[:0]
+    batch_x = original.bfloat16().npu()
+    for capacity in (16, 17):
+        step = dict(options, num_max_tokens_per_rank=capacity, do_cpu_sync=False)
+        _, _, received_weights, _, _ = launch(
+            buffer, 'dispatch', 1, x=batch_x, topk_idx=routes[:batch], topk_weights=local_weights, **step)
+        count = 2 * (source % 2)
+        checks.append((received_weights[:count], cpu_weights[:count, 0].to(batch_x.device)))
+
+    # A synchronized, all-empty dispatch retains the empty weight tensor's device.
+    _, _, empty_weights, _, _ = launch(
+        buffer, 'dispatch', 1, x=batch_x[:0], topk_idx=routes[:0], topk_weights=cpu_weights[:0], **options)
+    checks.append((empty_weights, cpu_weights[:0, 0]))
+
     for dtype in (torch.float32, torch.int32):
         x = tokens(rank, 2).to(torch.float8_e4m3fn)
         (values, received_scales), _, _, _, _ = launch(
@@ -94,7 +110,16 @@ def worker(local_rank, num_processes):
         checks.append((returned_weights.cpu() if returned_weights is not None else None,
                        None if rank == 3 else weights))
 
+    # Cancel an outstanding native dispatch collectively, keeping its event alive.
+    pending = buffer.dispatch(x, topk_idx=routes, defer_epilogue=True,
+                              **dict(options, num_max_tokens_per_rank=17))
     buffer.destroy()
+    try:
+        pending.wait()
+    except RuntimeError as error:
+        assert 'cancelled by buffer destruction' in str(error), str(error)
+    else:
+        raise AssertionError('A deferred dispatch ran after its buffer was destroyed')
     dist.destroy_process_group()
     # Compare after the last collective so a rank-local mismatch cannot strand peers.
     for actual, expected in checks:

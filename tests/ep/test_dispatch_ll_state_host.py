@@ -19,6 +19,7 @@ def host_test_source():
 #include <cstring>
 #include <exception>
 #include <format>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -75,7 +76,7 @@ struct FakeRuntime {
 auto runtime = &runtime_value;
 struct EventHandle {
     int stream;
-    explicit EventHandle(c10_npu::NPUStream recorded): stream(recorded) {
+    explicit EventHandle(c10_npu::NPUStream recorded = c10_npu::getCurrentNPUStream()): stream(recorded) {
         mock::note("record:" + std::to_string(stream));
         if (mock::event_failure) throw std::runtime_error("event record failure");
     }
@@ -164,7 +165,6 @@ void check_admission() {
             assert(combine(state, ctx) == (mode == 8));
         }
         assert(mock::setups == setups + (mode != 6));
-        state.close();
         mock::soc = "Ascend950DT_9582"; mock::arch = 3510; mock::cores = 64;
         mock::vec_per_ai = 2; mock::ub_bytes = 216 * 1024;
         mock::capable_peer = true;
@@ -221,7 +221,6 @@ void check_events() {
     assert(dispatch(state, ctx));
     state.submission_guard().begin_submission();
     rejects([&] { combine(state, ctx); }, "outstanding");
-    rejects([&] { state.close(); }, "outstanding");
     mock::stream = 1;
     state.record_completion(true);
     const auto count = mock::events.size();
@@ -253,7 +252,6 @@ void check_events() {
     ++mock::stream;
     state.prepare();
     assert(mock::events.size() == event_count + 2);
-    state.close();
 }
 void submit_dispatch(EPLowLatencyState& state, EPKernelMode mode, int vec_cores, int64_t timeout_cycles) {
     auto guard = state.submission_guard();
@@ -310,7 +308,7 @@ void check_failures() {
             mock::wait_failure = false;
         }
         rejects([&] { dispatch(state, ctx); }, "failed");
-        rejects([&] { state.close(); }, "failed");
+        rejects([&] { state.require_healthy(); }, "failed");
     }
 }
 void check_resource_lifetime() {
@@ -363,17 +361,31 @@ class DispatchLLStateHostTests(unittest.TestCase):
     def test_actual_state_transitions(self):
         run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
-    def test_automatic_teardown_after_failure(self):
+    def test_deferred_teardown_and_failure(self):
         base = (ROOT / 'csrc/buffers/base.hpp').read_text()
         ep = (ROOT / 'csrc/buffers/ep.hpp').read_text()
         cleanup = base[base.index('    void destroy_on_destruction'):base.index('public:')]
         destructor = ep[ep.index('    ~EPBuffer()'):ep.index('    EventHandle lb_prefetch_weights')]
+        deferred_state = ep[ep.index('    using Epilogue ='):ep.index('    static int get_num_used_vec_cores')]
+        defer = ep[ep.index('    pybind11::tuple defer('):ep.index('\npublic:')]
         stubs = r'''
+using deep_ep::EventHandle;
+namespace pybind11 {
+using object = int;
+using tuple = std::function<object()>;
+enum class return_value_policy { reference };
+auto cast(auto* owner, return_value_policy) { return owner->shared_from_this(); }
+object none() { return 0; }
+tuple make_tuple(object, EventHandle, tuple hook) { return hook; }
+}
 namespace comm {
 int drains = 0;
 bool drain_failed = false;
+std::weak_ptr<int> callback_tensor;
+bool check_callback_tensor = false;
 void barrier(Context&, bool) {
     ++drains;
+    if (check_callback_tensor) assert(!callback_tensor.expired());
     if (drain_failed) throw std::runtime_error("drain");
 }
 }
@@ -387,7 +399,7 @@ struct Base {
 '''
         fixture = r'''
 };
-struct EPBuffer : Base {
+struct EPBuffer : Base, std::enable_shared_from_this<EPBuffer> {
     std::shared_ptr<Context> context = std::make_shared<Context>();
     std::shared_ptr<EPLowLatencyState> low_latency_state = std::make_shared<EPLowLatencyState>();
     void* host_workspace = nullptr;
@@ -398,6 +410,15 @@ struct EPBuffer : Base {
 '''
         cases = r'''
 };
+std::function<int()> defer(EPBuffer& buffer, int& calls) {
+    auto capture = std::make_shared<int>(0);
+    comm::callback_tensor = capture;
+    buffer.low_latency_state->submission_guard().begin_submission();
+    return buffer.defer([capture, &calls, &state = *buffer.low_latency_state] {
+        state.record_completion(false);
+        return ++calls;
+    });
+}
 int main() {
     static_assert(std::is_nothrow_destructible_v<EPBuffer>);
     { auto buffer = std::make_unique<EPBuffer>(); }
@@ -416,9 +437,41 @@ int main() {
     comm::drain_failed = true;
     { auto buffer = std::make_unique<EPBuffer>(); }
     assert(comm::drains == 2);
+    comm::drain_failed = false;
+    int calls = 0;
+    {
+        auto buffer = std::make_shared<EPBuffer>();
+        buffer->explicitly_destroy = true;
+        auto consumed = defer(*buffer, calls);
+        assert(consumed() == 1);
+        auto cancelled = defer(*buffer, calls);
+        rejects([&] { consumed(); }, "already consumed");
+        comm::check_callback_tensor = true;
+        buffer->destroy();
+        assert(comm::drains == 3 && comm::callback_tensor.expired());
+        rejects([&] { cancelled(); }, "cancelled by buffer destruction");
+        assert(calls == 1 && !buffer->low_latency_state->unfinished());
+    }
+    {
+        auto buffer = std::make_shared<EPBuffer>();
+        auto outstanding = defer(*buffer, calls);
+        buffer.reset();
+        outstanding = {};
+        assert(comm::drains == 4 && comm::callback_tensor.expired());
+    }
+    {
+        auto buffer = std::make_shared<EPBuffer>();
+        auto outstanding = defer(*buffer, calls);
+        comm::drain_failed = true;
+        rejects([&] { buffer->destroy(); }, "drain");
+        assert(!comm::callback_tensor.expired());
+        rejects([&] { outstanding(); }, "operation failed");
+        assert(calls == 1 && buffer->low_latency_state->unfinished());
+    }
+    assert(comm::drains == 5);
 }
 '''
-        source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + destructor + cases
+        source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + deferred_state + defer + destructor + cases
         run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
     def test_group_topology_and_transport_limits(self):

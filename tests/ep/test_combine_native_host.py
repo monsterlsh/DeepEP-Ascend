@@ -10,6 +10,9 @@ class CombineNativeHostTests(unittest.TestCase):
         # Compile through the public include; replace only the device/runtime dependencies.
         headers = {f'csrc/kernels/ep/{name}': (ROOT / 'csrc/kernels/ep' / name).read_text()
                    for name in ('api.hpp', 'dispatch.hpp', 'combine.hpp', 'kernel_mode.hpp')}
+        buffer = (ROOT / 'csrc/buffers/ep.hpp').read_text()
+        copy_args = buffer.split('launch_dispatch_copy_epilogue(', 1)[1].split(',', 3)
+        copy_jetty_argument = copy_args[2].strip()
         headers.update({name: '#pragma once' for name in ('csrc/runtime/jit.hpp', 'deep_ep/layout/ep/token.hpp',
                                                           'deep_ep/common/exception.hpp', 'deep_ep/common/math.hpp')})
         run_host_cpp(r'''
@@ -28,7 +31,7 @@ namespace layout { struct TokenLayout { TokenLayout(int, int, int, bool=true) {}
 struct Config { int num_blocks, num_ubuf_bytes; };
 struct RecordingJit {
     std::string name, source;
-    void *buffer = nullptr, *send_buffer = nullptr, *scratch = nullptr;
+    void *buffer = nullptr, *send_buffer = nullptr, *scratch = nullptr, *copy_jetties = nullptr;
     const int* server_ids = nullptr;
     int rank = -1, launches = 0, argument_count = 0;
     bool reject_geometry = false;
@@ -51,6 +54,8 @@ struct RecordingJit {
             server_ids = std::get<19>(values);
             scratch = std::get<20>(values);
         }
+        if constexpr (sizeof...(Args) == 12)
+            copy_jetties = std::get<2>(values);
         ++launches;
     }
 } recording_jit;
@@ -134,6 +139,17 @@ int main() {
         assert(jit->source.find("#include <deep_ep/impls/ep/decode/combine_reduce_epilogue.hpp>") != std::string::npos);
         assert(jit->source.find(std::format("100, true, {}, half>", direct)) != std::string::npos);
     }
+    struct Comm { void* jetty_device_ptrs; } comm{&peers};
+    struct Context { Comm* hccl_context; } ctx{&comm};
+    const auto context = &ctx;
+    for (bool low_latency_transport : {false, true})
+        for (bool barrier : {false, true}) {
+            launch_dispatch_copy_epilogue(nullptr, nullptr, ''' + copy_jetty_argument + r''',
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, false, false, 0, 4, 16, 8, 3, 1, 256, 0, 0, 0,
+                194560, 64, 100, barrier);
+            assert(jit->name == "dispatch_copy_epilogue");
+            assert(jit->copy_jetties == (low_latency_transport ? nullptr : &peers));
+        }
 }
 ''', headers=headers)
 

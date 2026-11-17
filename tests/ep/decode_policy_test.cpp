@@ -88,9 +88,12 @@ int main() {
     static_assert(get_dispatch_max_expert_rows(128, 131072) > reduction::kReductionMaxLowCount);
     static_assert(get_dispatch_max_expanded_rows(1, 1, 2, 1 << 30) > std::numeric_limits<int>::max());
     const auto routing = get_dispatch_routing_workspace_bytes(8, 128, 4, 8);
-    assert(!dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128 - 1, false));
-    assert(dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128, false));
-    assert(dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 32, true));
-    assert(!dispatch_direct_ub_fits(routing, 4, 7168, 224, 8, routing + 7168 + 4 * (128 + 224) - 1, false));
-    assert(dispatch_direct_ub_fits(routing, 4, 7168, 224, 8, routing + 7168 + 4 * (128 + 224), false));
+    const auto stages = [](int hidden_bytes, int sf_bytes, int64_t ub_bytes, bool cached) {
+        return get_dispatch_mte_stages(8, 128, 4, hidden_bytes, sf_bytes, 8, ub_bytes, cached);
+    };
+    assert(!stages(14336, 0, routing + 14336 + 4 * 128 - 1, false).fits());
+    assert(stages(14336, 0, routing + 14336 + 4 * 128, false).fits());
+    assert(stages(14336, 0, routing + 14336 + 4 * 32, true).fits());
+    assert(!stages(7168, 224, routing + 7168 + 4 * (128 + 224) - 1, false).fits());
+    assert(stages(7168, 224, routing + 7168 + 4 * (128 + 224), false).fits());
 }

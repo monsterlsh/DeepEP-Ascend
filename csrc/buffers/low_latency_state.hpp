@@ -110,13 +110,13 @@ public:
 
     bool server_relay_enabled() const { return server_relay; }
 
-    void require_idle() const {
+    void require_healthy() const {
         EP_HOST_ASSERT(not failed and "EP operation failed; restart the distributed job");
-        EP_HOST_ASSERT(not pending and "Complete the outstanding EP epilogue before reusing or destroying the EPBuffer");
     }
 
     void prepare() {
-        require_idle();
+        require_healthy();
+        EP_HOST_ASSERT(not pending and "Complete the outstanding EP epilogue before reusing the EPBuffer");
         if (last_completion and last_completion->stream != c10_npu::getCurrentNPUStream()) {
             const auto guard = failure_guard();
             last_completion->event.current_stream_wait();
@@ -151,11 +151,6 @@ public:
     }
 
     EventHandle completion_event() const { return last_completion.value().event; }
-
-    void close() {
-        require_idle();
-        last_completion.reset();
-    }
 };
 
 }  // namespace deep_ep
