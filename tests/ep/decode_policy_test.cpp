@@ -84,8 +84,8 @@ int main() {
     static_assert(get_dispatch_max_expanded_rows(rows, 6, 3, 128) == 98688);
     static_assert(get_dispatch_max_expanded_rows(rows, 2, 3, 1) == rows * 2);
     static_assert(get_dispatch_max_expert_rows(128, 16384) == 2097152);
-    static_assert(get_dispatch_max_expert_rows(128, 131071) <= kDispatchReductionMaxValue);
-    static_assert(get_dispatch_max_expert_rows(128, 131072) > kDispatchReductionMaxValue);
+    static_assert(get_dispatch_max_expert_rows(128, 131071) <= reduction::kReductionMaxLowCount);
+    static_assert(get_dispatch_max_expert_rows(128, 131072) > reduction::kReductionMaxLowCount);
     static_assert(get_dispatch_max_expanded_rows(1, 1, 2, 1 << 30) > std::numeric_limits<int>::max());
     const auto routing = get_dispatch_routing_workspace_bytes(8, 128, 4, 8);
     assert(!dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128 - 1, false));

@@ -99,7 +99,9 @@ void boundaries() {
                 for (int sf : {0, 2, 34})
                     for (bool cached : {false, true}) {
                         const auto token = layout::TokenLayout(256, sf, K, !cached);
-                        const auto bytes = get_dispatch_token_bytes(256, sf, K, cached);
+                        const auto align32 = [](int n) { return 32 * ((n + 31) / 32); };
+                        const auto metadata = K * 4 + (cached ? 0 : align32(K * 8) + 4);
+                        const auto bytes = 256 + align32(sf) + align32(metadata);
                         assert(bytes == token.get_num_bytes());
                         const auto buffer = layout::BufferLayout(token, ranks, M, nullptr);
                         assert(buffer.get_num_bytes() == int64_t(ranks) * M * bytes);
@@ -124,7 +126,7 @@ void routed_examples(bool cached, bool reverse_order) {
     // sharing one payload while each original expert entry retains its weight.
     const int expected_counts[P][P] = {{1,0,2,1}, {1,0,2,1}, {1,0,1,1}, {0,0,2,1}};
     const auto token_layout = layout::TokenLayout(H, 0, K, !cached);
-    const auto stride = get_dispatch_token_bytes(H, 0, K, cached);
+    const auto stride = token_layout.get_num_bytes();
     // Keep a nonzero offset between the symmetric signal base and the receive window.
     struct Region { Workspace workspace; alignas(32) uint8_t data[P * M * 256]; };
     Region peers[P]{};

@@ -163,13 +163,8 @@ class EPHandle:
 class EPBuffer(BufferBase):
     """Expert-parallel dispatch/combine on Ascend, using the expanded layout.
 
-    Dispatch returns routing weights as metadata. Apply model weights in the
-    expert computation before combine sums the expert outputs.
-
     Stream usage:
-        All operations run on the current stream. After a call with capacity above
-        16 and no async event or deferred epilogue, establish a stream dependency
-        before reusing the buffer on another stream.
+        All operations run on the current stream.
     """
 
     barrier = comm.barrier
@@ -200,10 +195,6 @@ class EPBuffer(BufferBase):
         overlap preferences are compatibility options. LB storage can be allocated;
         LB kernels, RDMA service levels and explicit QP counts are unsupported. ``num_bytes`` excludes
         workspace and must be allocation-aligned.
-
-        Decode dispatch and combine use the communication buffer registered with HCCL.
-        Set decode transport options before construction; ranks exchange these settings
-        along with their communication ports.
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
         num_lb_bytes = lb_allocation_plan_or_num_bytes if lb_allocation_plan is None else lb_allocation_plan.num_bytes
@@ -240,7 +231,7 @@ class EPBuffer(BufferBase):
         self.runtime = _C.EPBuffer(
             self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
             num_bytes, num_lb_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
-            explicitly_destroy, deterministic)
+            explicitly_destroy)
         self.context = self.runtime.context
         if lb_allocation_plan is not None:
             lb_allocation_plan.materialize(self.runtime.lb_storage)
@@ -347,25 +338,21 @@ class EPBuffer(BufferBase):
         Dispatch tokens to different ranks.
 
         Arguments:
-            x: BF16 tokens shaped `[num_tokens, hidden]`, or an FP8 tuple
-                containing `torch.float8_e4m3fn` tokens and their scales. Scales may
-                be native 16-bit packs. Capacities up to 16 also support FP16 activations,
-                FP32 scales per 128 hidden elements and INT32 words packing four per-32 E8M0
-                scale bytes per word.
-                Dispatch preserves the scale dtype and columns per token. A native pack tensor
-                with zero columns skips scale transfer and returns zero columns.
+            x: `torch.Tensor` or tuple of `torch.Tensor`. For the first type, the shape must be
+                `[num_tokens, hidden]` with type `torch.bfloat16`; for the second type (FP8 mode),
+                the first element of the tuple must be `[num_tokens, hidden]` with type
+                `torch.float8_e4m3fn`; the second contains SF packs with shape
+                `[num_tokens, num_sf_packs]`.
             topk_idx: `[num_tokens, num_topk]` with `torch.int64`, the expert indices selected by each
-                token. Use `-1` for masked slots. Must be `None` if `handle` is provided.
+                token, `-1` means no selections. Must be `None` if `handle` is provided.
                 Stored by reference in the handle; must not be modified until all uses of the handle complete.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token
-                to dispatch. A contiguous trailing singleton dimension is also accepted.
-                Can be provided with a cached `handle` to dispatch updated weights.
+                to dispatch. Can be provided with a cached `handle` to dispatch updated weights.
             cumulative_local_expert_recv_stats: `[num_local_experts]` with `torch.int`, a cumulative
                 expert count tensor for statistics, useful for online EP load balance monitoring.
             num_experts: the number of all experts. Inferred from `handle` if provided.
             num_max_tokens_per_rank: the maximum number of tokens per rank. Inferred from constructor
-                default or `handle` if provided. Values from 1 through 16 use the decode
-                implementation, and larger values select the original EP implementation.
+                default or `handle` if provided.
             expert_alignment: align the number of tokens received by each local expert to this variable.
             num_sms: the number of AI cores to use (0 selects a default in Python).
                 Cached dispatch always uses the core count from `handle`.
@@ -547,14 +534,13 @@ class EPBuffer(BufferBase):
         Combine (reduce) tokens from different ranks back to their original ranks.
 
         Arguments:
-            x: BF16 expert outputs shaped `[num_tokens, hidden]` to reduce back to their
-                original ranks. FP16 is also supported when the handle capacity is at most 16.
+            x: `[num_tokens, hidden]` with `torch.bfloat16`, the tokens to send for reducing to its
+                original ranks.
             handle: a must-set communication handle, you can obtain this from the `dispatch` function.
             topk_weights: `[num_tokens]` with `torch.float`. The expanded tokens' top-k weights for
-                restoring to their original ranks as a separate output. These values do not
-                multiply `x`; any model weighting must already be present in the expert outputs.
+                reducing to their original ranks.
             bias: `None`, a tensor, or a tuple of 2 `[num_combined_tokens, hidden]` tensors with
-                the same dtype as `x`, added to the output.
+                `torch.bfloat16` final bias to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
             previous_event: compatibility parameter; ignored on Ascend.
@@ -564,8 +550,8 @@ class EPBuffer(BufferBase):
                 This requires `async_with_compute_stream=True`.
 
         Returns:
-            combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]`
-                and the dtype of `x`. Only returned when `defer_epilogue=False`.
+            combined_x: the reduced token tensor, with shape `[num_combined_tokens, hidden]` and type
+                `torch.bfloat16`. Only returned when `defer_epilogue=False`.
             combined_topk_weights: the reduced top-k weights, with shape `[num_combined_tokens, num_topk]`
                 and type `torch.float`. Only returned when `defer_epilogue=False`.
             event: the communication event (valid only if `async_with_compute_stream` is set).

@@ -1,8 +1,5 @@
 #pragma once
 
-#include <cstdlib>
-#include <cstring>
-
 #include <deep_ep/impls/ep/combine_layout.hpp>
 #include <deep_ep/impls/ep/dispatch_direct_layout.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
@@ -41,13 +38,6 @@ constexpr bool is_decode_shape(int num_ranks, int capacity, int hidden, int num_
     const auto reduce_slots = get_combine_hidden_slots(num_ub_bytes, hidden_bytes + get_combine_weight_bytes(num_topk));
     return num_topk <= get_combine_hidden_slots(issue_bytes, hidden_bytes) and
            math::min(num_ranks, num_topk) + 2 <= reduce_slots;
-}
-
-// Diagnostic escape hatch for comparing the same public API against its original
-// transport. No public constructor or dispatch/combine option is required.
-inline bool low_latency_transport_enabled() {
-    const auto disabled = std::getenv("EP_DISABLE_LOW_LATENCY_TRANSPORT");
-    return disabled == nullptr or std::strcmp(disabled, "1") != 0;
 }
 
 }  // namespace deep_ep

@@ -3,7 +3,6 @@
 #include <exception>
 #include <memory>
 #include <optional>
-#include <stdexcept>
 #include <string_view>
 
 #include <acl/acl.h>
@@ -46,12 +45,12 @@ class EPLowLatencyState {
     }
 
 public:
-    static comm::DecodeTopology local_topology(int world, int gpu_timeout_secs, bool deterministic) {
-        if (not is_decode_capacity(world, 1) or deterministic or not low_latency_transport_enabled())
+    static comm::DecodeTopology local_topology(int world) {
+        if (not is_decode_capacity(world, 1))
             return comm::DecodeTopology(0);
         const auto* soc = aclrtGetSocName();
         const bool capable = soc and std::string_view(soc) == "Ascend950DT_9582" and
-            runtime->get_npu_arch() == 3510 and gpu_timeout_secs == 100 and
+            runtime->get_npu_arch() == 3510 and
             runtime->get_num_vec_cores() >= 64 and runtime->get_num_vec_cores_per_ai_core() == 2 and
             runtime->get_num_ubuf_bytes_per_vec_core() == 216 * 1024;
         return comm::DecodeTopology(capable ? runtime->get_num_vec_cores() : 0);
@@ -112,10 +111,8 @@ public:
     bool server_relay_enabled() const { return server_relay; }
 
     void require_idle() const {
-        if (failed)
-            throw std::runtime_error("EP operation failed; restart the distributed job");
-        if (pending)
-            throw std::runtime_error("Complete the outstanding EP epilogue before reusing or destroying the EPBuffer");
+        EP_HOST_ASSERT(not failed and "EP operation failed; restart the distributed job");
+        EP_HOST_ASSERT(not pending and "Complete the outstanding EP epilogue before reusing or destroying the EPBuffer");
     }
 
     void prepare() {

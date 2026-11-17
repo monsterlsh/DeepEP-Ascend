@@ -5,9 +5,6 @@
 
 namespace deep_ep {
 
-// dispatch_impl checks these host-side bounds against the device reduction encoding.
-static constexpr int kDispatchReductionMaxArrivals = 255;
-static constexpr int kDispatchReductionMaxValue = (1 << 24) - 1;
 static constexpr int kDispatchWorkerThreads = 512;
 
 // Top-k selects distinct experts per token, so each expert can receive one
@@ -32,15 +29,6 @@ constexpr __aicore__ __forceinline__ int64_t get_dispatch_routing_workspace_byte
     const auto jetty_offset = math::align<int64_t>(num_ints * sizeof(int), 8);
     constexpr int64_t kNumJettyInfoBytes = 88, kNumPeerInfoBytes = 48;
     return math::align<int64_t>(jetty_offset + kNumJettyInfoBytes + num_ranks * kNumPeerInfoBytes, kNumUbAlignmentBytes);
-}
-
-constexpr __aicore__ __forceinline__ int64_t get_dispatch_token_bytes(
-    const int hidden_bytes, const int sf_bytes, const int num_topk, const bool cached) {
-    const int64_t weight_bytes = static_cast<int64_t>(num_topk) * sizeof(float);
-    const auto index_bytes = math::align<int64_t>(static_cast<int64_t>(num_topk) * sizeof(int64_t), kNumUbAlignmentBytes);
-    const auto metadata_bytes = weight_bytes + (cached ? 0 : index_bytes + static_cast<int>(sizeof(int)));
-    const auto aligned_sf_bytes = sf_bytes > 0 ? math::align<int64_t>(sf_bytes, kNumUbAlignmentBytes) : 0;
-    return hidden_bytes + aligned_sf_bytes + math::align<int64_t>(metadata_bytes, kNumUbAlignmentBytes);
 }
 
 struct DispatchBufferStages {

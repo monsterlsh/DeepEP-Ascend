@@ -30,7 +30,7 @@ void asc_copy_gm2ub_align(uint8_t* ub, uint8_t* gm, int, uint32_t bytes,
 void asc_copy_ub2gm_align(uint8_t* gm, uint8_t* ub, int, uint32_t bytes, asc_store_l2_cache_mode, int, int) {
     std::memcpy(gm, ub, bytes);
 }
-#include <deep_ep/impls/ep/dispatch_relay.hpp>
+#include <deep_ep/impls/ep/decode/dispatch_relay.hpp>
 using namespace deep_ep;
 constexpr int R = 6, M = 3, K = 6, max_packet = 256;
 struct Memory {
@@ -82,7 +82,7 @@ void round_trip(bool cached, int scale_bytes, bool same_server) {
                 }
                 contacted[dst] = true;
             }
-            publish_dispatch_relay_slots<K,M>(&plan, memory[source].signals, servers, memory[source].descriptors, source, t);
+            decode::publish_dispatch_relay_slots<K, M>(&plan, memory[source].signals, servers, memory[source].descriptors, source, t);
             for (int k = 0; k < K; ++k) {
                 int dst = plan.dst_rank_idx[t*K+k];
                 if (dst < 0) continue;
@@ -98,7 +98,7 @@ void round_trip(bool cached, int scale_bytes, bool same_server) {
             psum[src] = counts[dst][src] + (src ? psum[src-1] : 0);
         for (int core = 0; core < 2; ++core) {
             uint8_t ub[max_packet];
-            gather_dispatch_relay_slots<R,M,2>(layout::BufferLayout(packet, R, M, memory[dst].data), memory[dst].signals,
+            decode::gather_dispatch_relay_slots<R, M, 2>(layout::BufferLayout(packet, R, M, memory[dst].data), memory[dst].signals,
                                                memory[dst].descriptors, psum, core, ub);
         }
         for (int src = 0; src < R; ++src)

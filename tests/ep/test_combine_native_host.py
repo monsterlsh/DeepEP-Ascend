@@ -132,7 +132,7 @@ int main() {
         launch_ep_combine_reduce_epilogue(get_ep_kernel_mode(true, direct), nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, 4, 5, 16, 8, 3, 128, 194560, 64, 100, true, true);
         assert(jit->source.find("#include <deep_ep/impls/ep/decode/combine_reduce_epilogue.hpp>") != std::string::npos);
-        assert(jit->source.find(std::format("100, true, 256, half, {}>", direct)) != std::string::npos);
+        assert(jit->source.find(std::format("100, true, {}, half>", direct)) != std::string::npos);
     }
 }
 ''', headers=headers)

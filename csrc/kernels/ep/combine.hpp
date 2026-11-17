@@ -113,8 +113,8 @@ static void launch_ep_combine_reduce_epilogue(EPKernelMode mode, void* combined_
     EP_HOST_ASSERT(hidden % (kNumVectorRegisterBytes / static_cast<int>(sizeof(uint16_t))) == 0);
 
     const bool native = mode == EPKernelMode::Native;
-    const auto decode_args = native ? std::string{} : std::format(", {}, {}, {}",
-        hidden * sizeof(uint16_t), use_fp16 ? "half" : "bfloat16_t", mode == EPKernelMode::DecodeMTE);
+    const bool mte = mode == EPKernelMode::DecodeMTE;
+    const auto decode_args = native ? std::string{} : std::format(", {}, {}", mte, use_fp16 ? "half" : "bfloat16_t");
     const auto kernel = jit->compile("combine_reduce_epilogue", std::format(R"(
 #include <deep_ep/impls/ep/{}combine_reduce_epilogue.hpp>
 

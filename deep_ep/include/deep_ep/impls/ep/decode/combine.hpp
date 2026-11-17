@@ -27,7 +27,7 @@ template <int kNumRanks, int kNumTopk, int kHidden, int kNumTokensPerTask, int k
           bool kLowLatencyTransport = false, typename element_t = bfloat16_t>
 struct CombineUBLayout {
     static constexpr int kNumMetadataElems = kNumTopk + 2;
-    static constexpr int kNumHiddenBytes = kHidden * sizeof(bfloat16_t);
+    static constexpr int kNumHiddenBytes = kHidden * sizeof(element_t);
     static constexpr int kNumTopkWeightBytes = get_combine_weight_bytes(kNumTopk);
     static constexpr int kNumTopkWeightElems = kNumTopkWeightBytes / sizeof(float);
     static constexpr int kNumBaseMetadataElems = math::max(warpSize, kNumMetadataElems + 1);

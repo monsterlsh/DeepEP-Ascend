@@ -120,10 +120,17 @@ class PublicAPIContracts(unittest.TestCase):
         self.assertFalse(hasattr(self.buffer, 'low_latency_mode'))
         self.native.LowLatencyBuffer.assert_not_called()
         self.native.calculate_ep_buffer_size.assert_called_once_with(128, 256, 7168, 8, False)
-        self.native.EPBuffer.assert_called_once_with(0, 128, 'hccl', 2 << 20, 0, True, 300, 100, True, False)
+        self.native.EPBuffer.assert_called_once_with(0, 128, 'hccl', 2 << 20, 0, True, 300, 100, True)
         self.assertIs(self.buffer.context, self.runtime.context)
         self.torch.distributed.barrier.assert_called_once_with(self.group)
         self.assertEqual(self.torch.npu.synchronize.call_count, 2)
+
+    def test_deterministic_buffer_uses_one_allocation_with_the_same_arguments(self):
+        self.native.EPBuffer.reset_mock()
+        buffer = self.ep.EPBuffer(self.group, num_bytes=2 << 20, deterministic=True, explicitly_destroy=True)
+        self.native.EPBuffer.assert_called_once_with(0, 128, 'hccl', 2 << 20, 0, True, 300, 100, True)
+        self.assertTrue(buffer.deterministic)
+        self.assertIs(buffer.runtime, self.runtime)
 
     def test_native_fresh_defaults_optional_weights_and_stats_are_forwarded(self):
         stats = Tensor((1,), self.torch.int32)

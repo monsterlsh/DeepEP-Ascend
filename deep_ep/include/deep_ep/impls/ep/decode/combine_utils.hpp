@@ -1,96 +1,10 @@
 #pragma once
 
-#include <c_api/asc_simd.h>
-#include <c_api/sync/sync.h>
-#include <c_api/vector_datamove/vector_datamove.h>
-
-#include <deep_ep/common/exception.hpp>
-#include <deep_ep/common/math.hpp>
-
-#include <kernel_operator.h>
+#include <deep_ep/impls/ep/combine_utils.hpp>
 
 namespace deep_ep::decode {
 
-template <int kHidden, int kNumTopk, int kNumStrideElems, int kNumSlots = 0>
-__simd_vf__ __forceinline__ void combine_reduce_vf(__ubuf__ bfloat16_t* base_ptr, __ubuf__ bfloat16_t* output_ptr,
-                                                    const int count, const int slot_start_idx = 0) {
-    static constexpr int kNumElemsPerFP32 = AscendC::VECTOR_REG_WIDTH / sizeof(float);
-    EP_STATIC_ASSERT(kHidden % (kNumElemsPerFP32 * 2) == 0);
-    EP_STATIC_ASSERT(kNumTopk >= 1);
-
-    vector_bfloat16_t bf16_zero;
-    asc_duplicate_scalar(bf16_zero, 0);
-
-    if (count == 0) {
-        #pragma unroll 1
-        for (int offset = 0; offset < kHidden; offset += kNumElemsPerFP32 * 2)
-            asc_storealign(output_ptr + offset, bf16_zero, asc_create_mask_b16(PAT_ALL));
-        return;
-    } else if (count == 1) {
-        __ubuf__ bfloat16_t* ub_input_ptr = base_ptr + slot_start_idx * kNumStrideElems;
-        #pragma unroll 1
-        for (int offset = 0; offset < kHidden; offset += kNumElemsPerFP32 * 2) {
-            vector_bfloat16_t bf16_reg;
-            asc_loadalign_postupdate(bf16_reg, ub_input_ptr, kNumElemsPerFP32 * 2);
-            asc_storealign(output_ptr + offset, bf16_reg, asc_create_mask_b16(PAT_ALL));
-        }
-        return;
-    }
-
-    if (count == 2 and kNumStrideElems == kHidden) {
-        const auto second_slot_idx = kNumSlots != 0 and slot_start_idx + 1 == kNumSlots ? 0 : slot_start_idx + 1;
-        auto first_ptr = base_ptr + slot_start_idx * kNumStrideElems;
-        auto second_ptr = base_ptr + second_slot_idx * kNumStrideElems;
-        const auto mask = asc_create_mask_b16(PAT_ALL);
-        #pragma unroll 2
-        for (int offset = 0; offset < kHidden; offset += kNumElemsPerFP32 * 2) {
-            vector_bfloat16_t first, second;
-            asc_loadalign_postupdate(first, first_ptr, kNumElemsPerFP32 * 2);
-            asc_loadalign_postupdate(second, second_ptr, kNumElemsPerFP32 * 2);
-            asc_add(first, first, second, mask);
-            asc_storealign(output_ptr + offset, first, mask);
-        }
-        return;
-    }
-
-    vector_bool u32_mask = asc_create_mask_b32(PAT_ALL);
-    const auto num_wrap_count = kNumSlots == 0 ? count : math::min(kNumSlots - slot_start_idx, count);
-    #pragma unroll 1
-    for (int offset = 0; offset < kHidden; offset += kNumElemsPerFP32 * 2) {
-        vector_bfloat16_t bf16_regs[2];
-        vector_float acc_regs[2];
-        __ubuf__ bfloat16_t* ptr = base_ptr + slot_start_idx * kNumStrideElems + offset;
-        asc_loadalign_postupdate(bf16_regs[0], ptr, kNumStrideElems);
-        asc_intlv(reinterpret_cast<vector_bfloat16_t&>(acc_regs[0]), reinterpret_cast<vector_bfloat16_t&>(acc_regs[1]), bf16_zero,
-                  bf16_regs[0]);
-        #pragma unroll 1
-        for (int i = 1; i < num_wrap_count; ++ i) {
-            vector_float fp32_regs[2];
-            asc_loadalign_postupdate(bf16_regs[0], ptr, kNumStrideElems);
-            asc_intlv(reinterpret_cast<vector_bfloat16_t&>(fp32_regs[0]), reinterpret_cast<vector_bfloat16_t&>(fp32_regs[1]), bf16_zero,
-                      bf16_regs[0]);
-            asc_add(acc_regs[0], acc_regs[0], fp32_regs[0], u32_mask);
-            asc_add(acc_regs[1], acc_regs[1], fp32_regs[1], u32_mask);
-        }
-        if constexpr (kNumSlots != 0) {
-            ptr = base_ptr + offset;
-            #pragma unroll 1
-            for (int i = num_wrap_count; i < count; ++ i) {
-                vector_float fp32_regs[2];
-                asc_loadalign_postupdate(bf16_regs[0], ptr, kNumStrideElems);
-                asc_intlv(reinterpret_cast<vector_bfloat16_t&>(fp32_regs[0]), reinterpret_cast<vector_bfloat16_t&>(fp32_regs[1]),
-                          bf16_zero, bf16_regs[0]);
-                asc_add(acc_regs[0], acc_regs[0], fp32_regs[0], u32_mask);
-                asc_add(acc_regs[1], acc_regs[1], fp32_regs[1], u32_mask);
-            }
-        }
-
-        asc_float2bfloat16_rn(bf16_regs[0], acc_regs[0], u32_mask);
-        asc_float2bfloat16_rn(bf16_regs[1], acc_regs[1], u32_mask);
-        asc_deintlv(bf16_regs[0], bf16_regs[1], bf16_regs[0], bf16_regs[1]);
-        asc_storealign(output_ptr + offset, bf16_regs[0], asc_create_mask_b16(PAT_ALL));
-    }
-}
+using deep_ep::combine_reduce_vf;
 
 template <int kHidden, int kNumTopk, int kNumStrideElems, int kNumSlots>
 __simd_vf__ __forceinline__ void combine_reduce_vf(__ubuf__ half* base_ptr, __ubuf__ half* output_ptr,
@@ -116,7 +30,7 @@ __simd_vf__ __forceinline__ void combine_reduce_vf(__ubuf__ half* base_ptr, __ub
         vector_half value;
         asc_loadalign_unpack(value, base_ptr + slot * kNumStrideElems + offset);
         asc_half2float(sum, value, mask, ASC_POSITION_EVEN);
-        for (int i = 1; i < count; ++i) {
+        for (int i = 1; i < count; ++ i) {
             slot = slot + 1 == kNumSlots ? 0 : slot + 1;
             vector_float contribution;
             asc_loadalign_unpack(value, base_ptr + slot * kNumStrideElems + offset);
@@ -143,7 +57,7 @@ __simd_vf__ __forceinline__ void restore_combine_weights(
         asc_duplicate_scalar(result, static_cast<uint32_t>(0), mask);
         int slot = first_token_idx;
         #pragma unroll 1
-        for (int i = 0; i < num_tokens; ++i) {
+        for (int i = 0; i < num_tokens; ++ i) {
             vector_uint32_t weights;
             auto input = ub_tokens + (slot * kNumTokenElems + kNumHiddenElems) / 2 + lane;
             asc_loadalign_brc_v2(weights, input);

@@ -241,10 +241,12 @@ range from zero to `M`.
 For BF16 H7168/K6/E384 and alignment 128, the EP64 combine measurement at `M=16` was
 55.479 µs on `7004d16` and 53.774 µs on `main@4dfccac` (+3.17%).
 
-Within the decode implementation, MTE transport is available for the following configurations:
+Within the decode implementation, dispatch and combine select MTE automatically when their
+device and launch requirements are met. Other supported decode configurations use URMA
+internally, including for decode-specific formats such as FP16. Both transports respect the
+buffer's configured device timeout. The MTE requirements are:
 
-- Ascend950DT_9582 on A5, 32 AI cores (64 vector cores), 216 KiB of UB per vector core
-  and the default 100-second device timeout.
+- Ascend950DT_9582 on A5, 32 AI cores (64 vector cores) and 216 KiB of UB per vector core.
 - EP2, EP4, EP8, EP16, EP32, EP64 or EP128.
 - BF16/FP16 activations with `H` divisible by 128, or FP8 E4M3 with `H` divisible by 256.
   FP8 dispatch carries native 16-bit scale packs, FP32 scales per 128 channels, or INT32 words
@@ -252,7 +254,8 @@ Within the decode implementation, MTE transport is available for the following c
 - `1 ≤ K ≤ min(E, 32)`, `E ≤ 512`, and `E` evenly divisible by the EP group size. The
   dispatch stages and the combine reduction ring must fit UB. This covers H7168/K6/E384,
   as well as H7168/K8/E128. Alignment, host count sync, padding and epilogue scheduling
-  keep their usual expanded dispatch semantics. Deterministic buffers use URMA.
+  keep their usual expanded dispatch semantics. With `deterministic=True`, the dispatch
+  epilogue sorts the received rows within each expert for both MTE and URMA.
 - The expert computation applies the routing weight once to each selected expert output.
   Combine sums BF16 or FP16 expert rows. Its optional `topk_weights` argument restores the
   weights in their original routing slots. Bias is applied by the reduce epilogue.
@@ -266,17 +269,16 @@ any expert and at most `min(K, L)` rows to a rank. A fresh dispatch without host
 synchronization reserves `world × M × min(K, L)` rows plus alignment space. Synchronized
 dispatch uses the actual aligned expert counts, and cached dispatch reuses its handle's size.
 
-For cross-server deduplication, set `EP_DECODE_SERVER_ID` on **each rank** before constructing
-the `EPBuffer`. Use the same nonnegative integer for ranks on one physical server and different
-integers for different servers. EP ranks may be interleaved. An incomplete or invalid map disables
-server relaying for the group. With a multi-server group containing a shared server,
+During buffer construction, EP obtains server locations from the registered HCCL endpoints.
+EP ranks may be interleaved. When the group lacks complete location information, dispatch
+uses direct transfers. With a multi-server group containing a shared server,
 dispatch sends the full packet once per remote server and its other recipients fetch it within that server.
 Combine always sends each expert rank's partial directly to the token owner when using MTE.
 The owner applies biases and reduces rank partials in the same routing-slot order as URMA.
 Each contributing rank returns its own optional weights directly to the corresponding slots.
 
 Dispatch relay descriptors occupy reserved space in the existing registered EP workspace.
-During buffer construction, ranks exchange server IDs, device capabilities and transport settings
+During buffer construction, ranks exchange server locations and device capabilities
 alongside their communication ports.
 Dispatch and combine select their transport from this group configuration and the shared launch
 geometry. Use the same vector core count, fresh/cached mode and barrier placement on all ranks.
@@ -292,9 +294,6 @@ with HCCL. Complete a deferred epilogue with `event.current_stream_wait()` befor
 or destroying the buffer. If a call with `M > 16` does not request an event or defer its epilogue,
 establish a stream dependency yourself before reusing that buffer on another stream. For example,
 record an event on the producer stream immediately after the call and wait on it in the consumer stream.
-
-Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` before constructing the `EPBuffer` to use URMA in the
-decode implementation. If any rank disables MTE, the group uses URMA.
 
 For decode calls that return routing weights, pass the `recv_weights` from
 `EPBuffer.dispatch` to `EPBuffer.combine` as `topk_weights`. Combine returns

@@ -1,19 +1,21 @@
 #pragma once
 
-#include "low_latency_policy.hpp"
-
 #include <cstdint>
 
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/common/math.hpp>
+#include <deep_ep/common/reduction.hpp>
 #include <deep_ep/impls/ep/dispatch_direct_layout.hpp>
+#include <deep_ep/layout/ep/token.hpp>
+
+#include "low_latency_policy.hpp"
 
 namespace deep_ep {
 
 constexpr bool dispatch_direct_ub_fits(int64_t workspace_bytes, int64_t tokens_per_core,
                                        int64_t hidden_bytes, int sf_bytes, int num_topk, int64_t ub_bytes,
                                        bool cached_mode) {
-    const auto metadata_bytes = get_dispatch_token_bytes(0, sf_bytes, num_topk, cached_mode);
+    const auto metadata_bytes = layout::TokenLayout(0, sf_bytes, num_topk, not cached_mode).get_num_bytes();
     const auto hidden_stage_bytes = math::align<int64_t>(hidden_bytes, kNumUbAlignmentBytes);
     const auto stages = get_dispatch_buffer_stages(
         ub_bytes - workspace_bytes, hidden_stage_bytes, metadata_bytes, tokens_per_core);
@@ -28,8 +30,8 @@ inline bool supports_dispatch_mte(
         not is_decode_shape(num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, use_fp8))
         return false;
 
-    static_assert(kMaxDecodeRanks <= kNumMaxRanks and kMaxDecodeRanks <= kDispatchReductionMaxArrivals);
-    static_assert(get_dispatch_max_expert_rows(kMaxDecodeRanks, kMaxDecodeCapacity) <= kDispatchReductionMaxValue);
+    static_assert(kMaxDecodeRanks <= kNumMaxRanks and kMaxDecodeRanks <= reduction::kReductionMaxHighCount);
+    static_assert(get_dispatch_max_expert_rows(kMaxDecodeRanks, kMaxDecodeCapacity) <= reduction::kReductionMaxLowCount);
     const auto hidden_bytes = static_cast<int64_t>(hidden) * (use_fp8 ? 1 : 2);
     const int sf_bytes = num_sf_packs * static_cast<int>(sizeof(sf_pack_t));
     const auto tokens_per_core = math::ceil_div<int64_t>(capacity, num_vec_cores);

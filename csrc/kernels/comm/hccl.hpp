@@ -24,7 +24,6 @@
 #include <deep_ep/common/math.hpp>
 #include <deep_ep/common/exception.hpp>
 
-#include "../../comm/acl_timeout.hpp"
 #include "../../comm/decode_topology.hpp"
 #include "symmetric.hpp"
 
@@ -51,8 +50,14 @@ struct HCCLContext {
     HCCLContext(const std::string& hccl_group_name, const int& rank_idx,
                 const int& num_ranks, const int64_t& num_bytes,
                 const int& num_jetties, const int& num_cpu_timeout_secs, const bool& use_huge1g_page,
-                const std::shared_ptr<symmetric::SymmetricMemory>& shared_memory = nullptr,
-                comm::DecodeTopology* decode_topology = nullptr):
+                const std::shared_ptr<symmetric::SymmetricMemory>& shared_memory = nullptr):
+        HCCLContext(hccl_group_name, rank_idx, num_ranks, num_bytes, num_jetties, num_cpu_timeout_secs,
+                    use_huge1g_page, shared_memory, nullptr) {}
+
+    HCCLContext(const std::string& hccl_group_name, const int& rank_idx,
+                const int& num_ranks, const int64_t& num_bytes,
+                const int& num_jetties, const int& num_cpu_timeout_secs, const bool& use_huge1g_page,
+                const std::shared_ptr<symmetric::SymmetricMemory>& shared_memory, comm::DecodeTopology* decode_topology):
         num_bytes(num_bytes),
         num_ranks(num_ranks), rank_idx(rank_idx) {
         EP_HOST_ASSERT(num_bytes > 0);
@@ -252,6 +257,8 @@ private:
         uint32_t listen_port = 0;
         HCOMM_CHECK(HcommEndpointGetListenPort(jetty_endpoints.front(), &listen_port));
         EP_HOST_ASSERT(listen_port > 0 and listen_port <= std::numeric_limits<uint16_t>::max());
+        if (decode_topology != nullptr)
+            decode_topology->local_server = comm::DecodeTopology::get_server_location(jetty_endpoint_desc.loc);
         const auto listen_ports = gather_listen_ports(static_cast<uint16_t>(listen_port), num_cpu_timeout_secs, decode_topology);
 
         // The first entries describe every peer; pair the remaining Jetty owners directly.
@@ -317,7 +324,8 @@ private:
             const auto status = HcclAllGather(send, raw, sizeof(T) / sizeof(uint16_t), HCCL_DATA_TYPE_UINT16, comm, stream);
             // If the wait times out, the collective may still access this allocation.
             allocation.release();
-            ACL_CHECK(aclrtSynchronizeStreamWithTimeout(stream, comm::acl_timeout_ms(num_cpu_timeout_secs)));
+            const auto timeout_ms = std::min<int64_t>(int64_t{num_cpu_timeout_secs} * 1000, std::numeric_limits<int32_t>::max());
+            ACL_CHECK(aclrtSynchronizeStreamWithTimeout(stream, static_cast<int32_t>(timeout_ms)));
             allocation.reset(raw);
             HCCL_CHECK(status);
             ACL_CHECK(aclrtMemcpy(peers.data(), bytes, raw, bytes, ACL_MEMCPY_DEVICE_TO_HOST));

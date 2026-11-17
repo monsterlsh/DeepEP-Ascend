@@ -17,7 +17,7 @@
 #include <deep_ep/common/reduction.hpp>
 #include <deep_ep/common/simt.hpp>
 #include <deep_ep/impls/ep/dispatch_direct_layout.hpp>
-#include <deep_ep/impls/ep/dispatch_relay.hpp>
+#include <deep_ep/impls/ep/decode/dispatch_relay.hpp>
 
 namespace deep_ep::decode {
 
@@ -622,9 +622,6 @@ __global__ __vector__ void dispatch_impl(
     EP_STATIC_ASSERT(kNumSGEPairsPerSQE <= handle::kNumMaxSGEPairsPerSQE);
     EP_STATIC_ASSERT(kNumRanks <= reduction::kReductionMaxHighCount and kNumVecCores <= reduction::kReductionMaxHighCount,
                      "Reduction arrival count exceeds 8 bits");
-    EP_STATIC_ASSERT(kDispatchReductionMaxArrivals == reduction::kReductionMaxHighCount and
-                     kDispatchReductionMaxValue == reduction::kReductionMaxLowCount,
-                     "Direct dispatch host reduction bounds differ from the device encoding");
     static constexpr int64_t kMaxExpertRows = get_dispatch_max_expert_rows(kNumRanks, kNumMaxTokensPerRank);
     EP_STATIC_ASSERT(kMaxExpertRows <= reduction::kReductionMaxLowCount,
                      "Per-expert token count exceeds the 24-bit reduction value");
@@ -653,7 +650,7 @@ __global__ __vector__ void dispatch_impl(
 
     // Token and buffer layouts
     // Cached dispatch reuses source metadata from the handle; only SF and weights travel again.
-    const auto token_layout = layout::TokenLayout(
+    constexpr auto token_layout = layout::TokenLayout(
         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode);
     const auto recv_buffer = layout::BufferLayout(
         token_layout, kNumRanks, kNumMaxTokensPerRank,
@@ -665,9 +662,6 @@ __global__ __vector__ void dispatch_impl(
     EP_STATIC_ASSERT(sizeof(ub_layout_t) == get_dispatch_routing_workspace_bytes(
                          kNumRanks, kNumExperts, kNumMaxTokensPerVecCore, kNumTopk),
                      "Direct dispatch host routing workspace differs from the device layout");
-    EP_STATIC_ASSERT(get_dispatch_token_bytes(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, kCachedMode) ==
-                         layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, not kCachedMode).get_num_bytes(),
-                     "Direct dispatch host token stride differs from the native layout");
     using ub_layout_with_buffer_t = UBLayoutWithBuffer<ub_layout_t, kNumHiddenBytes, kNumSFPacks,
         kNumTopk, kNumMaxTokensPerVecCore, kNumUbBytes, kCachedMode>;
     EP_STATIC_ASSERT(sizeof(ub_layout_with_buffer_t) <= kNumUbBytes, "Dispatch buffers exceed UB capacity");
@@ -976,8 +970,7 @@ __global__ __vector__ void dispatch_impl(
     }
 
     if constexpr (kServerRelay) {
-        EP_STATIC_ASSERT(get_dispatch_token_bytes(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t),
-                                                 kNumTopk, kCachedMode) <= kNumUbBytes);
+        EP_STATIC_ASSERT(token_layout.get_num_bytes() <= kNumUbBytes);
         comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores>(
             workspace_layout.get_common_signals(), vec_core_idx);
         gather_dispatch_relay_slots<kNumRanks, kNumMaxTokensPerRank, kNumVecCores>(

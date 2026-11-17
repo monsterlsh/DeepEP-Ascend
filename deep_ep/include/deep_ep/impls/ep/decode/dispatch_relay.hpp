@@ -3,7 +3,7 @@
 #include <deep_ep/layout/common/signals.hpp>
 #include <deep_ep/layout/ep/token.hpp>
 
-namespace deep_ep {
+namespace deep_ep::decode {
 
 // Each thread owns a whole token. Walk backwards so earlier lanes remain intact
 // while looking for the first destination rank on each remote server. The
@@ -14,7 +14,7 @@ __simt_callee__ void publish_dispatch_relay_slots(
     __gm__ const int* server_ids, __gm__ int* relay_slots, int source_rank,
     int local_token) {
     const int first = local_token * kNumTopk;
-    for (int k = kNumTopk - 1; k >= 0; --k) {
+    for (int k = kNumTopk - 1; k >= 0; -- k) {
         const int entry = first + k;
         const int dst = routing->dst_rank_idx[entry];
         if (dst < 0)
@@ -22,7 +22,7 @@ __simt_callee__ void publish_dispatch_relay_slots(
 
         int relay = -1;
         if (server_ids[dst] != server_ids[source_rank]) {
-            for (int earlier = first; earlier < entry; ++earlier) {
+            for (int earlier = first; earlier < entry; ++ earlier) {
                 const int peer = routing->dst_rank_idx[earlier];
                 if (peer >= 0 and server_ids[peer] == server_ids[dst]) {
                     relay = peer * kCapacity + routing->dst_slot_idx[earlier];
@@ -48,7 +48,7 @@ __aicore__ __forceinline__ void gather_dispatch_relay_slots(
     __ubuf__ uint8_t* packet) {
     const auto packet_bytes = static_cast<uint32_t>(received.get_num_bytes_per_token());
     int prefix = 0;
-    for (int source = 0; source < kNumRanks; ++source) {
+    for (int source = 0; source < kNumRanks; ++ source) {
         const int next = AscendC::ReadGmByPassDCache(recv_rank_psum + source);
         const auto source_buffer = received.get_rank_buffer(source);
         for (int slot = vec_core_idx; slot < next - prefix; slot += kNumVecCores) {
@@ -71,4 +71,4 @@ __aicore__ __forceinline__ void gather_dispatch_relay_slots(
     }
 }
 
-}  // namespace deep_ep
+}  // namespace deep_ep::decode

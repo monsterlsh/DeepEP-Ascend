@@ -20,8 +20,7 @@ namespace deep_ep::decode {
 template <int kNumRanks, int kNumExperts, int kNumTopk,
           int kHidden, int kNumMaxTokensPerRank, int kNumUbBytes,
           int kNumVecCores, int64_t kNumTimeoutCycles, bool kDoBarrier = true,
-          int kNumHiddenBytes = kHidden * static_cast<int>(sizeof(uint16_t)), typename element_t = bfloat16_t,
-          bool kLowLatencyTransport = false>
+          bool kLowLatencyTransport = false, typename element_t = bfloat16_t>
 __global__ __vector__ void combine_reduce_epilogue_impl(
     __gm__ element_t* combined_x,
     __gm__ float* combined_topk_weights,
@@ -40,9 +39,10 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             kNumRanks, kNumTimeoutCycles, true, kLowLatencyTransport, true, kNumVecCores, kLowLatencyTransport ? 0 : kNumVecCores>(
                 static_cast<__gm__ layout::EPSignals*>(workspace)->common_signals, vec_core_idx, jetty_ptrs);
 
+    static constexpr int kNumHiddenBytes = kHidden * static_cast<int>(sizeof(element_t));
     static constexpr int kNumWeightBytes = get_combine_weight_bytes(kNumTopk);
     static constexpr int kNumHiddenSlots = get_combine_hidden_slots(kNumUbBytes, kNumHiddenBytes + kNumWeightBytes);
-    static constexpr int kNumCombineTokenElems = kHidden + kNumWeightBytes / static_cast<int>(sizeof(bfloat16_t));
+    static constexpr int kNumCombineTokenElems = kHidden + kNumWeightBytes / static_cast<int>(sizeof(element_t));
     using HiddenReducer = RingReducer<
         kHidden, math::min(kNumRanks, kNumTopk) + 2, kNumHiddenSlots, 0, kNumWeightBytes, element_t>;
 

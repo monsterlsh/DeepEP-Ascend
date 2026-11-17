@@ -36,7 +36,7 @@ class EPBuffer: public BufferBase {
     std::shared_ptr<EPLowLatencyState> low_latency_state;
 
     static int get_num_used_vec_cores(int num_ai_cores) {
-        const auto cores = int64_t{num_ai_cores} * runtime->get_num_vec_cores_per_ai_core();
+        const auto cores = static_cast<int64_t>(num_ai_cores) * runtime->get_num_vec_cores_per_ai_core();
         EP_HOST_ASSERT(num_ai_cores > 0 and cores > 0 and cores <= std::numeric_limits<int>::max());
         return static_cast<int>(cores);
     }
@@ -47,13 +47,14 @@ class EPBuffer: public BufferBase {
     }
 
     pybind11::tuple defer(std::function<pybind11::object()> epilogue) const {
-        auto hook = pybind11::cpp_function([epilogue = std::move(epilogue),
-                owner = pybind11::cast(this, pybind11::return_value_policy::reference)]() mutable {
+        // A direct runtime caller may release the buffer before invoking the callback.
+        auto owner = pybind11::cast(this, pybind11::return_value_policy::reference);
+        std::function<pybind11::object()> hook = [owner = std::move(owner), epilogue = std::move(epilogue)]() mutable {
             // Consume before launch so a saved Python callback cannot replay an old collective.
             auto once = std::exchange(epilogue, nullptr);
             EP_HOST_ASSERT(once and "EP epilogue already consumed");
             return once();
-        });
+        };
         return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(hook));
     }
 
@@ -65,7 +66,7 @@ public:
              const int64_t& num_buffer_bytes, const int64_t& num_lb_buffer_bytes,
              const bool& use_huge1g_page,
              const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
-             const bool& explicitly_destroy, bool deterministic = false):
+             const bool& explicitly_destroy):
         BufferBase(explicitly_destroy), num_buffer_bytes(num_buffer_bytes),
         low_latency_state(std::make_shared<EPLowLatencyState>()) {
         EP_HOST_ASSERT(num_buffer_bytes >= 0 and num_buffer_bytes % kNumAllocationAlignmentBytes == 0);
@@ -75,7 +76,7 @@ public:
         EP_HOST_ASSERT(num_cpu_timeout_secs > 0 and num_gpu_timeout_secs > 0);
         EP_HOST_ASSERT(arena_bytes <= std::numeric_limits<int64_t>::max() -
                        static_cast<int64_t>(sizeof(layout::EPSignals)));
-        auto topology = EPLowLatencyState::local_topology(num_ranks, num_gpu_timeout_secs, deterministic);
+        auto topology = EPLowLatencyState::local_topology(num_ranks);
         context = std::make_shared<comm::Context>(
             hccl_group_name, rank_idx, num_ranks, sizeof(layout::EPSignals), arena_bytes, 0,
             use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs, nullptr, &topology);
@@ -84,7 +85,7 @@ public:
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_common_signals(&workspace.common_signals);
         lb_storage = torch::from_blob(
-            context->buffer, {num_buffer_bytes + num_lb_buffer_bytes}, [context = context](void*) {},
+            context->buffer, {arena_bytes}, [context = context](void*) {},
             torch::TensorOptions().dtype(torch::kByte).device(TORCH_DEVICE_NPU)
         ).narrow(0, num_buffer_bytes, num_lb_buffer_bytes);
         ACL_CHECK(aclrtMallocHost(&host_workspace, sizeof(layout::EPSignals)));
@@ -216,8 +217,8 @@ public:
             const int words_per_scale = wide ? 2 : 1;
             const auto columns = wire_scales.size(1);
             // Singleton/empty dimensions can carry arbitrary PyTorch strides.
-            const auto row_stride = decode and (num_tokens <= 1 or columns == 0) ? columns : wire_scales.stride(0);
-            const auto column_stride = decode and (wide or num_tokens == 0 or columns <= 1) ? 1 : wire_scales.stride(1);
+            const auto row_stride = (decode and (num_tokens <= 1 or columns == 0)) ? columns : wire_scales.stride(0);
+            const auto column_stride = (decode and (wide or num_tokens == 0 or columns <= 1)) ? 1 : wire_scales.stride(1);
             EP_HOST_ASSERT(columns <= std::numeric_limits<int>::max() / (words_per_scale * static_cast<int>(sizeof(sf_pack_t))) and
                            row_stride <= std::numeric_limits<int>::max() / words_per_scale and
                            column_stride <= std::numeric_limits<int>::max());
@@ -238,10 +239,11 @@ public:
         EP_HOST_ASSERT(topk_idx.is_contiguous());
         EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and math::is_power_of_2(expert_alignment));
         const auto max_expert_rows = get_dispatch_max_expert_rows(context->num_ranks, num_max_tokens_per_rank);
-        EP_HOST_ASSERT(max_expert_rows <= kDispatchReductionMaxValue and
+        EP_HOST_ASSERT(max_expert_rows <= reduction::kReductionMaxLowCount and
                        "Per-expert route count exceeds the 24-bit dispatch reduction");
-        EP_HOST_ASSERT(not do_cpu_sync or math::align<int64_t>(max_expert_rows, expert_alignment) <= kDispatchReductionMaxValue);
-        const auto max_expanded_rows = get_dispatch_max_expanded_rows(max_expert_rows, num_topk, num_experts_per_rank, expert_alignment);
+        EP_HOST_ASSERT(not do_cpu_sync or math::align<int64_t>(max_expert_rows, expert_alignment) <= reduction::kReductionMaxLowCount);
+        const auto max_expanded_rows = get_dispatch_max_expanded_rows(
+            max_expert_rows, num_topk, num_experts_per_rank, expert_alignment);
         EP_HOST_ASSERT(max_expanded_rows <= std::numeric_limits<int>::max() and
                        "Expanded row capacity exceeds the 32-bit dispatch slot index");
 
@@ -347,11 +349,11 @@ public:
         if (decode) {
             record_use(x, *issue_stream);
             record_use(topk_idx, *issue_stream);
-            if (sf)
+            if (sf.has_value())
                 record_use(*sf, *issue_stream);
-            if (topk_weights)
+            if (topk_weights.has_value())
                 record_use(*topk_weights, *issue_stream);
-            if (cumulative_local_expert_recv_stats)
+            if (cumulative_local_expert_recv_stats.has_value())
                 record_use(*cumulative_local_expert_recv_stats, *issue_stream);
             if (cached_mode) {
                 record_use(dst_buffer_slot_idx, *issue_stream);
@@ -366,14 +368,24 @@ public:
         auto submission = low_latency_state->submission_guard(x, metadata_send_buffer);
         launch_ep_dispatch(
             get_ep_kernel_mode(decode, low_latency_transport), [&] { submission.begin_submission(); },
-            x.data_ptr(), sf_ptr, topk_idx.data_ptr(), topk_weights_ptr,
-            metadata_send_buffer.data_ptr(), cumulative_local_expert_recv_stats_ptr,
-            psum_num_recv_tokens_per_rank.data_ptr<int>(), psum_num_recv_tokens_per_expert.data_ptr<int>(),
-            num_unaligned_recv_tokens_per_expert.data_ptr<int>(), dst_buffer_slot_idx.data_ptr<int>(), dst_gsge_idx.data_ptr<int>(),
-            context->buffer, context->workspace, mapped_host_workspace, context->hccl_context->jetty_device_ptrs,
-            context->rank_idx, context->num_ranks, num_tokens, num_max_tokens_per_rank,
-            num_experts, num_topk, expert_alignment, cached_mode, do_cpu_sync, num_hidden_bytes,
-            num_sf_packs, sf_token_stride, sf_hidden_stride, num_ub_bytes, num_used_vec_cores,
+            x.data_ptr(), sf_ptr,
+            topk_idx.data_ptr(), topk_weights_ptr,
+            metadata_send_buffer.data_ptr(),
+            cumulative_local_expert_recv_stats_ptr,
+            psum_num_recv_tokens_per_rank.data_ptr<int>(),
+            psum_num_recv_tokens_per_expert.data_ptr<int>(),
+            num_unaligned_recv_tokens_per_expert.data_ptr<int>(),
+            dst_buffer_slot_idx.data_ptr<int>(),
+            dst_gsge_idx.data_ptr<int>(),
+            context->buffer, context->workspace, mapped_host_workspace,
+            context->hccl_context->jetty_device_ptrs,
+            context->rank_idx, context->num_ranks,
+            num_tokens, num_max_tokens_per_rank,
+            num_experts, num_topk, expert_alignment,
+            cached_mode, do_cpu_sync,
+            num_hidden_bytes, num_sf_packs,
+            sf_token_stride, sf_hidden_stride,
+            num_ub_bytes, num_used_vec_cores,
             context->num_gpu_timeout_cycles, barrier_in_prologue,
             relay ? workspace.decode_server_ids : nullptr, relay ? workspace.decode_relay_slots : nullptr);
 
@@ -382,7 +394,7 @@ public:
         auto epilogue = [=, x = x, metadata_send_buffer = metadata_send_buffer, context = context,
                          low_latency_state = low_latency_state]() {
             const auto ll_failure_guard = low_latency_state->failure_guard();
-            if (issue_stream) {
+            if (issue_stream.has_value()) {
                 const auto copy_stream = c10_npu::getCurrentNPUStream();
                 const bool cross_stream = copy_stream != *issue_stream;
                 if ((decode and cached_mode) or cross_stream) {
@@ -551,7 +563,7 @@ public:
         EP_HOST_ASSERT(combined_topk_idx.is_contiguous());
         EP_HOST_ASSERT(combined_topk_idx.scalar_type() == torch::kInt64);
         EP_HOST_ASSERT(src_metadata.size(1) == num_topk + 2);
-        EP_HOST_ASSERT(src_metadata.size(0) <= int64_t{context->num_ranks} * num_max_tokens_per_rank);
+        EP_HOST_ASSERT(src_metadata.size(0) <= static_cast<int64_t>(context->num_ranks) * num_max_tokens_per_rank);
         EP_HOST_ASSERT(src_metadata.is_contiguous());
         EP_HOST_ASSERT(src_metadata.scalar_type() == torch::kInt);
         EP_HOST_ASSERT(psum_num_recv_tokens_per_rank.dim() == 1);
@@ -606,7 +618,7 @@ public:
             record_use(x, *issue_stream);
             record_use(src_metadata, *issue_stream);
             record_use(psum_num_recv_tokens_per_rank, *issue_stream);
-            if (topk_weights)
+            if (topk_weights.has_value())
                 record_use(*topk_weights, *issue_stream);
         }
         auto submission = low_latency_state->submission_guard(x, send_buffer);
@@ -635,14 +647,14 @@ public:
         auto epilogue = [=, x = x, send_buffer = send_buffer, context = context,
                          low_latency_state = low_latency_state]() {
             const auto ll_failure_guard = low_latency_state->failure_guard();
-            if (issue_stream) {
+            if (issue_stream.has_value()) {
                 const auto reduce_stream = c10_npu::getCurrentNPUStream();
                 const bool cross_stream = reduce_stream != *issue_stream;
                 if (decode or cross_stream) {
                     record_use(combined_topk_idx, reduce_stream);
-                    if (bias_0)
+                    if (bias_0.has_value())
                         record_use(*bias_0, reduce_stream);
-                    if (bias_1)
+                    if (bias_1.has_value())
                         record_use(*bias_1, reduce_stream);
                 }
                 if (send_buffer.defined() and cross_stream) {

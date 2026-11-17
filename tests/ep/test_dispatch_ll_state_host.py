@@ -6,6 +6,8 @@ import unittest
 from _host_test_helpers import ROOT, run_host_cpp
 
 HEADER = ROOT / 'csrc/buffers/low_latency_state.hpp'
+CANN_HEADERS = {'simt_api/device_warp_functions.h': '#pragma once\n',
+                'utils/debug/asc_assert.h': '#pragma once\n#include <cassert>\n'}
 
 
 def host_test_source():
@@ -23,6 +25,8 @@ def host_test_source():
 #include <string>
 #include <string_view>
 #include <vector>
+#define ACL_CHECK(op) do { if (op) throw std::runtime_error("capture"); } while(false)
+#define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while(false)
 #include "csrc/comm/decode_topology.hpp"
 #include "csrc/kernels/ep/kernel_mode.hpp"
 #include "csrc/kernels/ep/dispatch_low_latency_policy.hpp"
@@ -50,7 +54,6 @@ int aclmdlRICaptureGetInfo(int, aclmdlRICaptureStatus* status, aclmdlRI*) {
     *status = capture_status;
     return aclrtCaptureError;
 }
-#define ACL_CHECK(op) do { if (op) throw std::runtime_error("capture"); } while(false)
 const char* aclrtGetSocName() { return mock::soc; }
 namespace c10_npu {
 using NPUStream = int;
@@ -82,7 +85,6 @@ struct EventHandle {
     }
 };
 namespace comm {
-constexpr int64_t kNumSystemCyclesPerSecond = 1000000000LL;
 struct Context {
     int num_ranks = 8, num_cpu_timeout_secs = 300;
     int64_t num_gpu_timeout_cycles = 100 * kNumSystemCyclesPerSecond;
@@ -97,11 +99,11 @@ struct Context {
     launcher = dispatch_header[dispatch_header.index('static void launch_ep_dispatch('):
                                dispatch_header.index('static void launch_dispatch(')]
     recording_jit = r"""
-#define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while(false)
 struct Config { int num_blocks, num_ubuf_bytes; };
 struct TestJit {
     int launches = 0;
-    int compile(const char*, const std::string&) { return 1; }
+    std::string source;
+    int compile(const char*, const std::string& code) { source = code; return 1; }
     void launch(int, Config, auto...) { ++launches; }
 } test_jit;
 auto jit = &test_jit;
@@ -111,20 +113,20 @@ using deep_ep::comm::Context;
 using deep_ep::comm::DecodeTopology;
 using deep_ep::EPLowLatencyState;
 
-void initialize(EPLowLatencyState& state, std::shared_ptr<Context> ctx, bool deterministic = false) {
-    auto topology = state.local_topology(ctx->num_ranks, int(ctx->num_gpu_timeout_cycles / deep_ep::comm::kNumSystemCyclesPerSecond), deterministic);
+void initialize(EPLowLatencyState& state, std::shared_ptr<Context> ctx) {
+    auto topology = state.local_topology(ctx->num_ranks);
     if (ctx->num_ranks > 1) {
         topology.gather_ports(3000, [&](DecodeTopology::Record local) {
             ++mock::setups;
-            std::vector<DecodeTopology::Record> peers(ctx->num_ranks, {3000, -1, mock::capable_peer ? 64 : 0});
+            std::vector<DecodeTopology::Record> peers(ctx->num_ranks, {3000, mock::capable_peer ? 64 : 0, {}});
             peers[0] = local;
             return peers;
         });
     }
     state.attach_context(ctx, topology);
 }
-void initialize(EPLowLatencyState& state, const Context& ctx, bool deterministic = false) {
-    initialize(state, std::make_shared<Context>(ctx), deterministic);
+void initialize(EPLowLatencyState& state, const Context& ctx) {
+    initialize(state, std::make_shared<Context>(ctx));
 }
 
 bool dispatch(EPLowLatencyState& state, const Context& ctx, int m = 2, int sf_words = 0) {
@@ -144,25 +146,24 @@ template <class F> void rejects(F fn, std::string_view message) {
 }
 
 void check_admission() {
-    for (int mode = 0; mode < 11; ++mode) {
+    for (int mode = 0; mode < 9; ++mode) {
         Context ctx;
         if (mode == 0) mock::soc = nullptr;
         if (mode == 1) mock::arch = 3500;
         if (mode == 2) mock::cores = 63;
         if (mode == 3) mock::vec_per_ai = 1;
         if (mode == 4) mock::ub_bytes = 100;
-        if (mode == 5) --ctx.num_gpu_timeout_cycles;
-        if (mode == 6) mock::capable_peer = false;
-        if (mode == 7) ctx.num_ranks = 1;
-        if (mode == 10) mock::cores = 80;
+        if (mode == 5) mock::capable_peer = false;
+        if (mode == 6) ctx.num_ranks = 1;
+        if (mode == 7) mock::cores = 80;
         EPLowLatencyState state;
         const auto setups = mock::setups;
-        initialize(state, ctx, mode == 8);
+        initialize(state, ctx);
         for (int i = 0; i < 3; ++i) {
-            assert(dispatch(state, ctx) == (mode == 9));
-            assert(combine(state, ctx) == (mode == 9));
+            assert(dispatch(state, ctx) == (mode == 8));
+            assert(combine(state, ctx) == (mode == 8));
         }
-        assert(mock::setups == setups + (mode != 7));
+        assert(mock::setups == setups + (mode != 6));
         state.close();
         mock::soc = "Ascend950DT_9582"; mock::arch = 3510; mock::cores = 64;
         mock::vec_per_ai = 2; mock::ub_bytes = 216 * 1024;
@@ -254,23 +255,35 @@ void check_events() {
     assert(mock::events.size() == event_count + 2);
     state.close();
 }
+void submit_dispatch(EPLowLatencyState& state, EPKernelMode mode, int vec_cores, int64_t timeout_cycles) {
+    auto guard = state.submission_guard();
+    launch_ep_dispatch(mode, [&] { guard.begin_submission(); }, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                       0, 8, 2, 2, 128, 8, 128, false, false, 14336, 0, 0, 0, 216 * 1024, vec_cores, timeout_cycles);
+}
 void check_invalid_core_count_retry() {
     EPLowLatencyState state;
     Context ctx;
     initialize(state, ctx);
-    const auto submit = [&](int vec_cores) {
-        auto guard = state.submission_guard();
-        launch_ep_dispatch(EPKernelMode::DecodeURMA, [&] { guard.begin_submission(); }, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                        0, 8, 2, 2, 128, 8, 128, false, false, 14336, 0, 0, 0, 216 * 1024, vec_cores, 100);
-    };
-    rejects([&] { submit(8); }, "16 <= num_vec_cores");
+    rejects([&] { submit_dispatch(state, EPKernelMode::DecodeURMA, 8, ctx.num_gpu_timeout_cycles); }, "16 <= num_vec_cores");
     assert(jit->launches == 0);
     assert(dispatch(state, ctx));
-    submit(64);
+    submit_dispatch(state, EPKernelMode::DecodeURMA, 64, ctx.num_gpu_timeout_cycles);
     assert(jit->launches == 1);
     state.record_completion(true);
     assert(combine(state, ctx));
+}
+void check_gpu_timeouts() {
+    for (int seconds : {1, 99, 100, 101, 300}) {
+        Context ctx;
+        ctx.num_gpu_timeout_cycles = seconds * deep_ep::comm::kNumSystemCyclesPerSecond;
+        EPLowLatencyState state;
+        initialize(state, ctx);
+        assert(dispatch(state, ctx) && combine(state, ctx));
+        submit_dispatch(state, EPKernelMode::DecodeMTE, 64, ctx.num_gpu_timeout_cycles);
+        assert(jit->source.find(std::format(", {}, false, true, false>", ctx.num_gpu_timeout_cycles)) != std::string::npos);
+        state.record_completion(true);
+    }
 }
 void check_failures() {
     Context ctx;
@@ -333,6 +346,7 @@ int main() {
     check_admission();
     check_events();
     check_invalid_core_count_retry();
+    check_gpu_timeouts();
     check_failures();
     check_resource_lifetime();
     check_capacity_boundary();
@@ -344,10 +358,10 @@ int main() {
 class DispatchLLStateHostTests(unittest.TestCase):
     def test_decode_policy_grid(self):
         source = (ROOT / 'tests/ep/decode_policy_test.cpp').read_text()
-        run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'))
+        run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
     def test_actual_state_transitions(self):
-        run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'))
+        run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
     def test_automatic_teardown_after_failure(self):
         base = (ROOT / 'csrc/buffers/base.hpp').read_text()
@@ -405,13 +419,15 @@ int main() {
 }
 '''
         source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + destructor + cases
-        run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'))
+        run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
     def test_group_topology_and_transport_limits(self):
         source = (ROOT / 'tests/ep/decode_topology_host_test.cpp').read_text()
         hccl = (ROOT / 'csrc/kernels/comm/hccl.hpp').read_text()
+        context = (ROOT / 'csrc/kernels/comm/api.hpp').read_text()
         headers = {'gather_listen_ports.inc': hccl[hccl.index('    std::vector<uint16_t> gather_listen_ports('):
-                                                    hccl.index('    void wait_for_channels(')]}
+                                                    hccl.index('    void wait_for_channels(')],
+                   'finalize.inc': context[context.index('    void finalize()'):context.index('\n};')]}
         run_host_cpp(source, include_dirs=(ROOT,), headers=headers)
 
 

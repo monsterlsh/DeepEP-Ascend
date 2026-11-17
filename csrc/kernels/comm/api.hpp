@@ -35,7 +35,16 @@ public:
             const int64_t& num_workspace_bytes, const int64_t& num_gpu_buffer_bytes,
             const int64_t& num_rdma_storage_bytes, const bool& use_huge1g_page,
             const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
-            const std::shared_ptr<Context>& main_context = nullptr, DecodeTopology* decode_topology = nullptr):
+            const std::shared_ptr<Context>& main_context = nullptr):
+        Context(hccl_group_name, rank_idx, num_ranks, num_workspace_bytes, num_gpu_buffer_bytes,
+                num_rdma_storage_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
+                main_context, nullptr) {}
+
+    Context(const std::string& hccl_group_name, const int& rank_idx, const int& num_ranks,
+            const int64_t& num_workspace_bytes, const int64_t& num_gpu_buffer_bytes,
+            const int64_t& num_rdma_storage_bytes, const bool& use_huge1g_page,
+            const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
+            const std::shared_ptr<Context>& main_context, DecodeTopology* decode_topology):
         rank_idx(rank_idx), num_ranks(num_ranks),
         num_cpu_timeout_secs(num_cpu_timeout_secs),
         num_gpu_timeout_cycles(static_cast<int64_t>(num_gpu_timeout_secs) * kNumSystemCyclesPerSecond),
@@ -94,8 +103,9 @@ public:
 
     void finalize() {
         EP_HOST_ASSERT(not finalized);
-        // Surface release errors here, while the caller can still handle them.
-        hccl_context->close();
+        // Release shared registrations and memory only when their last owner finishes.
+        if (hccl_context.use_count() == 1)
+            hccl_context->close();
         if (symmetric_memory.use_count() == 1)
             symmetric_memory->close();
         hccl_context.reset();

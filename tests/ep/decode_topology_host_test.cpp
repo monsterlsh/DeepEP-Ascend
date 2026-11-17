@@ -7,7 +7,6 @@
 #include <stdexcept>
 #include <vector>
 
-#include "csrc/comm/acl_timeout.hpp"
 #include "csrc/comm/decode_topology.hpp"
 
 using deep_ep::comm::DecodeTopology;
@@ -76,26 +75,67 @@ struct TestContext {
     HcclComm comm;
 #include "gather_listen_ports.inc"
 };
+
+struct TestMemory {
+    void close() { assert(!closed); closed = true; }
+    bool closed = false;
+};
+
+struct TestHCCLContext {
+    std::shared_ptr<TestMemory> memory;
+    void close() { memory.reset(); }
+};
+
+struct SharedContext {
+    bool finalized = false;
+    std::shared_ptr<TestMemory> symmetric_memory;
+    std::shared_ptr<TestHCCLContext> hccl_context;
+#include "finalize.inc"
+};
 }
 
 int main() {
-    const auto set_id = [](const char* id) {
-#ifdef _WIN32
-        assert(_putenv_s("EP_DECODE_SERVER_ID", id) == 0);
-#else
-        assert((*id ? setenv("EP_DECODE_SERVER_ID", id, 1) : unsetenv("EP_DECODE_SERVER_ID")) == 0);
-#endif
+    {
+        deep_ep::SharedContext first, second;
+        first.symmetric_memory = second.symmetric_memory = std::make_shared<deep_ep::TestMemory>();
+        first.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(first.symmetric_memory);
+        second.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(second.symmetric_memory);
+        auto retained_registration = first.hccl_context;
+        std::weak_ptr<deep_ep::TestMemory> window = first.symmetric_memory;
+        first.finalize();
+        second.finalize();
+        assert(first.finalized && second.finalized);
+        assert(retained_registration->memory && !retained_registration->memory->closed);
+        retained_registration.reset();
+        assert(window.expired());
+    }
+    using Location = DecodeTopology::ServerLocation;
+    enum LocType { ENDPOINT_LOC_TYPE_DEVICE, ENDPOINT_LOC_TYPE_HOST };
+    struct EndpointLoc {
+        LocType locType;
+        struct { uint32_t serverIdx, superPodIdx; } device;
     };
-    const auto setup = [](const std::vector<int>& ids, int local_cores = 64, int peer_cores = 64, int timeout = 120) {
+    struct OlderEndpointLoc {
+        LocType locType;
+        struct { uint32_t devPhyId; } device;
+    };
+    const Location local{17, 0}, remote{17, 1};
+    assert(DecodeTopology::get_server_location(EndpointLoc{ENDPOINT_LOC_TYPE_DEVICE, {17, 1}}) == remote);
+    assert(DecodeTopology::get_server_location(EndpointLoc{ENDPOINT_LOC_TYPE_HOST, {17, 1}}) == Location{});
+    assert(DecodeTopology::get_server_location(OlderEndpointLoc{ENDPOINT_LOC_TYPE_DEVICE, {3}}) == Location{});
+
+    const auto setup = [](const std::vector<Location>& locations, int local_cores = 64, int peer_cores = 64,
+                          int timeout = 120, Location local_location = {17, 0}) {
         DecodeTopology topology(local_cores);
+        topology.local_server = local_location;
         other.clear();
         std::vector<uint16_t> expected{3000};
-        for (auto id : ids) {
+        for (auto location : locations) {
             const int port = 3000 + static_cast<int>(expected.size());
-            other.push_back({port, id, peer_cores});
+            other.push_back({port, peer_cores, location});
             expected.push_back(static_cast<uint16_t>(port));
         }
-        deep_ep::TestContext ctx{static_cast<int>(ids.size()) + 1, 1};
+        deep_ep::TestContext ctx{static_cast<int>(locations.size()) + 1, 1};
         int before = gathers, before_wait = waits;
         assert(ctx.gather_listen_ports(3000, timeout, &topology) == expected);
         assert(gathers == before + 1 && waits == before_wait + 1);
@@ -103,44 +143,43 @@ int main() {
         assert(gathers == before + 2 && waits == before_wait + 2);
         return topology;
     };
-    set_id("17");
-    const auto interleaved = setup({9,17,9});
-    assert(interleaved.mte_enabled && interleaved.server_ids == std::vector<int>({17,9,17,9}));
-    assert(setup({17,17,17}).server_ids.empty());
-    assert(setup({9,13,21}).server_ids.empty());
-    for (const char* id : {"", "unknown", "-2", "2147483648", "7x"}) {
-        set_id(id);
-        const auto topology = setup({9,17,9});
-        assert(topology.mte_enabled && topology.server_ids.empty());
+    // Servers can reuse a local index across different superpods.
+    const auto interleaved = setup({remote, local, remote});
+    assert(interleaved.mte_enabled && interleaved.server_ids == std::vector<int>({0, 1, 0, 1}));
+    assert(setup({{18, 0}, local, {18, 0}}).server_ids == interleaved.server_ids);
+    assert(setup({local, local, local}).server_ids.empty());
+    assert(setup({{9, 0}, {13, 0}, {21, 0}}).server_ids.empty());
+    for (Location unknown : {Location{}, Location{UINT32_MAX, 0}, Location{17, UINT32_MAX}}) {
+        const auto missing_peer = setup({local, unknown, remote});
+        const auto missing_local = setup({local, local, remote}, 64, 64, 120, unknown);
+        assert(missing_peer.mte_enabled && missing_peer.server_ids.empty());
+        assert(missing_local.mte_enabled && missing_local.server_ids.empty());
     }
-    set_id("0");
-    assert(setup({0,-1,17}).server_ids.empty());
-    for (int local : {0, 64, 80})
+    for (int cores : {0, 64, 80})
         for (int peer : {0, 64, 80}) {
-            const auto topology = setup({17, 0, 17}, local, peer);
-            assert(topology.mte_enabled == (local > 0 && local == peer));
+            const auto topology = setup({remote, local, remote}, cores, peer);
+            assert(topology.mte_enabled == (cores > 0 && cores == peer));
             assert(topology.server_ids.empty() == !topology.mte_enabled);
         }
-    setup({-1}, 64, 64, 7200);
+    setup({{}}, 64, 64, 7200);
     assert(last_timeout_ms == 7200000);
     constexpr int32_t max_ms = std::numeric_limits<int32_t>::max();
-    setup({-1}, 64, 64, max_ms / 1000);
+    setup({{}}, 64, 64, max_ms / 1000);
     assert(last_timeout_ms == (max_ms / 1000) * 1000);
-    setup({-1}, 64, 64, max_ms / 1000 + 1);
+    setup({{}}, 64, 64, max_ms / 1000 + 1);
     assert(last_timeout_ms == max_ms);
     for (Failure failure : {malloc_failure, h2d_failure, collective_failure, d2h_failure}) {
         const int before = gathers;
         fail = failure;
-        try { setup({17}); assert(false); } catch (const std::runtime_error&) {}
+        try { setup({local}); assert(false); } catch (const std::runtime_error&) {}
         assert(allocations == 0 && gathers == before + (failure >= collective_failure));
         fail = none;
-        assert(setup({17}).mte_enabled);
+        assert(setup({local}).mte_enabled);
     }
     fail = timeout_failure;
-    try { setup({17}); assert(false); } catch (const std::runtime_error&) {}
+    try { setup({local}); assert(false); } catch (const std::runtime_error&) {}
     // A timed-out stream might still use the receive buffer; runtime teardown reclaims it.
     assert(allocations == 1);
     aclrtFree(last_allocation);
-    set_id("");
     assert(allocations == 0);
 }
