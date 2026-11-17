@@ -55,9 +55,9 @@ public:
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
         for (const auto& context: contexts)
-            comm::barrier(*context, true);
+            context->drain_for_destroy();
         for (const auto& context: contexts)
-            context->finalize();
+            context->finalize(not in_destructor);
         storage = torch::Tensor();
         contexts.clear();
         destroyed = true;
@@ -83,6 +83,7 @@ public:
         EP_HOST_ASSERT(not srcs.empty() and srcs.size() <= comm::kNumMaxBuckets);
         EP_HOST_ASSERT(dsts.empty() or dsts.size() == srcs.size());
         const auto& context = contexts[context_idx];
+        context->check_available();
         const auto rank_idx = context->rank_idx, num_ranks = context->num_ranks;
 
         // Describe each gathered tensor and its optional external source by byte offsets.

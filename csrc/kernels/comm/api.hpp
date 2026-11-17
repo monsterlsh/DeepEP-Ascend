@@ -101,26 +101,19 @@ public:
         EP_HOST_ASSERT(not finalized);
     }
 
+    void drain_for_destroy();
+
     void finalize() {
-        release_resources(false);
+        finalize(true);
     }
 
-    void finalize_ep() {
-        release_resources(true);
-    }
-
-private:
-    void release_resources(bool report_cleanup_errors) {
-        EP_HOST_ASSERT(not finalized);
+    void finalize(bool report_cleanup_errors) {
         finalized = true;
-        // EP retains its failed context if explicit cleanup cannot complete.
-        if (report_cleanup_errors) {
-            if (hccl_context.use_count() == 1)
-                hccl_context->close();
-            if (symmetric_memory.use_count() == 1)
-                symmetric_memory->close();
-        }
+        if (report_cleanup_errors and hccl_context.use_count() == 1)
+            hccl_context->close();
         hccl_context.reset();
+        if (report_cleanup_errors and symmetric_memory.use_count() == 1)
+            symmetric_memory->close();
         symmetric_memory.reset();
     }
 };

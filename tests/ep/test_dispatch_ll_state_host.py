@@ -94,7 +94,7 @@ struct Context {
     void* workspace = nullptr;
     bool finalized = false;
     void check_available() const { EP_HOST_ASSERT(not finalized); }
-    void finalize_ep() { finalized = true; }
+    void finalize() { finalized = true; }
 };
 }
 }
@@ -411,6 +411,7 @@ int aclrtHostUnregister(void*) { return 0; }
 int aclrtFreeHost(void*) { return 0; }
 struct Base {
     bool explicitly_destroy = false, destroyed = false;
+    bool in_destructor = false;
     std::shared_ptr<Context> main_context;
     virtual ~Base() noexcept(false) = default;
     virtual void destroy() = 0;
@@ -478,13 +479,117 @@ int main() {
         source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + destructor + cases
         run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'), headers=CANN_HEADERS)
 
+    def test_non_ep_buffer_destroy_reports_failure_and_retries_locally(self):
+        buffers = ROOT / 'csrc/buffers'
+        base = (buffers / 'base.hpp').read_text()
+        context = (ROOT / 'csrc/kernels/comm/api.hpp').read_text()
+        barrier = (ROOT / 'csrc/comm/barrier.hpp').read_text()
+        headers = {
+            'base.inc': base[base.index('class BufferBase'):base.index('    void print_memory_usage')] + '};',
+            'context.inc': context[context.index('    void check_available()'):context.index('\n};')],
+            'drain.inc': barrier[barrier.index('inline void Context::drain_for_destroy'):barrier.index('}  // namespace')],
+        }
+        for name in ('PP', 'Engram', 'Bucket'):
+            body = (buffers / f'{name.lower()}.hpp').read_text()
+            start = body.index(f'    ~{name}Buffer()')
+            end = body.index('\n    }', body.index('    void destroy() override', start)) + len('\n    }')
+            headers[f'{name}.inc'] = body[start:end]
+        run_host_cpp(r'''
+#include <cassert>
+#include <cstdio>
+#include <memory>
+#include <stdexcept>
+#include <string_view>
+#include <vector>
+#define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while (false)
+namespace torch { struct Tensor {}; }
+namespace comm {
+struct Resource {
+    static inline int destructor_errors = 0;
+    bool fail = false;
+    void close() { if (fail) throw std::runtime_error("device free"); }
+    ~Resource() noexcept { try { close(); } catch (...) { ++destructor_errors; } }
+};
+struct Context {
+    std::shared_ptr<Resource> hccl_context = std::make_shared<Resource>();
+    std::shared_ptr<Resource> symmetric_memory = std::make_shared<Resource>();
+    bool finalized = false;
+    int barriers = 0;
+#include "context.inc"
+};
+void barrier(Context& context, bool sync) {
+    context.check_available();
+    assert(sync);
+    ++context.barriers;
+}
+#include "drain.inc"
+}
+#include "base.inc"
+struct SingleBuffer : BufferBase {
+    using BufferBase::BufferBase;
+    std::shared_ptr<comm::Context> context = std::make_shared<comm::Context>();
+    auto groups() const { return std::vector{context}; }
+};
+struct PPBuffer : SingleBuffer {
+    PPBuffer(bool explicit_destroy) : SingleBuffer(explicit_destroy) {}
+    torch::Tensor storage;
+#include "PP.inc"
+};
+struct EngramBuffer : SingleBuffer {
+    EngramBuffer(bool explicit_destroy) : SingleBuffer(explicit_destroy) {}
+#include "Engram.inc"
+};
+struct BucketBuffer : BufferBase {
+    BucketBuffer(bool explicit_destroy) : BufferBase(explicit_destroy) {}
+    std::vector<std::shared_ptr<comm::Context>> contexts{
+        std::make_shared<comm::Context>(), std::make_shared<comm::Context>(), std::make_shared<comm::Context>()};
+    auto groups() const { return contexts; }
+    torch::Tensor storage;
+#include "Bucket.inc"
+};
+
+template <class Buffer> void check_destroy() {
+    Buffer buffer(true);
+    auto groups = buffer.groups();
+    const auto& failed_group = groups[groups.size() / 2];
+    failed_group->symmetric_memory->fail = true;
+    try {
+        buffer.destroy();
+        assert(false);
+    } catch (const std::runtime_error& e) {
+        assert(std::string_view(e.what()) == "device free");
+    }
+    for (const auto& group : groups) {
+        try { comm::barrier(*group, true); assert(false); } catch (const std::runtime_error&) {}
+        assert(group->barriers == 1);
+    }
+    failed_group->symmetric_memory->fail = false;
+    buffer.destroy();
+    for (const auto& group : groups)
+        assert(group->barriers == 1 && !group->hccl_context && !group->symmetric_memory);
+
+    const auto before = comm::Resource::destructor_errors;
+    {
+        Buffer automatic(false);
+        automatic.groups().front()->symmetric_memory->fail = true;
+    }
+    assert(comm::Resource::destructor_errors == before + 1);
+}
+int main() {
+    check_destroy<PPBuffer>();
+    check_destroy<EngramBuffer>();
+    check_destroy<BucketBuffer>();
+}
+''', headers=headers)
+
     def test_group_topology_and_transport_limits(self):
         source = (ROOT / 'tests/ep/decode_topology_host_test.cpp').read_text()
         hccl = (ROOT / 'csrc/kernels/comm/hccl.hpp').read_text()
         context = (ROOT / 'csrc/kernels/comm/api.hpp').read_text()
         headers = {'gather_listen_ports.inc': hccl[hccl.index('    std::vector<uint16_t> gather_listen_ports('):
                                                     hccl.index('    void wait_for_channels(')],
-                   'finalize.inc': context[context.index('    void finalize()'):context.index('\n};')]}
+                   'finalize.inc': context[context.index('    void finalize()'):context.index('\n};')],
+                   'close.inc': hccl[hccl.index('    void close()'):hccl.index('    ~HCCLContext()')]}
         run_host_cpp(source, include_dirs=(ROOT,), headers=headers)
 
 

@@ -108,20 +108,25 @@ struct HCCLContext {
 
     void close() {
         // TODO: do we have to destroy the connections as well?
+        // HCOMM can consume handles before returning an error. Never resubmit those handles.
+        HCOMM_CHECK(close_status);
         if (jetty_device_ptrs != nullptr) {
             ACL_CHECK(aclrtFree(jetty_device_ptrs));
             jetty_device_ptrs = nullptr;
         }
         if (not channel_handles.empty()) {
-            HCOMM_CHECK(HcommChannelDestroy(channel_handles.data(), static_cast<uint32_t>(channel_handles.size())));
+            close_status = HcommChannelDestroy(channel_handles.data(), static_cast<uint32_t>(channel_handles.size()));
+            HCOMM_CHECK(close_status);
             channel_handles.clear();
         }
         while (not jetty_endpoints.empty()) {
             if (jetty_mem_handles.size() == jetty_endpoints.size()) {
-                HCOMM_CHECK(HcommMemUnreg(jetty_endpoints.back(), jetty_mem_handles.back()));
+                close_status = HcommMemUnreg(jetty_endpoints.back(), jetty_mem_handles.back());
+                HCOMM_CHECK(close_status);
                 jetty_mem_handles.pop_back();
             }
-            HCOMM_CHECK(HcommEndpointDestroy(jetty_endpoints.back()));
+            close_status = HcommEndpointDestroy(jetty_endpoints.back());
+            HCOMM_CHECK(close_status);
             jetty_endpoints.pop_back();
         }
         memory.reset();
@@ -139,6 +144,7 @@ struct HCCLContext {
     }
 
 private:
+    HcommResult close_status = 0;
     std::vector<HcommMemHandle> jetty_mem_handles;
     // HCOMM shallow-copies channelName pointers; keep channel_names until channel destruction.
     std::vector<std::string> channel_names;

@@ -100,7 +100,7 @@ public:
             low_latency_state->record_completion(false);
             ACL_CHECK(aclrtHostUnregister(host_workspace));
             ACL_CHECK(aclrtFreeHost(host_workspace));
-            context->finalize_ep();
+            context->finalize();
             lb_storage = torch::Tensor();
             destroyed = true;
         } catch (...) {

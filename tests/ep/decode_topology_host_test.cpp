@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -69,7 +70,21 @@ aclrtStream getCurrentNPUStream() { return 2; }
 
 #define ACL_CHECK(op) do { if (op) throw std::runtime_error("ACL"); } while (false)
 #define HCCL_CHECK(op) do { if (op) throw std::runtime_error("HCCL"); } while (false)
+#define HCOMM_CHECK(op) do { if (op) throw std::runtime_error("HCOMM"); } while (false)
 #define EP_HOST_ASSERT(op) assert(op)
+
+static int failing_channel = 0;
+static std::vector<int> destroyed_channels;
+int HcommChannelDestroy(const int* channels, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        if (channels[i] == failing_channel)
+            return 1;
+        destroyed_channels.push_back(channels[i]);
+    }
+    return 0;
+}
+int HcommMemUnreg(int, int) { return 0; }
+int HcommEndpointDestroy(int) { return 0; }
 
 namespace deep_ep {
 struct TestContext {
@@ -79,18 +94,22 @@ struct TestContext {
 };
 
 struct TestMemory {
-    void close() { assert(!closed); closed = true; }
-    bool closed = false;
+    static inline int closes = 0;
+    bool close_fails = false;
+    void close() {
+        if (close_fails)
+            throw std::runtime_error("memory close");
+        ++closes;
+    }
 };
 
 struct TestHCCLContext {
     std::shared_ptr<TestMemory> memory;
-    bool close_fails = false;
-    void close() {
-        if (close_fails)
-            throw std::runtime_error("close");
-        memory.reset();
-    }
+    int close_status = 0;
+    void* buffer = nullptr;
+    void* jetty_device_ptrs = nullptr;
+    std::vector<int> channel_handles, jetty_endpoints, jetty_mem_handles;
+#include "close.inc"
 };
 
 struct SharedContext {
@@ -107,27 +126,54 @@ int main() {
         first.symmetric_memory = second.symmetric_memory = std::make_shared<deep_ep::TestMemory>();
         first.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(first.symmetric_memory);
         second.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(second.symmetric_memory);
-        auto retained_registration = first.hccl_context;
         std::weak_ptr<deep_ep::TestMemory> window = first.symmetric_memory;
-        first.finalize_ep();
-        second.finalize_ep();
-        assert(first.finalized && second.finalized);
-        assert(retained_registration->memory && !retained_registration->memory->closed);
+        const int closes_before = deep_ep::TestMemory::closes;
+        first.finalize();
+        assert(!window.expired() && deep_ep::TestMemory::closes == closes_before);
+        second.finalize();
+        assert(window.expired() && deep_ep::TestMemory::closes == closes_before + 1);
+    }
+    {
+        deep_ep::SharedContext context;
+        context.symmetric_memory = std::make_shared<deep_ep::TestMemory>();
+        context.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(context.symmetric_memory);
+        auto retained_registration = context.hccl_context;
+        std::weak_ptr<deep_ep::TestMemory> window = context.symmetric_memory;
+        const int closes_before = deep_ep::TestMemory::closes;
+        context.finalize();
+        assert(retained_registration->memory && deep_ep::TestMemory::closes == closes_before);
         retained_registration.reset();
         assert(window.expired());
     }
-    for (bool ep : {false, true}) {
+    for (bool fail_channel : {false, true}) {
         deep_ep::SharedContext context;
         context.symmetric_memory = std::make_shared<deep_ep::TestMemory>();
-        context.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(context.symmetric_memory, true);
-        if (ep) {
-            try { context.finalize_ep(); assert(false); }
-            catch (const std::runtime_error& e) { assert(std::strcmp(e.what(), "close") == 0); }
-            assert(context.finalized && context.hccl_context && context.symmetric_memory);
-        } else {
+        context.symmetric_memory->close_fails = !fail_channel;
+        context.hccl_context = std::make_shared<deep_ep::TestHCCLContext>(context.symmetric_memory);
+        context.hccl_context->channel_handles = {1, 2, 3};
+        destroyed_channels.clear();
+        failing_channel = fail_channel ? 2 : 0;
+        const int closes_before = deep_ep::TestMemory::closes;
+        try {
             context.finalize();
-            assert(context.finalized && !context.hccl_context && !context.symmetric_memory);
+            assert(false);
+        } catch (const std::runtime_error& e) {
+            assert(std::strcmp(e.what(), fail_channel ? "HCOMM" : "memory close") == 0);
         }
+        assert(context.symmetric_memory && deep_ep::TestMemory::closes == closes_before);
+        assert(destroyed_channels.size() == (fail_channel ? 1u : 3u));
+        failing_channel = 0;
+        if (fail_channel) {
+            try { context.finalize(); assert(false); }
+            catch (const std::runtime_error& e) { assert(std::strcmp(e.what(), "HCOMM") == 0); }
+            assert(destroyed_channels == std::vector<int>({1}));
+            assert(context.hccl_context && context.symmetric_memory);
+            continue;
+        }
+        context.symmetric_memory->close_fails = false;
+        context.finalize();
+        assert(destroyed_channels == std::vector<int>({1, 2, 3}));
+        assert(!context.hccl_context && !context.symmetric_memory && deep_ep::TestMemory::closes == closes_before + 1);
     }
     using Location = DecodeTopology::ServerLocation;
     enum LocType { ENDPOINT_LOC_TYPE_DEVICE, ENDPOINT_LOC_TYPE_HOST };

@@ -48,8 +48,8 @@ public:
 
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
-        comm::barrier(*context, true);
-        context->finalize();
+        context->drain_for_destroy();
+        context->finalize(not in_destructor);
         storage = torch::Tensor();
         context = nullptr;
         destroyed = true;
@@ -57,6 +57,7 @@ public:
 
     void send(const torch::Tensor& x, const int& dst_rank_idx, const int& num_sms) const {
         EP_HOST_ASSERT(not destroyed);
+        context->check_available();
         EP_HOST_ASSERT(num_max_pp_tensor_bytes > 0 and num_max_pp_inflight_tensors > 0);
         EP_HOST_ASSERT(x.device().type() == TORCH_DEVICE_NPU and x.is_contiguous() and x.nbytes() > 0 and x.nbytes() <= num_max_pp_tensor_bytes);
         EP_HOST_ASSERT(dst_rank_idx == prev_rank_idx or dst_rank_idx == next_rank_idx);
@@ -74,6 +75,7 @@ public:
 
     void recv(const torch::Tensor& x, const int& src_rank_idx, const int& num_sms) const {
         EP_HOST_ASSERT(not destroyed);
+        context->check_available();
         EP_HOST_ASSERT(num_max_pp_tensor_bytes > 0 and num_max_pp_inflight_tensors > 0);
         EP_HOST_ASSERT(x.device().type() == TORCH_DEVICE_NPU and x.is_contiguous() and x.nbytes() > 0 and x.nbytes() <= num_max_pp_tensor_bytes);
         EP_HOST_ASSERT(src_rank_idx == prev_rank_idx or src_rank_idx == next_rank_idx);

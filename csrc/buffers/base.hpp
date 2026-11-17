@@ -12,12 +12,14 @@ class BufferBase {
 protected:
     bool explicitly_destroy;
     bool destroyed = false;
+    bool in_destructor = false;
 
     explicit BufferBase(const bool& explicitly_destroy): explicitly_destroy(explicitly_destroy) {}
 
     // Called from the derived destructor, while its members and destroy() implementation are still available.
     void destroy_on_destruction(const char* name) {
         if (not explicitly_destroy and not destroyed) {
+            in_destructor = true;
             destroy();
             main_context = nullptr;
         }
