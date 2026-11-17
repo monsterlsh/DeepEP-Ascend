@@ -48,8 +48,8 @@ public:
 
     void destroy() override {
         EP_HOST_ASSERT(not destroyed);
-        context->drain_for_destroy();
-        context->finalize(not in_destructor);
+        comm::barrier(*context, true);
+        context->finalize();
         context = nullptr;
         destroyed = true;
     }
@@ -140,7 +140,6 @@ public:
     fetch(const torch::Tensor& indices, const int& num_qps,
           const bool& use_tma_aligned_col_major_sf) const {
         EP_HOST_ASSERT(not destroyed and num_qps == 0);
-        context->check_available();
         EP_HOST_ASSERT(indices.dim() == 3);
         const auto use_fp8 = num_engram_sf_packs > 0;
         const auto fetched_dtype = use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16;

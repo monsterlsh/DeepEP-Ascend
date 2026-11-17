@@ -101,10 +101,8 @@ public:
         EP_HOST_ASSERT(not finalized);
     }
 
-    void drain_for_destroy();
-
     void finalize() {
-        finalize(true);
+        finalize(false);
     }
 
     void finalize(bool report_cleanup_errors) {

@@ -6,8 +6,6 @@
 
 ## Performance
 
-The following prefill measurements predate the [capacity-based decode implementation](#capacity-based-ep-dispatch-and-combine).
-
 Measured on Ascend 950DT NPUs with CANN 9.2.0 and the manually configured PoC HDK described under [Recommended HDK and firmware](#recommended-hdk-and-firmware). All measurements use netlayer 1, the supernode's external Clos network.
 
 The following runs use 16,384 tokens/rank capacity, hidden size 7168, top-6 routing over 256 experts, 32 AI cores / 64 AIVs, expert alignment 128 and no bias. Dispatch uses FP8 with row-major scales; combine uses BF16. Each rank uses 10 warmups and 50 samples with cache flushing.
@@ -30,18 +28,12 @@ Bandwidth ranges cover all ranks, using timings that include issue and drain but
 - Ascend 950 (A5) with UBMEM connectivity and UBC_CTP/URMA channels between the participating ranks.
 - An even number of ranks for multi-rank communication.
 - CANN with Ascend C, the Bisheng compiler, HCCL and HCOMM headers/libraries.
-- Python 3.10 or newer, matching CPU-build PyTorch/`torch_npu` packages, and NumPy for the tests.
-- A C++20 compiler and standard library supporting `std::format`. For GCC/libstdc++, use GCC 13 or newer with matching development headers and runtime libraries ([GCC 13 release notes](https://gcc.gnu.org/gcc-13/changes.html)).
-- elfutils development headers, including `elfutils/libdwfl.h`, for DeepJIT's host-side exception handling.
+- Python 3.10 or newer, a matching PyTorch/`torch_npu` installation, and NumPy for the tests.
+- A C++20 compiler and standard library supporting `std::format`.
 
 The validated stack is Ascend 950DT, CANN 9.2.0, Python 3.12, PyTorch 2.13.0+cpu and torch_npu 2.13.0rc1, with the PoC HDK configuration described below. Kernel support on other Ascend generations or CANN versions has not been established by these measurements.
 
 Installation builds the host extension; device kernels are compiled on first use. Keep the CANN toolkit and Bisheng available at runtime. Set `ASCEND_HOME_PATH` to the active CANN installation, or use `ASCEND_TOOLKIT_HOME`.
-
-Use the CPU build of PyTorch with `torch_npu`. In the Python 3.11 build check,
-PyTorch `2.12.0+cu130` and `torch_npu 2.12.0.post1` failed during import because
-both registered the same allocator configuration keys. Using `2.12.0+cpu`
-resolved that failure; disabling backend autoload alone did not.
 
 ### Recommended HDK and firmware
 
@@ -50,29 +42,6 @@ Use Huawei's Q3 commercial HDK release for Atlas 850E when it becomes publicly a
 The performance results in this README were collected using a PoC HDK supplied to DeepSeek, with additional manual configuration. That configuration is not a publicly distributed release. Users on earlier PoC versions may observe lower bandwidth and should first check their HDK version and configuration. Use the Q3 commercial release, once available, as the recommended public deployment baseline; these measurements are not results from that unreleased commercial version.
 
 ### Installation
-
-Install the elfutils development packages in the host or container where you build the extension. On Ubuntu/Debian:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y libdw-dev libelf-dev
-```
-
-On openEuler/Fedora/RHEL, use the corresponding packages:
-
-```bash
-sudo dnf install -y elfutils-devel elfutils-libelf-devel
-```
-
-On openEuler 24.03 LTS SP4, enable [GCC Toolset 14](https://docs.openeuler.org/zh/docs/25.03/server/development/gcc/gcc-14-secondary-version-compilation-toolchain-user-guide.html) for C++20 `<format>` support. The C++ package in the [SP4 aarch64 repository](https://repo.openeuler.org/openEuler-24.03-LTS-SP4/everything/aarch64/Packages/) is named `gcc-toolset-14-gcc-c++`:
-
-```bash
-sudo dnf install -y gcc-toolset-14-gcc gcc-toolset-14-gcc-c++ \
-    gcc-toolset-14-binutils gcc-toolset-14-libstdc++-devel
-source /opt/openEuler/gcc-toolset-14/enable
-export CC=/opt/openEuler/gcc-toolset-14/root/usr/bin/gcc
-export CXX=/opt/openEuler/gcc-toolset-14/root/usr/bin/g++
-```
 
 Activate the CANN environment and install the matching PyTorch/`torch_npu` packages first, then:
 
@@ -94,15 +63,16 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP8 dispatch and BF16 combine, FP16 dispatch/combine at capacities up to 16, cached handles, deterministic layouts, expert padding, deferred epilogues and native MTE transport with optional cross-server deduplication |
+| `EPBuffer` | Expanded BF16/FP8 dispatch, BF16 combine, cached handles, deterministic layouts, expert padding and deferred epilogues |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
 | `BufferAllocator`, `BufferBase`, `deep_ep.comm` | Allocation planning, buffer lifecycle, communicator queries, barriers and stream access |
 
-An HCOMM cleanup error can leave channels or endpoint memory registrations active.
-When the destructor reports that it retained registered resources, the affected
-window and registration data remain allocated until the process exits.
+`EPBuffer` automatically selects the decode path for `1 ≤ num_max_tokens_per_rank ≤ 16`, using MTE when supported.
+At these capacities, dispatch and combine also support FP16, and FP8 dispatch accepts FP32 or packed INT32 scales.
+For these formats, the dispatch input row size must be a multiple of 32 bytes (256 bytes with `do_zero_padding=True`).
+FP16 combine requires a hidden size divisible by 128.
 
 PP, Engram and Bucket are experimental; remaining work is listed under [Ongoing](#ongoing). EP requires `do_expand=True` and `allow_multiple_reduction=True`; `do_handle_copy` must remain `False`.
 
@@ -123,6 +93,7 @@ Hybrid communication, CPU-backed Engram storage and graph capture remain unsuppo
 ### Buffer initialization
 
 Create one long-lived buffer per EP group and reuse it across layers or microbatches. All ranks must agree on the token capacity. Complete outstanding operations before resizing, reusing or destroying a buffer.
+Use the same DeepEP build on all ranks in the group.
 
 ```python
 import torch
@@ -148,7 +119,8 @@ buffer = EPBuffer(
 )
 ```
 
-Use `EPBuffer.get_buffer_size_hint()` to check capacity when managing a buffer pool. Call `buffer.destroy()` on all ranks before tearing down the process group.
+Use `EPBuffer.get_buffer_size_hint()` to check capacity when managing a buffer pool. After all uses and their waits have finished, call `buffer.destroy()` before tearing down the process group.
+If an EP operation fails after communication has been submitted, or `buffer.destroy()` reports a cleanup error, restart the distributed job.
 
 ### Dispatch and combine
 
@@ -157,7 +129,7 @@ Training, prefill and decoding use the same `EPBuffer` dispatch and combine APIs
 ```python
 def dispatch_forward(buffer, x, topk_idx, topk_weights, num_experts,
                      expert_alignment=1, do_cpu_sync=True):
-    """Route BF16, FP16 or FP8 inputs to their selected experts."""
+    """Route BF16 or FP8 inputs to their selected experts."""
     return buffer.dispatch(
         x,
         topk_idx=topk_idx,
@@ -185,7 +157,7 @@ def dispatch_backward(buffer, grad_recv_x, grad_recv_weights, handle, bias=None)
 
 
 def combine_forward(buffer, expert_output, handle, bias=None):
-    """Reduce BF16 or FP16 expert outputs back to their original ranks."""
+    """Reduce BF16 expert outputs back to their original ranks."""
     return buffer.combine(
         expert_output,
         handle=handle,
@@ -229,97 +201,6 @@ output, _ = pending.wait()
 ```
 
 Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on their returned events in the same way. See [EP tests](tests/ep/test_ep.py) for complete examples.
-
-## Capacity-based EP dispatch and combine
-
-The effective `M = num_max_tokens_per_rank` selects the complete dispatch and combine implementation.
-Fresh dispatch uses its explicit capacity or the buffer default. Cached dispatch and combine use the
-capacity saved in the originating handle. All ranks use the same `M`, and their local token counts may
-range from zero to `M`.
-
-| Capacity per rank | Fresh dispatch, cached dispatch and combine |
-|---|---|
-| `1 ≤ M ≤ 16` | Decode implementation, including FP16 and extended FP8 scale formats. |
-| `M > 16` | Original implementation from main, including BF16 and native FP8 dispatch and BF16 combine. |
-
-For BF16 H7168/K6/E384 and alignment 128, the EP64 combine measurement at `M=16` was
-55.479 µs on `7004d16` and 53.774 µs on `main@4dfccac` (+3.17%).
-
-Decode FP16 dispatch requires `H` to be a multiple of 16 so the routing metadata starts
-on a 32-byte boundary. For decode FP8 dispatch with FP32 or packed INT32 scales, the hidden
-row must also be a multiple of 32 bytes so both ends of the transfer use the same scale offset.
-
-Within the decode implementation, dispatch and combine select MTE automatically when their
-device and launch requirements are met. Other supported decode configurations use URMA
-internally, including for decode-specific formats such as FP16. Both transports respect the
-buffer's configured device timeout. The MTE requirements are:
-
-- Ascend950DT_9582 on A5, 32 AI cores (64 vector cores) and 216 KiB of UB per vector core.
-- EP2, EP4, EP8, EP16, EP32, EP64 or EP128.
-- BF16/FP16 activations with `H` divisible by 128, or FP8 E4M3 with `H` divisible by 256.
-  FP8 dispatch carries native 16-bit scale packs, FP32 scales per 128 channels, or INT32 words
-  containing four E8M0 scales per 128 channels. The returned scales preserve their dtype and bits.
-- `1 ≤ K ≤ min(E, 32)`, `E ≤ 512`, and `E` evenly divisible by the EP group size. Dispatch
-  checks its UB stages. Combine checks its issue and reduction rings. This covers H7168/K6/E384,
-  as well as H7168/K8/E128. Alignment, host count sync, padding and epilogue scheduling
-  keep their usual expanded dispatch semantics. With `deterministic=True`, the dispatch
-  epilogue sorts the received rows within each expert for both MTE and URMA.
-- The expert computation applies the routing weight once to each selected expert output.
-  Combine sums BF16 or FP16 expert rows. Its optional `topk_weights` argument restores the
-  weights in their original routing slots. Bias is applied by the reduce epilogue.
-
-Dispatch writes each token into the destination rank's registered EP communication buffer.
-The native copy epilogue and cached handle use the same token layout as URMA.
-All ranks use the same H/K/E, capacity, payload dtype and scale format. Use distinct expert
-IDs within each token's top-k selection, as returned by `torch.topk`. Masked slots may
-contain `-1`. With `L = E / world` local experts, a token contributes at most one row to
-any expert and at most `min(K, L)` rows to a rank. A fresh dispatch without host count
-synchronization reserves `world × M × min(K, L)` rows plus alignment space. Synchronized
-dispatch uses the actual aligned expert counts, and cached dispatch reuses its handle's size.
-
-During buffer construction, EP obtains server locations from the registered HCCL endpoints.
-EP ranks may be interleaved. When the group lacks complete location information, dispatch
-uses direct transfers. With a multi-server group containing a shared server,
-dispatch sends the full packet once per remote server and its other recipients fetch it within that server.
-Combine always sends each expert rank's partial directly to the token owner when using MTE.
-The owner applies biases and reduces rank partials in the same routing-slot order as URMA.
-Each contributing rank returns its own optional weights directly to the corresponding slots.
-
-Dispatch relay descriptors occupy reserved space in the existing registered EP workspace.
-Use the same DeepEP build on all ranks. During multi-rank EP buffer construction,
-a one-word AllGather checks that peers support the topology exchange. Mixing this build
-with `main@4dfccac` fails at this check. Compatible ranks then exchange their ports,
-server locations and device capabilities together.
-Dispatch and combine select their transport from this group configuration and the shared launch
-geometry. Use the same vector core count, fresh/cached mode and barrier placement on all ranks.
-Empty ranks participate in the collective. Local token count, statistics, bias and deferred
-execution do not enter transport selection. Graph capture remains unsupported. Parameter validation
-errors detected on all ranks before submission can be corrected and retried on the same buffer.
-If a rank has already entered the collective, a lone rank cannot retry it. When a submission fails
-and work may still be outstanding, restart the distributed job. Releasing the failed buffer retains
-its registered memory and outstanding URMA sources until process exit. Explicit destruction reports the failure to the caller.
-
-Dispatch and combine both use the communication buffer allocated by `EPBuffer` and registered
-with HCCL. Keep the returned event and call `event.current_stream_wait()` to run its deferred
-epilogue before reusing or destroying the buffer.
-If a call with `M > 16` does not request an event or defer its epilogue,
-establish a stream dependency yourself before reusing that buffer on another stream. For example,
-record an event on the producer stream immediately after the call and wait on it in the consumer stream.
-
-For decode calls that return routing weights, pass the `recv_weights` from
-`EPBuffer.dispatch` to `EPBuffer.combine` as `topk_weights`. Combine returns
-these weights in the original token order. The expert computation applies the
-weights to its outputs once, as in [Dispatch and combine](#dispatch-and-combine).
-To compare decode correctness and latency with main, run the same EP test on each build.
-Set `--num-tokens` to the per-rank capacity you want to measure.
-The stock benchmark labels the communication-kernel time `urma:` for both transports.
-Use the JIT specialization names (`dispatch_mte`, `dispatch_mte_relay`, `combine_mte`)
-to confirm which MTE kernels were selected.
-
-```bash
-python tests/ep/test_ep.py --num-processes 8 --num-ai-cores 32 \
-    --num-tokens 16 --hidden 7168 --num-topk 6 --num-experts 384 --dispatch-dtype bf16
-```
 
 ## Other buffer interfaces
 

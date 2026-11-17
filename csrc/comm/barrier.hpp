@@ -32,12 +32,4 @@ static void barrier(const Context& context, const bool& with_cpu_sync = false,
     }
 }
 
-inline void Context::drain_for_destroy() {
-    // Peers may have already finished destroy() when local cleanup is retried.
-    if (not finalized) {
-        barrier(*this, true);
-        finalized = true;
-    }
-}
-
 }  // namespace deep_ep::comm
