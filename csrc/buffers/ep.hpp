@@ -61,7 +61,6 @@ public:
         EP_HOST_ASSERT(num_lb_buffer_bytes >= 0 and num_lb_buffer_bytes % kNumAllocationAlignmentBytes == 0);
         EP_HOST_ASSERT(num_buffer_bytes <= std::numeric_limits<int64_t>::max() - num_lb_buffer_bytes);
         const auto arena_bytes = num_buffer_bytes + num_lb_buffer_bytes;
-        EP_HOST_ASSERT(num_cpu_timeout_secs > 0 and num_gpu_timeout_secs > 0);
         EP_HOST_ASSERT(arena_bytes <= std::numeric_limits<int64_t>::max() -
                        static_cast<int64_t>(sizeof(layout::EPSignals)));
         auto topology = EPLowLatencyState::local_topology(num_ranks);
@@ -507,7 +506,8 @@ public:
 
         // Defer epilogue and host sync
         if (defer_epilogue) {
-            std::function<pybind11::object()> epilogue_hook = std::move(epilogue);
+            std::function<pybind11::object()> epilogue_hook =
+                EPLowLatencyState::make_deferred_epilogue(std::move(epilogue));
             return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(epilogue_hook));
         }
 
@@ -696,7 +696,8 @@ public:
 
         // Defer epilogue
         if (defer_epilogue) {
-            std::function<pybind11::object()> epilogue_hook = std::move(epilogue);
+            std::function<pybind11::object()> epilogue_hook =
+                EPLowLatencyState::make_deferred_epilogue(std::move(epilogue));
             return pybind11::make_tuple(pybind11::none(), EventHandle(), std::move(epilogue_hook));
         }
 

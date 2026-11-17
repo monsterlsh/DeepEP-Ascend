@@ -13,6 +13,7 @@ CANN_HEADERS = {'simt_api/device_warp_functions.h': '#pragma once\n',
 def host_test_source():
     prefix = r"""
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,7 @@ def host_test_source():
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #define ACL_CHECK(op) do { if (op) throw std::runtime_error("capture"); } while(false)
 #define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while(false)
@@ -255,6 +257,30 @@ void check_events() {
     state.prepare();
     assert(mock::events.size() == event_count + 2);
 }
+void check_deferred_epilogue_retry() {
+    EPLowLatencyState state;
+    initialize(state, Context{});
+    auto submit = [&]() -> std::function<void()> {
+        state.prepare();
+        state.submission_guard().begin_submission();
+        return EPLowLatencyState::make_deferred_epilogue([&] {
+            auto guard = state.epilogue_guard(true);
+            state.record_completion(true);
+        });
+    };
+
+    auto first = submit();
+    auto retry_first = first;
+    rejects([&] {
+        first();
+        throw std::runtime_error("Python postprocessing failed");
+    }, "postprocessing failed");
+    auto second = submit();
+    rejects(retry_first, "already");
+    rejects([&] { state.prepare(); }, "outstanding");
+    second();
+    state.prepare();
+}
 void submit_dispatch(EPLowLatencyState& state, EPKernelMode mode, int vec_cores, int64_t timeout_cycles) {
     auto guard = state.submission_guard();
     launch_ep_dispatch(mode, [&] { guard.begin_submission(); }, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -345,6 +371,7 @@ void check_resource_lifetime() {
 int main() {
     check_admission();
     check_events();
+    check_deferred_epilogue_retry();
     check_invalid_core_count_retry();
     check_gpu_timeouts();
     check_failures();

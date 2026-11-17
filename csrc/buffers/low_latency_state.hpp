@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 #include <acl/acl.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
@@ -95,6 +97,15 @@ public:
             }
         }
     };
+
+    static auto make_deferred_epilogue(auto epilogue) {
+        // Copies of the returned hook belong to the same submission.
+        return [epilogue = std::move(epilogue), consumed = std::make_shared<std::atomic_bool>(false)] {
+            const bool already_called = consumed->exchange(true);
+            EP_HOST_ASSERT(not already_called and "Deferred EP epilogue was already called");
+            return epilogue();
+        };
+    }
 
     FailureGuard epilogue_guard(bool deferred) {
         // The caller can hold the callback beyond the lifetime of the buffer.
