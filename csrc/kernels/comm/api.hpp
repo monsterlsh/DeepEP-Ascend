@@ -35,7 +35,7 @@ public:
             const int64_t& num_workspace_bytes, const int64_t& num_gpu_buffer_bytes,
             const int64_t& num_rdma_storage_bytes, const bool& use_huge1g_page,
             const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
-            const std::shared_ptr<Context>& main_context = nullptr):
+            const std::shared_ptr<Context>& main_context = nullptr, DecodeTopology* decode_topology = nullptr):
         rank_idx(rank_idx), num_ranks(num_ranks),
         num_cpu_timeout_secs(num_cpu_timeout_secs),
         num_gpu_timeout_cycles(static_cast<int64_t>(num_gpu_timeout_secs) * kNumSystemCyclesPerSecond),
@@ -55,7 +55,7 @@ public:
         hccl_context = std::make_shared<HCCLContext>(
             hccl_group_name, rank_idx, num_ranks, num_bytes, runtime->get_num_vec_cores(),
             num_cpu_timeout_secs, use_huge1g_page,
-            main_context == nullptr ? nullptr : main_context->symmetric_memory);
+            main_context == nullptr ? nullptr : main_context->symmetric_memory, decode_topology);
         symmetric_memory = hccl_context->memory;
         workspace = symmetric_memory->ptr;
         EP_HOST_ASSERT(reinterpret_cast<uintptr_t>(workspace) % kNumAllocationAlignmentBytes == 0);
@@ -94,6 +94,10 @@ public:
 
     void finalize() {
         EP_HOST_ASSERT(not finalized);
+        // Surface release errors here, while the caller can still handle them.
+        hccl_context->close();
+        if (symmetric_memory.use_count() == 1)
+            symmetric_memory->close();
         hccl_context.reset();
         symmetric_memory.reset();
         finalized = true;

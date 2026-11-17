@@ -7,63 +7,138 @@ from _host_test_helpers import ROOT, run_host_cpp
 
 class CombineNativeHostTests(unittest.TestCase):
     def test_kernel_specialization_and_runtime_arguments(self):
-        host = (ROOT / 'csrc/kernels/ep/combine.hpp').read_text()
-        launcher = host[host.index('static void* launch_combine('):
-                        host.index('static void launch_combine_reduce_epilogue(')]
+        # Compile through the public include; replace only the device/runtime dependencies.
+        headers = {f'csrc/kernels/ep/{name}': (ROOT / 'csrc/kernels/ep' / name).read_text()
+                   for name in ('api.hpp', 'dispatch.hpp', 'combine.hpp', 'kernel_mode.hpp')}
+        headers.update({name: '#pragma once' for name in ('csrc/runtime/jit.hpp', 'deep_ep/layout/ep/token.hpp',
+                                                          'deep_ep/common/exception.hpp', 'deep_ep/common/math.hpp')})
         run_host_cpp(r'''
 #include <cassert>
 #include <cstdint>
 #include <format>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 #define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::invalid_argument(#cond); } while (false)
+namespace deep_ep {
+using sf_pack_t = uint32_t;
+constexpr int kNumVectorRegisterBytes = 256;
+namespace layout { struct TokenLayout { TokenLayout(int, int, int, bool=true) {} }; }
 struct Config { int num_blocks, num_ubuf_bytes; };
 struct RecordingJit {
     std::string name, source;
-    void *buffer, *send_buffer;
-    int rank, launches = 0;
+    void *buffer = nullptr, *send_buffer = nullptr, *scratch = nullptr;
+    const int* server_ids = nullptr;
+    int rank = -1, launches = 0, argument_count = 0;
+    bool reject_geometry = false;
     int compile(std::string kernel, std::string code) {
+        if (reject_geometry) throw std::runtime_error("unsupported specialization");
         name = kernel;
         source = code;
         return 1;
     }
-    void launch(int, Config, void*, void*, void*, void*, void* recv, void* send,
-                void*, void*, int current_rank, const int* servers, void* scratch) {
-        assert((servers != nullptr) == (scratch != nullptr));
-        buffer = recv;
-        send_buffer = send;
-        rank = current_rank;
+    template<class... Args>
+    void launch(int, Config, Args... args) {
+        auto values = std::tuple{args...};
+        argument_count = sizeof...(Args);
+        if constexpr (sizeof...(Args) == 9) {
+            buffer = std::get<4>(values);
+            send_buffer = std::get<5>(values);
+            rank = std::get<8>(values);
+        }
+        if constexpr (sizeof...(Args) == 21) {
+            server_ids = std::get<19>(values);
+            scratch = std::get<20>(values);
+        }
         ++launches;
     }
 } recording_jit;
 auto jit = &recording_jit;
-''' + launcher + r'''
+} // namespace deep_ep
+#include "csrc/kernels/ep/api.hpp"
+
 int main() {
-    int recv, send, weights, servers[4]{}, scratch;
-    for (bool direct : {false, true})
+    using namespace deep_ep;
+    static_assert(get_ep_kernel_mode(false, true) == EPKernelMode::Native);
+    static_assert(get_ep_kernel_mode(true, false) == EPKernelMode::DecodeURMA);
+    static_assert(get_ep_kernel_mode(true, true) == EPKernelMode::DecodeMTE);
+    int recv, send, weights, peers, scratch;
+    // Old source calls, including omitted default arguments, still submit main's device ABI.
+    launch_dispatch(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, 4, 5, 16,
+                    8, 3, 1, false, false, 256, 0, 0, 0, 194560, 64, 100);
+    assert(jit->argument_count == 19 && jit->name == "dispatch");
+    assert(jit->source.find("#include <deep_ep/impls/ep/dispatch.hpp>") != std::string::npos);
+    assert(jit->source.find("&dispatch_impl<4, 8, 3, 1, false, false, 64, 256, 0, 16, 194560, 100, false>")
+           != std::string::npos);
+    auto result = launch_combine(nullptr, &weights, nullptr, nullptr, &recv, &send, nullptr, nullptr,
+                                 1, 4, 16, 3, 128, 194560, 64, 100);
+    assert(jit->argument_count == 9 && jit->rank == 1 && result == &recv && jit->buffer == &recv);
+    assert(jit->send_buffer == &send && jit->name == "combine");
+    assert(jit->source.find("#include <deep_ep/impls/ep/combine.hpp>") != std::string::npos);
+    assert(jit->source.find("&combine_impl<4, 3, 128, 16, 64, 100, 194560, false, true>") != std::string::npos);
+    launch_combine_reduce_epilogue(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                   4, 5, 16, 8, 3, 128, 194560, 64, 100);
+    assert(jit->source.find("&combine_reduce_epilogue_impl<4, 8, 3, 128, 16, 194560, 64, 100, true>")
+           != std::string::npos);
+
+    const auto native_launches = jit->launches;
+    int submissions = 0;
+    auto before_launch = [&] { ++submissions; };
+    for (auto mode : {EPKernelMode::Native, EPKernelMode::DecodeURMA, EPKernelMode::DecodeMTE}) {
+        jit->reject_geometry = true;
+        try {
+            launch_ep_combine(mode, before_launch, nullptr, nullptr, false, nullptr, nullptr, &recv, &send,
+                              nullptr, nullptr, 1, 4, 16, 3, 128, 194560, 64, 100);
+            assert(false);
+        } catch (const std::runtime_error&) {
+            assert(submissions == 0 && jit->launches == native_launches);
+        }
+    }
+    jit->reject_geometry = false;
+    for (bool direct : {false, true}) {
+        auto mode = get_ep_kernel_mode(true, direct);
+        for (bool relay : {false, true}) {
+            if (!direct && relay) continue;
+            launch_ep_dispatch(mode, before_launch, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 1, 4, 5, 16,
+                               8, 3, 1, false, false, 256, 0, 0, 0, 194560, 64, 100, false,
+                               relay ? &peers : nullptr, relay ? &scratch : nullptr);
+            assert(jit->argument_count == 21);
+            assert(jit->server_ids == (relay ? &peers : nullptr) && jit->scratch == (relay ? &scratch : nullptr));
+            assert(jit->name == (relay ? "dispatch_mte_relay" : direct ? "dispatch_mte" : "dispatch"));
+            assert(jit->source.find("#include <deep_ep/impls/ep/decode/dispatch.hpp>") != std::string::npos);
+            auto suffix = std::format("100, false, {}, {}>", direct, relay);
+            assert(jit->source.find(suffix) != std::string::npos);
+        }
         for (bool barrier : {false, true})
             for (bool weighted : {false, true})
-              for (bool fp16 : {false, true})
-                for (bool relay : {false, true}) {
-                if (relay && !direct) continue;
-                auto staging = direct ? nullptr : &send;
-                const int before = jit->launches;
-                auto result = launch_combine(nullptr, weighted ? &weights : nullptr, nullptr,
-                    nullptr, &recv, staging, nullptr, nullptr, 1, 4, 16, 3, 128,
-                    194560, 64, 100, barrier, direct, fp16, relay ? servers : nullptr, relay ? &scratch : nullptr);
-                assert(result == &recv && jit->buffer == &recv && jit->send_buffer == staging);
-                assert(jit->rank == 1 && jit->launches == before + 1);
-                assert(jit->name == (relay ? "combine_mte_relay" : direct ? "combine_mte" : "combine"));
-                auto specialization = std::format("combine_impl<4, 3, 128, 16, 64, 100, 194560, {}, {}, {}, {}, {}>",
-                                                  barrier, weighted, direct, fp16 ? "half" : "bfloat16_t", relay);
-                assert(jit->source.find(specialization) != std::string::npos);
-            }
+                for (bool fp16 : {false, true}) {
+                    auto staging = direct ? nullptr : &send;
+                    // A defined zero-row weight input may have a null address.
+                    auto result = launch_ep_combine(mode, before_launch, nullptr, nullptr, weighted, nullptr,
+                        nullptr, &recv, staging, nullptr, nullptr, 1, 4, 16, 3, 128,
+                        194560, 64, 100, barrier, fp16);
+                    assert(result == &recv && jit->buffer == &recv && jit->send_buffer == staging);
+                    assert(jit->rank == 1 && submissions == jit->launches - native_launches);
+                    assert(jit->name == (direct ? "combine_mte" : "combine"));
+                    auto specialization = std::format("&deep_ep::decode::combine_impl<4, 3, 128, 16, 64, 100, 194560, {}, {}, {}, {}>",
+                                                      barrier, weighted, direct, fp16 ? "half" : "bfloat16_t");
+                    assert(jit->source.find(specialization) != std::string::npos);
+                }
+    }
+    for (bool direct : {false, true}) {
+        launch_ep_combine_reduce_epilogue(get_ep_kernel_mode(true, direct), nullptr, nullptr, nullptr,
+            nullptr, nullptr, nullptr, nullptr, nullptr, 4, 5, 16, 8, 3, 128, 194560, 64, 100, true, true);
+        assert(jit->source.find("#include <deep_ep/impls/ep/decode/combine_reduce_epilogue.hpp>") != std::string::npos);
+        assert(jit->source.find(std::format("100, true, 256, half, {}>", direct)) != std::string::npos);
+    }
 }
-''')
+''', headers=headers)
 
     def test_local_and_remote_return_slots(self):
-        device = (ROOT / 'deep_ep/include/deep_ep/impls/ep/combine.hpp').read_text()
+        device = (ROOT / 'deep_ep/include/deep_ep/impls/ep/decode/combine.hpp').read_text()
         addressing = device[device.index('        auto task_recv_buffer ='):
                             device.index('            const auto output_addr =')]
         run_host_cpp(r'''
@@ -71,7 +146,6 @@ int main() {
 #include <cstdint>
 
 #define __gm__
-namespace AscendC { void WriteGmByPassDCache(int* ptr, int value) { *ptr = value; } }
 namespace layout {
 struct CommonSignals { uint8_t* native[4]; };
 uint8_t* get_sym_ptr(const CommonSignals& signals, uint8_t* local, int peer) {
@@ -83,8 +157,6 @@ uint8_t* get_sym_ptr(const CommonSignals& signals, uint8_t* local, int peer) {
 template <bool kLowLatencyTransport, int kNumTopk>
 void check_slot(int owner, layout::CommonSignals native,
                 uint8_t* combine_recv_buffer, uint8_t* send_buffer, uint8_t* expected) {
-    constexpr bool kDomainRelay = false;
-    struct { uint8_t* partials; int* masters; } scratch{};
     constexpr int rank_idx = 1, kNumRanks = 4, kNumMaxTokensPerRank = 4;
     constexpr int kNumVecCores = 2, kNumTokenBytes = 32;
     struct { layout::CommonSignals common_signals; } signals{native};

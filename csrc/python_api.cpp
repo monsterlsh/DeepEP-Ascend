@@ -31,8 +31,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     base::register_apis(m);
 
     py::class_<EPBuffer, BufferBase>(m, "EPBuffer")
-        .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool>())
-        .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool, int64_t>())
+        .def(py::init<int, int, std::string, int64_t, int64_t, bool, int, int, bool, bool>(),
+             py::arg("rank_idx"), py::arg("num_ranks"), py::arg("hccl_group_name"),
+             py::arg("num_buffer_bytes"), py::arg("num_lb_buffer_bytes"), py::arg("use_huge1g_page"),
+             py::arg("num_cpu_timeout_secs"), py::arg("num_gpu_timeout_secs"), py::arg("explicitly_destroy"),
+             py::arg("deterministic") = false)
         .def_readonly("context", &EPBuffer::context)
         .def_readonly("lb_storage", &EPBuffer::lb_storage)
         .def("lb_prefetch_weights", &EPBuffer::lb_prefetch_weights)
@@ -48,13 +51,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
              py::arg("num_ai_cores"), py::arg("previous_event"), py::arg("async_with_compute_stream"),
              py::arg("allocate_on_comm_stream"), py::arg("do_handle_copy"), py::arg("do_cpu_sync"),
              py::arg("do_expand"), py::arg("do_zero_padding"), py::arg("use_cube_aligned_col_major_sf"),
-             py::arg("defer_epilogue"), py::arg("decode_handle") = false)
+             py::arg("defer_epilogue"))
         .def("combine", &EPBuffer::combine,
              py::arg("x"), py::arg("topk_weights"), py::arg("bias_0"), py::arg("bias_1"),
              py::arg("src_metadata"), py::arg("combined_topk_idx"), py::arg("psum_num_recv_tokens_per_rank"),
              py::arg("num_experts"), py::arg("num_max_tokens_per_rank"), py::arg("num_sms"),
              py::arg("previous_event"), py::arg("async_with_compute_stream"), py::arg("allocate_on_comm_stream"),
-             py::arg("defer_epilogue"), py::arg("decode_handle") = false);
+             py::arg("defer_epilogue"));
 
     py::class_<PPBuffer, BufferBase>(m, "PPBuffer")
         .def(py::init<int, int, std::string, int64_t, int, bool, int, bool>())
@@ -79,11 +82,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("all_gather", &BucketBuffer::all_gather);
 
     m.def("calculate_ep_buffer_size", &EPBuffer::calculate_buffer_size);
-    // Local resource admission for the compatibility profiler. Group agreement is still required.
-    m.def("_decode_shape_supported", [](int world, int capacity, int hidden, int topk, int experts, int sf_words) {
-        return get_dispatch_low_latency_plan(runtime->get_npu_arch(), world, capacity, hidden, topk, experts,
-            runtime->get_num_vec_cores(), runtime->get_num_ubuf_bytes_per_vec_core(), sf_words).has_value();
-    });
     m.def("get_num_allocation_alignment", []() {
         return kNumAllocationAlignmentBytes;
     });

@@ -1,25 +1,25 @@
 #pragma once
 
-#include <charconv>
 #include <cstdlib>
 #include <cstring>
 
 #include <deep_ep/impls/ep/combine_layout.hpp>
 #include <deep_ep/impls/ep/dispatch_direct_layout.hpp>
+#include <deep_ep/layout/ep/workspace.hpp>
 
 namespace deep_ep {
 
 constexpr int kMaxDecodeRanks = 128;
-constexpr int kMaxDecodeCapacity = 256;
+constexpr int kMaxDecodeCapacity = layout::kDecodeCapacity;
 
 // M is the common per-rank slot capacity used to address each peer's communication buffer.
-constexpr bool is_decode_capacity(int num_ranks, int capacity) {
-    return num_ranks > 1 and num_ranks <= kMaxDecodeRanks and math::is_power_of_2(num_ranks) and
-           capacity >= 1 and capacity <= kMaxDecodeCapacity;
+constexpr bool use_decode_implementation(int capacity) {
+    return capacity >= 1 and capacity <= kMaxDecodeCapacity;
 }
 
-constexpr bool is_decode_batch(int batch, int capacity) {
-    return batch > 0 and batch <= capacity;
+constexpr bool is_decode_capacity(int num_ranks, int capacity) {
+    return num_ranks > 1 and num_ranks <= kMaxDecodeRanks and math::is_power_of_2(num_ranks) and
+           use_decode_implementation(capacity);
 }
 
 constexpr bool is_decode_geometry(int num_ranks, int capacity, int hidden, int num_topk, int num_experts) {
@@ -41,19 +41,6 @@ constexpr bool is_decode_shape(int num_ranks, int capacity, int hidden, int num_
     const auto reduce_slots = get_combine_hidden_slots(num_ub_bytes, hidden_bytes + get_combine_weight_bytes(num_topk));
     return num_topk <= get_combine_hidden_slots(issue_bytes, hidden_bytes) and
            math::min(num_ranks, num_topk) + 2 <= reduce_slots;
-}
-
-// An explicit combine limit can narrow the decode capacity range.
-inline int mte_bs_threshold_override() {
-    const auto value = std::getenv("EP_MTE_BS_THRESHOLD");
-    if (value == nullptr or *value == '\0')
-        return -1;
-    const auto end = value + std::strlen(value);
-    int threshold = -1;
-    const auto result = std::from_chars(value, end, threshold);
-    if (result.ec != std::errc{} or result.ptr != end or threshold < -1)
-        return -1;
-    return threshold;
 }
 
 // Diagnostic escape hatch for comparing the same public API against its original

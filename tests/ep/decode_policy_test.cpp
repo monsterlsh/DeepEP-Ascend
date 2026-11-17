@@ -33,60 +33,20 @@ void check_workspace_size() {
 
 }  // namespace
 
-using deep_ep::mte_bs_threshold_override;
-
-static void set_threshold_override(const char* value) {
-#ifdef _WIN32
-    const auto status = _putenv_s("EP_MTE_BS_THRESHOLD", value == nullptr ? "" : value);
-#else
-    const auto status = value == nullptr ? unsetenv("EP_MTE_BS_THRESHOLD") :
-                                          setenv("EP_MTE_BS_THRESHOLD", value, 1);
-#endif
-    assert(status == 0);
-}
-
-static void test_override_parsing() {
-    struct Case {
-        const char* value;
-        int expected;
-    };
-    const Case cases[] = {
-        {nullptr, -1}, {"", -1}, {"-1", -1}, {"0", 0}, {"16", 16}, {"0016", 16},
-        {"256", 256}, {"2147483647", std::numeric_limits<int>::max()},
-        {"-2", -1}, {"invalid", -1}, {"16tail", -1}, {" 16", -1}, {"16 ", -1},
-        {"+16", -1}, {"0x10", -1}, {"1e2", -1}, {"2147483648", -1},
-        {"99999999999999999999999999999999999999", -1},
-    };
-    for (const auto& test: cases) {
-        set_threshold_override(test.value);
-        assert(mte_bs_threshold_override() == test.expected);
-    }
-}
-
-
 int main() {
     using namespace deep_ep;
-    test_override_parsing();
-    set_threshold_override(nullptr);
-    assert(mte_bs_threshold_override() == -1);
     for (int ep = -1; ep <= 256; ++ep) {
         for (int m = -1; m <= 513; ++m) {
             const bool in_grid = (ep == 2 || ep == 4 || ep == 8 || ep == 16 ||
-                                  ep == 32 || ep == 64 || ep == 128) && m >= 1 && m <= 256;
+                                  ep == 32 || ep == 64 || ep == 128) && m >= 1 && m <= 16;
+            assert(use_decode_implementation(m) == (m >= 1 && m <= 16));
             assert(is_decode_capacity(ep, m) == in_grid);
             assert(is_decode_shape(ep, m, 7168, 8, 128, 64, 221184, false) == in_grid);
-            const auto plan = get_dispatch_low_latency_plan(3510, ep, m, 7168, 8, 128, 64, 221184, 0);
-            assert(bool(plan) == in_grid);
-            if (plan)
-                assert(plan->buffer_bytes == int64_t(ep) * m * (14336 + 128));
+            assert(supports_dispatch_mte(3510, ep, m, 7168, 8, 128, 64, 221184, 0) == in_grid);
         }
     }
-    for (int m = 1; m <= 256; ++m) {
-        for (int b = -1; b <= m + 1; ++b)
-            assert(is_decode_batch(b, m) == (b >= 1 && b <= m));
-    }
     const auto plan = [](int arch, int h, int k, int e, int cores, int ub, int sf_words) {
-        return get_dispatch_low_latency_plan(arch, 8, 64, h, k, e, cores, ub, sf_words);
+        return supports_dispatch_mte(arch, 8, 16, h, k, e, cores, ub, sf_words);
     };
     assert(!plan(2201, 7168, 8, 128, 64, 221184, 0));
     assert(plan(3510, 4096, 8, 128, 64, 221184, 0));
@@ -96,8 +56,7 @@ int main() {
     assert(!plan(3510, 7168, 8, 128, 64, 221183, 0));
     assert(!plan(3510, 7168, 8, 128, 64, 221185, 0));
     for (int ranks : {8, 16, 32, 64, 128}) {
-        const auto model = get_dispatch_low_latency_plan(3510, ranks, 256, 7168, 6, 384, 64, 221184, 112);
-        assert(model && model->buffer_bytes == int64_t(ranks) * 256 * (7168 + 224 + 96));
+        assert(supports_dispatch_mte(3510, ranks, 16, 7168, 6, 384, 64, 221184, 112));
     }
     assert(plan(3510, 384, 8, 128, 64, 221184, 0));
     assert(!plan(3510, 384, 8, 128, 64, 221184, 6));  // FP8 zero padding is one 256-byte vector
@@ -114,22 +73,20 @@ int main() {
     // EP32 needs 34 reduction slots, exceeding the 32 available mutex IDs.
     assert(plan(3510, 2048, 32, 512, 64, 221184, 0));
     assert(!plan(3510, 4096, 32, 512, 64, 221184, 0));
-    assert(!is_decode_shape(32, 64, 2048, 32, 512, 64, 221184, false));
+    assert(!is_decode_shape(32, 16, 2048, 32, 512, 64, 221184, false));
     assert(!plan(3510, 2048, 33, 512, 64, 221184, 0));
     assert(!plan(3510, std::numeric_limits<int>::max() - 127, 8, 128, 64, 221184, 0));
     check_workspace_size<128, 2, 1, 8>();
     check_workspace_size<128, 128, 4, 8>();
     check_workspace_size<384, 64, 4, 6>();
-    // All six lanes of every token may route to one expert. Only the wire
-    // packet is deduplicated. Each lane keeps a separate expanded slot.
-    constexpr auto rows = get_dispatch_max_expert_rows(128, 256, 6);
-    static_assert(rows == 196608);
-    static_assert(get_dispatch_max_expanded_rows(rows, 3, 1) == rows);
-    static_assert(get_dispatch_max_expanded_rows(rows, 3, 128) == 196992);
-    // Reduction and slot counts must remain in range even for generic URMA.
-    static_assert(get_dispatch_max_expert_rows(128, 16383, 8) <= kDispatchReductionMaxValue);
-    static_assert(get_dispatch_max_expert_rows(128, 16384, 8) > kDispatchReductionMaxValue);
-    static_assert(get_dispatch_max_expanded_rows(1, 2, 1 << 30) > std::numeric_limits<int>::max());
+    // EP128, E384, K6: each token can select at most three local experts.
+    constexpr auto rows = get_dispatch_max_expert_rows(128, 256);
+    static_assert(get_dispatch_max_expanded_rows(rows, 6, 3, 128) == 98688);
+    static_assert(get_dispatch_max_expanded_rows(rows, 2, 3, 1) == rows * 2);
+    static_assert(get_dispatch_max_expert_rows(128, 16384) == 2097152);
+    static_assert(get_dispatch_max_expert_rows(128, 131071) <= kDispatchReductionMaxValue);
+    static_assert(get_dispatch_max_expert_rows(128, 131072) > kDispatchReductionMaxValue);
+    static_assert(get_dispatch_max_expanded_rows(1, 1, 2, 1 << 30) > std::numeric_limits<int>::max());
     const auto routing = get_dispatch_routing_workspace_bytes(8, 128, 4, 8);
     assert(!dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128 - 1, false));
     assert(dispatch_direct_ub_fits(routing, 4, 14336, 0, 8, routing + 14336 + 4 * 128, false));

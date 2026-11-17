@@ -7,6 +7,7 @@
 #include <deep_ep/common/math.hpp>
 
 #include "../../runtime/jit.hpp"
+#include "kernel_mode.hpp"
 
 namespace deep_ep {
 
@@ -15,6 +16,85 @@ static layout::TokenLayout get_dispatch_token_layout(const int& num_hidden_bytes
                                                      const int& num_topk) {
     return layout::TokenLayout(
         num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk);
+}
+
+static void launch_ep_dispatch(EPKernelMode mode, auto&& before_launch,
+                               void* x, void* sf,
+                               void* topk_idx, void* topk_weights,
+                               void* metadata_send_buffer,
+                               void* cumulative_local_expert_recv_stats,
+                               void* psum_num_recv_tokens_per_rank,
+                               void* psum_num_recv_tokens_per_expert,
+                               void* num_unaligned_recv_tokens_per_expert,
+                               void* dst_buffer_slot_idx, void* dst_gsge_idx,
+                               void* buffer, void* workspace, void* host_workspace,
+                               void* jetty_ptrs,
+                               const int& rank_idx, const int& num_ranks,
+                               const int& num_tokens, const int& num_max_tokens_per_rank,
+                               const int& num_experts, const int& num_topk,
+                               const int& expert_alignment,
+                               const bool& cached_mode,
+                               const bool& do_cpu_sync,
+                               const int& num_hidden_bytes,
+                               const int& num_sf_packs,
+                               const int& sf_token_stride,
+                               const int& sf_hidden_stride,
+                               const int& num_ub_bytes,
+                               const int& num_vec_cores,
+                               const int64_t& num_timeout_cycles,
+                               const bool& do_barrier = false,
+                               const int* server_ids = nullptr, void* relay_scratch = nullptr) {
+    // Calculate configs
+    EP_HOST_ASSERT(num_vec_cores > 0);
+    EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
+    EP_HOST_ASSERT(num_hidden_bytes > 0);
+    EP_HOST_ASSERT(num_ub_bytes > 0);
+    EP_HOST_ASSERT(16 <= num_vec_cores);
+
+    const bool native = mode == EPKernelMode::Native;
+    const bool mte = mode == EPKernelMode::DecodeMTE;
+    const bool relay = server_ids != nullptr;
+    EP_HOST_ASSERT(not relay or (mte and relay_scratch != nullptr));
+    const auto name = relay ? "dispatch_mte_relay" : mte ? "dispatch_mte" : "dispatch";
+    const auto decode_args = native ? std::string{} : std::format(", {}, {}", mte, relay);
+    const auto kernel = jit->compile(name, std::format(R"(
+#include <deep_ep/impls/ep/{}dispatch.hpp>
+
+using namespace deep_ep;
+
+static void __instantiate_kernel() {{
+    auto ptr = reinterpret_cast<void*>(&{}dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>);
+}}
+)", native ? "" : "decode/", native ? "" : "deep_ep::decode::",
+        num_ranks, num_experts, num_topk,
+        expert_alignment, cached_mode, do_cpu_sync,
+        num_vec_cores,
+        num_hidden_bytes, num_sf_packs, num_max_tokens_per_rank, num_ub_bytes,
+        num_timeout_cycles, do_barrier, decode_args));
+
+    // The native device ABI ends at sf_hidden_stride. Only decode kernels take relay pointers.
+    auto launch = [&](auto... relay_args) {
+        jit->launch(
+            kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
+            x, sf,
+            topk_idx, topk_weights,
+            metadata_send_buffer,
+            cumulative_local_expert_recv_stats,
+            psum_num_recv_tokens_per_rank,
+            psum_num_recv_tokens_per_expert,
+            num_unaligned_recv_tokens_per_expert,
+            dst_buffer_slot_idx, dst_gsge_idx,
+            buffer, workspace, host_workspace,
+            jetty_ptrs,
+            rank_idx,
+            num_tokens,
+            sf_token_stride, sf_hidden_stride, relay_args...);
+    };
+    before_launch();
+    if (native)
+        launch();
+    else
+        launch(server_ids, relay_scratch);
 }
 
 static void launch_dispatch(void* x, void* sf,
@@ -40,49 +120,15 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_ub_bytes,
                             const int& num_vec_cores,
                             const int64_t& num_timeout_cycles,
-                            const bool& do_barrier = false,
-                            const bool& low_latency_transport = false,
-                            const int* server_ids = nullptr, void* relay_scratch = nullptr) {
-    // Calculate configs
-    EP_HOST_ASSERT(num_vec_cores > 0);
-    EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
-    EP_HOST_ASSERT(num_hidden_bytes > 0);
-    EP_HOST_ASSERT(num_ub_bytes > 0);
-    EP_HOST_ASSERT(16 <= num_vec_cores);
-
-    // Compile
-    const bool server_relay = server_ids != nullptr;
-    EP_HOST_ASSERT(not server_relay or (low_latency_transport and relay_scratch != nullptr));
-    const auto kernel = jit->compile(server_relay ? "dispatch_mte_relay" : low_latency_transport ? "dispatch_mte" : "dispatch", std::format(R"(
-#include <deep_ep/impls/ep/dispatch.hpp>
-
-using namespace deep_ep;
-
-static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
-}}
-)", num_ranks, num_experts, num_topk,
-        expert_alignment, cached_mode, do_cpu_sync,
-        num_vec_cores,
-        num_hidden_bytes, num_sf_packs, num_max_tokens_per_rank, num_ub_bytes,
-        num_timeout_cycles, do_barrier, low_latency_transport, server_relay));
-
-    // Launch
-    jit->launch(
-        kernel, {.num_blocks = num_vec_cores, .num_ubuf_bytes = num_ub_bytes},
-        x, sf,
-        topk_idx, topk_weights,
-        metadata_send_buffer,
-        cumulative_local_expert_recv_stats,
-        psum_num_recv_tokens_per_rank,
-        psum_num_recv_tokens_per_expert,
-        num_unaligned_recv_tokens_per_expert,
-        dst_buffer_slot_idx, dst_gsge_idx,
-        buffer, workspace, host_workspace,
-        jetty_ptrs,
-        rank_idx,
-        num_tokens,
-        sf_token_stride, sf_hidden_stride, server_ids, relay_scratch);
+                            const bool& do_barrier = false) {
+    launch_ep_dispatch(EPKernelMode::Native, [] {}, x, sf, topk_idx, topk_weights,
+                       metadata_send_buffer, cumulative_local_expert_recv_stats,
+                       psum_num_recv_tokens_per_rank, psum_num_recv_tokens_per_expert,
+                       num_unaligned_recv_tokens_per_expert, dst_buffer_slot_idx, dst_gsge_idx,
+                       buffer, workspace, host_workspace, jetty_ptrs, rank_idx, num_ranks,
+                       num_tokens, num_max_tokens_per_rank, num_experts, num_topk, expert_alignment,
+                       cached_mode, do_cpu_sync, num_hidden_bytes, num_sf_packs, sf_token_stride,
+                       sf_hidden_stride, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier);
 }
 
 static void launch_dispatch_copy_epilogue(void* buffer,

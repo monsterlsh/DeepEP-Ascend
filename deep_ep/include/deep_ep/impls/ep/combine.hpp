@@ -4,8 +4,6 @@
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/comm/handle.hpp>
 #include <deep_ep/impls/ep/combine_utils.hpp>
-#include <deep_ep/impls/ep/combine_layout.hpp>
-#include <deep_ep/impls/ep/combine_relay.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
 #include <deep_ep/common/bitset.hpp>
 #include <deep_ep/common/exception.hpp>
@@ -24,18 +22,13 @@ struct CombineTask {
     int32_t rank_slot_idx;
 };
 
-template <int kNumRanks, int kNumTopk, int kHidden, int kNumTokensPerTask, int kNumStages, int kNumUbBytes,
-          bool kLowLatencyTransport = false, typename element_t = bfloat16_t>
+template <int kNumRanks, int kNumTopk, int kHidden, int kNumTokensPerTask, int kNumStages, int kNumUbBytes>
 struct CombineUBLayout {
     static constexpr int kNumMetadataElems = kNumTopk + 2;
+    static constexpr int kNumUbMetadataElems = math::max(warpSize, kNumMetadataElems + 1);
     static constexpr int kNumHiddenBytes = kHidden * sizeof(bfloat16_t);
-    static constexpr int kNumTopkWeightBytes = get_combine_weight_bytes(kNumTopk);
+    static constexpr int kNumTopkWeightBytes = math::align<int>(kNumTopk * sizeof(float), kNumUbAlignmentBytes);
     static constexpr int kNumTopkWeightElems = kNumTopkWeightBytes / sizeof(float);
-    static constexpr int kNumBaseMetadataElems = math::max(warpSize, kNumMetadataElems + 1);
-    static constexpr int kNumSlotsMetadataIdx = kNumBaseMetadataElems - 1;
-    static constexpr int kNumUbWeightOffset = math::align<int>(kNumBaseMetadataElems, kNumUbAlignmentBytes / sizeof(int));
-    static constexpr int kNumUbMetadataElems = kLowLatencyTransport ?
-        kNumUbWeightOffset + kNumTopkWeightElems : kNumBaseMetadataElems;
     static constexpr int kNumTokenBytes = kNumHiddenBytes + kNumTopkWeightBytes;
     static constexpr int kNumWQEBBWords = handle::kNumWQEBBBytes / sizeof(uint64_t);
     static constexpr int kNumWQEBBsPerToken = math::ceil_div<int>(sizeof(AscendC::HcommUrmaSqeCtx) + 2 * sizeof(AscendC::HcommUrmaSgeCtx), handle::kNumWQEBBBytes);
@@ -55,16 +48,15 @@ struct CombineUBLayout {
         2 * math::align(kNumRanks * static_cast<int>(sizeof(int)), kNumUbAlignmentBytes) +
         math::align(kNumStages * kNumTokensPerTask * kNumUbMetadataElems * static_cast<int>(sizeof(int)), kNumUbAlignmentBytes);
     static constexpr int kNumAvailableHiddenBytes = math::max(0, math::align<int, false>(kNumUbBytes, kNumUbAlignmentBytes) - kNumFixedBytes);
-    static constexpr int kNumHiddenRingSlots = get_combine_hidden_slots(kNumAvailableHiddenBytes, kNumHiddenBytes);
-    using Element = element_t;
-    using HiddenReducer = RingReducer<kHidden, kNumTopk, kNumHiddenRingSlots, 0, 0, element_t>;
+    static constexpr int kNumHiddenRingSlots = math::min(32, kNumAvailableHiddenBytes / kNumHiddenBytes);
+    using HiddenReducer = RingReducer<kHidden, kNumTopk, kNumHiddenRingSlots>;
     alignas(kNumUbAlignmentBytes) typename HiddenReducer::Buffer hidden;
 };
 
 template <int kNumRanks, int kNumTopk, int kNumMaxTokensPerRank, int kNumVecCores,
-          int kNumTokensPerTask, typename ub_layout_t, bool kHasTopkWeights, bool kLowLatencyTransport>
+          int kNumTokensPerTask, typename ub_layout_t, bool kHasTopkWeights>
 __simt_vf__ __aicore__ __launch_bounds__(kNumTokensPerTask * warpSize) void load_meta_issue_wqe(
-        __ubuf__ ub_layout_t* ub, __gm__ const int* src_metadata, __gm__ const typename ub_layout_t::Element* x, __gm__ uint8_t* send_buffer, __gm__ uint8_t* combine_recv_buffer, __gm__ const uint32_t* topk_weights,
+        __ubuf__ ub_layout_t* ub, __gm__ const int* src_metadata, __gm__ const bfloat16_t* x, __gm__ uint8_t* send_buffer, __gm__ uint8_t* combine_recv_buffer, __gm__ const uint32_t* topk_weights,
         const uint64_t combine_recv_buffer_offset, const CombineTask task, const uint32_t task_sqebb_idx,
         const int stage_idx, const int rank_idx, const bool issue_wqe) {
     EP_STATIC_ASSERT(kNumTopk > 0 and kNumTopk <= warpSize);
@@ -93,7 +85,7 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumTokensPerTask * warpSize) void load
         ub->metadata[stage_idx][token_idx][packed_idx] = slot_idx;
     }
     if (lane_idx == 0)
-        ub->metadata[stage_idx][token_idx][ub_layout_t::kNumSlotsMetadataIdx] = num_slots;
+        ub->metadata[stage_idx][token_idx][ub_layout_t::kNumUbMetadataElems - 1] = num_slots;
 
     const auto src_token_global_idx = asc_shfl(metadata_value, kNumTopk % warpSize);
     const auto master_topk_idx = asc_shfl(metadata_value, (kNumTopk + 1) % warpSize);
@@ -102,20 +94,14 @@ __simt_vf__ __aicore__ __launch_bounds__(kNumTokensPerTask * warpSize) void load
     if constexpr (kHasTopkWeights) {
         if (valid_token and lane_idx < ub_layout_t::kNumTopkWeightElems) {
             const auto weight = lane_idx < kNumTopk and slot_idx >= 0 ? topk_weights[slot_idx] : 0;
-            if constexpr (kLowLatencyTransport) {
-                const auto weights = reinterpret_cast<__ubuf__ uint32_t*>(
-                    ub->metadata[stage_idx][token_idx] + ub_layout_t::kNumUbWeightOffset);
-                weights[lane_idx] = weight;
-            } else {
-                const auto is_local = task.rank_idx == rank_idx;
-                const auto slot_group_idx = kNumRanks < kNumTopk ? rank_idx : master_topk_idx;
-                const auto src_token_idx = src_token_global_idx - rank_idx * kNumMaxTokensPerRank;
-                const auto local_slot_idx = static_cast<int64_t>(slot_group_idx) * kNumMaxTokensPerRank + src_token_idx;
-                const auto remote_slot_idx = static_cast<int64_t>(task.rank_slot_idx) + token_idx * kNumVecCores;
-                const auto dst = (is_local ? combine_recv_buffer : send_buffer) +
-                    (is_local ? local_slot_idx : remote_slot_idx) * ub_layout_t::kNumTokenBytes + ub_layout_t::kNumHiddenBytes;
-                asc_stcg(reinterpret_cast<__gm__ uint32_t*>(dst) + lane_idx, weight);
-            }
+            const auto is_local = task.rank_idx == rank_idx;
+            const auto slot_group_idx = kNumRanks < kNumTopk ? rank_idx : master_topk_idx;
+            const auto src_token_idx = src_token_global_idx - rank_idx * kNumMaxTokensPerRank;
+            const auto local_slot_idx = static_cast<int64_t>(slot_group_idx) * kNumMaxTokensPerRank + src_token_idx;
+            const auto remote_slot_idx = static_cast<int64_t>(task.rank_slot_idx) + token_idx * kNumVecCores;
+            const auto dst = (is_local ? combine_recv_buffer : send_buffer) +
+                (is_local ? local_slot_idx : remote_slot_idx) * ub_layout_t::kNumTokenBytes + ub_layout_t::kNumHiddenBytes;
+            asc_stcg(reinterpret_cast<__gm__ uint32_t*>(dst) + lane_idx, weight);
         }
     }
 
@@ -174,30 +160,24 @@ void load_combine_peers(__ubuf__ handle::HcommPeerInfo* peers, __gm__ void* jett
 
 template <int kNumRanks, int kNumTopk, int kHidden, int kNumMaxTokensPerRank, int kNumVecCores,
           int64_t kNumTimeoutCycles, int kNumUbBytes,
-          bool kDoBarrier = false, bool kHasTopkWeights = true, bool kLowLatencyTransport = false,
-          typename element_t = bfloat16_t, bool kDomainRelay = false>
-__global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_weights, __gm__ int* src_metadata,
+          bool kDoBarrier = false, bool kHasTopkWeights = true>
+__global__ __vector__ void combine_impl(__gm__ bfloat16_t* x, __gm__ float* topk_weights, __gm__ int* src_metadata,
                                         __gm__ int* psum_num_recv_tokens_per_rank, __gm__ uint8_t* combine_recv_buffer,
                                         __gm__ uint8_t* send_buffer, __gm__ void* workspace, __gm__ void* jetty_ptrs,
-                                        const int rank_idx, __gm__ const int* server_ids, __gm__ void* relay_scratch) {
+                                        const int rank_idx) {
     AscendC::InitSocState();
 
-    constexpr auto kNumTokensPerTask = kCombineTokensPerTask;
-    constexpr auto kNumStages = kCombineStages;
+    constexpr auto kNumTokensPerTask = 8;
+    constexpr auto kNumStages = 2;
     constexpr auto kNumTasksPerDoorbell = 8;
 
     EP_STATIC_ASSERT(math::is_power_of_2(kNumTasksPerDoorbell));
 
-    using UBLayout = CombineUBLayout<kNumRanks, kNumTopk, kHidden, kNumTokensPerTask, kNumStages, kNumUbBytes,
-                                    kLowLatencyTransport, element_t>;
+    using UBLayout = CombineUBLayout<kNumRanks, kNumTopk, kHidden, kNumTokensPerTask, kNumStages, kNumUbBytes>;
     using HiddenReducer = typename UBLayout::HiddenReducer;
-    EP_STATIC_ASSERT(UBLayout::kNumFixedBytes == get_combine_fixed_bytes(kNumRanks, kNumTopk, kLowLatencyTransport));
     constexpr auto kNumTokenBytes = UBLayout::kNumTokenBytes;
     constexpr auto kNumWQEBBsPerToken = UBLayout::kNumWQEBBsPerToken;
     constexpr auto kNumWQEBBsPerTask = UBLayout::kNumWQEBBsPerTask;
-    constexpr bool kUseRemoteQueue = kNumRanks > 1 and not kLowLatencyTransport;
-    constexpr auto kOutputCacheMode = kLowLatencyTransport ?
-        asc_store_l2_cache_mode::NOTALLOC_CLEAN : asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM;
 
     EP_STATIC_ASSERT(kNumTokensPerTask > 0);
     EP_STATIC_ASSERT(kNumTokensPerTask <= 8);
@@ -209,29 +189,21 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
     // The padded task bound also covers the final alignment NOP WQEs.
     static constexpr int64_t kNumMaxRemoteTasks = static_cast<int64_t>(kNumRanks - 1) *
         math::ceil_div(math::ceil_div(kNumMaxTokensPerRank, kNumVecCores), kNumTokensPerTask);
-    EP_STATIC_ASSERT(kLowLatencyTransport or
-                     kNumMaxRemoteTasks * kNumWQEBBsPerTask + kSQEBBAlignment <= static_cast<int64_t>(UINT16_MAX) + 1,
+    EP_STATIC_ASSERT(kNumMaxRemoteTasks * kNumWQEBBsPerTask + kSQEBBAlignment <= static_cast<int64_t>(UINT16_MAX) + 1,
                      "Combine WQEBBs including task padding and final NOP exceed the 16-bit SQ index range");
 
     const auto topk_weight_u32 = reinterpret_cast<__gm__ uint32_t*>(topk_weights);
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
-    const auto combine_recv_buffer_offset = kUseRemoteQueue ?
-        reinterpret_cast<uint64_t>(combine_recv_buffer) - reinterpret_cast<uint64_t>(workspace) : 0;
+    const auto combine_recv_buffer_offset = reinterpret_cast<uint64_t>(combine_recv_buffer) - reinterpret_cast<uint64_t>(workspace);
     auto& signals = *static_cast<__gm__ layout::EPSignals*>(workspace);
 
     EP_STATIC_ASSERT(sizeof(UBLayout) <= kNumUbBytes, "Combine task stages and hidden ring exceed UB capacity");
     __ubuf__ UBLayout* ub = 0;
 
     comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, false>(signals.common_signals, vec_core_idx);
-    CombineRelayScratch<kNumRanks, kNumMaxTokensPerRank, kNumTokenBytes> scratch(relay_scratch);
-    if constexpr (kDomainRelay) {
-        EP_STATIC_ASSERT(kLowLatencyTransport);
-        scratch.template clear_masters<kNumVecCores>(vec_core_idx);
-        AscendC::SyncAll<true>();
-    }
 
-    handle::HcommJetty jetty(&ub->jetty_info, nullptr, kLowLatencyTransport ? nullptr : jetty_ptrs, vec_core_idx);
-    if constexpr (kUseRemoteQueue) {
+    handle::HcommJetty jetty(&ub->jetty_info, nullptr, jetty_ptrs, vec_core_idx);
+    if constexpr (kNumRanks > 1) {
         asc_vf_call<load_combine_peers<kNumRanks>>(
             dim3(math::align(kNumRanks, warpSize), 1, 1), ub->peer_infos, jetty_ptrs, rank_idx);
         asc_sync_notify(PIPE_V, PIPE_S, EVENT_ID0);
@@ -279,9 +251,9 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
         return CombineTask{task_rank_idx, num_task_tokens, rank_slot_idx};
     };
 
-    const auto sq_base_addr = kUseRemoteQueue ? reinterpret_cast<__gm__ uint8_t*>(ub->jetty_info.sq_base_addr) : nullptr;
-    const auto sq_head = kUseRemoteQueue ? static_cast<uint32_t>(ub->jetty_info.packed_head) : 0;
-    if constexpr (kUseRemoteQueue) {
+    const auto sq_base_addr = kNumRanks > 1 ? reinterpret_cast<__gm__ uint8_t*>(ub->jetty_info.sq_base_addr) : nullptr;
+    const auto sq_head = kNumRanks > 1 ? static_cast<uint32_t>(ub->jetty_info.packed_head) : 0;
+    if constexpr (kNumRanks > 1) {
         EP_DEVICE_ASSERT(sq_head % kSQEBBAlignment == 0);
         EP_DEVICE_ASSERT(num_remote_tasks == 0 or
                          static_cast<int64_t>(num_remote_tasks) * kNumWQEBBsPerTask + kSQEBBAlignment <= handle::kSQDepth);
@@ -294,11 +266,11 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
         if (task_idx >= num_total_tasks)
             return;
         const auto task = get_task();
-        const auto issue_wqe = not kLowLatencyTransport and task.rank_idx != rank_idx;
+        const auto issue_wqe = task.rank_idx != rank_idx;
         fetched_tasks[stage_idx] = task;
         const auto task_sqebb_idx = next_remote_sqebb_idx;
-        asc_vf_call<load_meta_issue_wqe<kNumRanks, kNumTopk, kNumMaxTokensPerRank, kNumVecCores,
-                                       kNumTokensPerTask, UBLayout, kHasTopkWeights, kLowLatencyTransport>>(
+        asc_vf_call<load_meta_issue_wqe<kNumRanks, kNumTopk, kNumMaxTokensPerRank,
+                                                 kNumVecCores, kNumTokensPerTask, UBLayout, kHasTopkWeights>>(
             dim3(kNumTokensPerTask * warpSize, 1, 1),
             ub, src_metadata, x, send_buffer, combine_recv_buffer, topk_weight_u32,
             combine_recv_buffer_offset, task, task_sqebb_idx, stage_idx, rank_idx, issue_wqe
@@ -321,34 +293,19 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
         const auto current_sq_end = fetched_sq_ends[stage_idx];
         const auto num_stage_tokens = current_task.num_tokens;
         const auto is_local = current_task.rank_idx == rank_idx;
-        const auto event_idx = static_cast<event_t>(stage_idx);
 
-        asc_sync_wait(PIPE_V, PIPE_S, event_idx);
-        if constexpr (kLowLatencyTransport and kHasTopkWeights) {
-            asc_sync_notify(PIPE_V, PIPE_MTE3, event_idx);
-            asc_sync_wait(PIPE_V, PIPE_MTE3, event_idx);
-        }
-        auto task_recv_buffer = combine_recv_buffer;
-        if constexpr (kLowLatencyTransport and not kDomainRelay)
-            task_recv_buffer = layout::get_sym_ptr(signals.common_signals, combine_recv_buffer, current_task.rank_idx);
+        asc_sync_wait(PIPE_V, PIPE_S, static_cast<event_t>(stage_idx));
         for (int token_idx = 0; token_idx < num_stage_tokens; ++ token_idx) {
             const auto meta = ub->metadata[stage_idx][token_idx];
-            __gm__ uint8_t* output;
-            if constexpr (kDomainRelay) {
-                const int global_token = meta[kNumTopk];
-                output = scratch.partials + static_cast<int64_t>(global_token) * kNumTokenBytes;
-                AscendC::WriteGmByPassDCache(scratch.masters + global_token, meta[kNumTopk + 1]);
-            } else if (is_local or kLowLatencyTransport) {
-                const auto src_token_idx = meta[kNumTopk] - current_task.rank_idx * kNumMaxTokensPerRank;
-                const auto subslot_idx = kNumRanks < kNumTopk ? rank_idx : meta[kNumTopk + 1];
-                const auto combine_slot_idx = subslot_idx * kNumMaxTokensPerRank + src_token_idx;
-                output = task_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes;
-            } else {
-                const auto recv_slot_idx = current_task.rank_slot_idx + token_idx * kNumVecCores;
-                output = send_buffer + static_cast<int64_t>(recv_slot_idx) * kNumTokenBytes;
-            }
-            const auto output_addr = reinterpret_cast<__gm__ element_t*>(output);
-            const auto num_slots = meta[UBLayout::kNumSlotsMetadataIdx];
+            const auto recv_slot_idx = current_task.rank_slot_idx + token_idx * kNumVecCores;
+            const auto src_token_idx = meta[kNumTopk] - rank_idx * kNumMaxTokensPerRank;
+            const auto subslot_idx = kNumRanks < kNumTopk ? rank_idx : meta[kNumTopk + 1];
+            const auto combine_slot_idx = subslot_idx * kNumMaxTokensPerRank + src_token_idx;
+            const auto output_addr = is_local ?
+                reinterpret_cast<__gm__ bfloat16_t*>(
+                    combine_recv_buffer + static_cast<int64_t>(combine_slot_idx) * kNumTokenBytes) :
+                reinterpret_cast<__gm__ bfloat16_t*>(send_buffer + static_cast<int64_t>(recv_slot_idx) * kNumTokenBytes);
+            const auto num_slots = meta[UBLayout::kNumUbMetadataElems - 1];
             const auto first_slot_idx = num_slots > 0 ? meta[0] : -1;
             if (num_slots >= 2) {
                 reducer.load_first_2_token(x, meta[0], meta[1], asc_load_l2_cache_mode::NOTALLOC_KEEP);
@@ -356,33 +313,21 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
                     reducer.load_next_token(x + static_cast<int64_t>(meta[slot_idx]) * kHidden,
                                            asc_load_l2_cache_mode::NOTALLOC_KEEP);
             }
-            if ((is_local or kLowLatencyTransport) and num_slots == 1) {
+            if (is_local and num_slots == 1) {
                 reducer.load_next_token(
                     x + static_cast<int64_t>(first_slot_idx) * kHidden, asc_load_l2_cache_mode::NOTALLOC_KEEP);
-                reducer.store_last_token(output_addr, kOutputCacheMode);
+                reducer.store_last_token(output_addr);
             } else if (num_slots > 1) {
                 reducer.reduce(num_slots);
-                reducer.store_last_token(output_addr, kOutputCacheMode);
-            }
-            if constexpr (kLowLatencyTransport and kHasTopkWeights) {
-                asc_copy_ub2gm_align(
-                    output + UBLayout::kNumHiddenBytes,
-                    reinterpret_cast<__ubuf__ uint8_t*>(meta + UBLayout::kNumUbWeightOffset),
-                    1, UBLayout::kNumTopkWeightBytes,
-                    kOutputCacheMode, 0, 0);
+                reducer.store_last_token(output_addr);
             }
         }
 
-        if constexpr (kLowLatencyTransport and kHasTopkWeights) {
-            // MTE3 must finish reading weights before SIMT reuses this metadata stage.
-            asc_sync_notify(PIPE_MTE3, PIPE_V, event_idx);
-            asc_sync_wait(PIPE_MTE3, PIPE_V, event_idx);
-        }
         issue_load_meta_wqe(stage_idx, task_iter_idx + kNumStages);
 
-        if (not kLowLatencyTransport and not is_local and (++ num_issued_remote_tasks % kNumTasksPerDoorbell == 0)) {
-            asc_sync_notify(PIPE_MTE3, PIPE_S, event_idx);
-            asc_sync_wait(PIPE_MTE3, PIPE_S, event_idx);
+        if (not is_local and (++ num_issued_remote_tasks % kNumTasksPerDoorbell == 0)) {
+            asc_sync_notify(PIPE_MTE3, PIPE_S, static_cast<event_t>(stage_idx));
+            asc_sync_wait(PIPE_MTE3, PIPE_S, static_cast<event_t>(stage_idx));
             jetty.set_sq_head(current_sq_end);
             jetty.ring_doorbell();
         }
@@ -394,7 +339,7 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
     asc_sync_wait(PIPE_MTE3, PIPE_S, EVENT_ID0);
 
     // Append a strong-order NOP requesting CQE; the barrier only polls completion.
-    if (not kLowLatencyTransport and num_remote_tasks > 0) {
+    if (num_remote_tasks > 0) {
         const auto final_sqebb_idx = sq_head + num_remote_tokens * kNumWQEBBsPerToken;
         const auto new_head = math::align(final_sqebb_idx + 1, static_cast<uint32_t>(kSQEBBAlignment));
         const auto num_final_wqebbs = new_head - final_sqebb_idx;
@@ -412,21 +357,10 @@ __global__ __vector__ void combine_impl(__gm__ element_t* x, __gm__ float* topk_
         jetty.ring_doorbell();
     }
 
-    // URMA's drain also joins all AIVs. Direct MTE has no drain, so explicitly
-    // join them before core zero advertises this rank's completed remote writes.
-    if constexpr (kDomainRelay) {
-        // All rank partials must be visible before any relay inspects their master slots.
-        comm::scalar::barrier<kNumRanks, kNumTimeoutCycles, true, true, true, kNumVecCores>(
-            signals.common_signals, vec_core_idx);
-        relay_combine_partials<kNumRanks, kNumMaxTokensPerRank, kHidden, kNumTopk,
-                               kNumUbBytes, kNumVecCores, kHasTopkWeights, element_t>(
-            signals.common_signals, server_ids, relay_scratch, combine_recv_buffer, rank_idx, vec_core_idx, ub);
-    }
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, kLowLatencyTransport, true,
-            kNumVecCores, kLowLatencyTransport ? 0 : kNumVecCores>(
-                signals.common_signals, vec_core_idx, kLowLatencyTransport ? nullptr : jetty_ptrs);
+            kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
+                signals.common_signals, vec_core_idx, jetty_ptrs);
 }
 
 } // namespace deep_ep

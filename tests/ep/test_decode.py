@@ -1,143 +1,121 @@
-"""NPU correctness test of EPBuffer dispatch and combine across decode batch changes.
-
-Same node-count WORLD_SIZE / node-index RANK convention as test_ep.py.
-Run on every participating node; do not wrap this mp.spawn launcher in torchrun.
-"""
+"""NPU regressions for empty ranks, deferred combine and decode payload formats."""
 
 import argparse
-from datetime import timedelta
-import os
 
-__test__ = False
+import torch
 
 
-def check_deferred_combine_with_empty_ranks(buffer):
-    import torch
+def tokens(rank, count):
+    # Include a low FP16 mantissa bit that BF16 would discard.
+    rows = torch.arange(count, dtype=torch.float32, device='cpu')[:, None]
+    columns = torch.arange(256, dtype=torch.float32, device='cpu')[None, :]
+    return (1 + (rank % 8) / 16 + rows / 4 + (columns % 4) / 8 + 1 / 1024).half()
 
-    # Empty ranks and nonzero bias exercise the native fallback in a deferred chain.
-    batch = buffer.rank_idx % 3
-    x = torch.full((batch, 7168), 1 + buffer.rank_idx % 7, dtype=torch.bfloat16, device='npu')
-    topk_idx = (torch.arange(8, dtype=torch.int64, device='npu') * 16).repeat(batch, 1)
-    recv, _, _, handle, ready = buffer.dispatch(
-        x, topk_idx=topk_idx, num_experts=128, num_max_tokens_per_rank=2, num_sms=32,
-        do_expand=True, do_cpu_sync=False, async_with_compute_stream=True)
-    ready.wait()
 
-    def submit(offset):
-        return buffer.combine(recv, handle, bias=torch.full_like(x, offset),
-                              async_with_compute_stream=True, defer_epilogue=True)
+def scales(rank, dtype):
+    offsets = torch.arange(4, dtype=torch.int32, device='cpu').reshape(2, 2)
+    if dtype == torch.float32:
+        return (0x3F000001 + rank * 65536 + offsets).view(dtype)
+    # Four finite E8M0 exponent bytes per word.
+    return 0x74757677 + ((rank + offsets) % 8) * 0x01010101
 
-    first = submit(3)
+
+@torch.inference_mode()
+def worker(local_rank, num_processes):
+    import torch.distributed as dist
+    import torch_npu  # Register the NPU backend when autoload is disabled.
+    from deep_ep import EPBuffer
+    from deep_ep.utils.envs import init_dist
+    from test_ep import launch
+
+    rank, world, group = init_dist(local_rank, num_processes)
+    buffer = EPBuffer(group, num_max_tokens_per_rank=17, hidden=256, num_topk=3, explicitly_destroy=True)
+    peer = (rank + 1) % world
+    source = (rank - 1) % world
+    # Both rows go to the next rank, one to each local expert, in expert order.
+    routes = 2 * peer + torch.arange(2, device='npu', dtype=torch.int64)[:, None]
+    options = dict(num_experts=2 * world, num_max_tokens_per_rank=16, do_expand=True,
+                   do_cpu_sync=True, async_with_compute_stream=True)
+
+    batch = 2 * (rank % 2)
+    original = tokens(rank, batch)
+    pending = buffer.dispatch(original.npu(), topk_idx=routes[:batch], defer_epilogue=True, **options)
     consumer = torch.npu.Stream()
     with torch.npu.stream(consumer):
-        first_x, first_weights = first.wait()
-        assert first.wait() is None
-        # Reuse the handle, then finish the second epilogue on the original stream.
-        second = submit(5)
-    # Exercise allocator reuse on the first bias's creation stream before waiting for the consumer.
-    scratch = torch.full_like(x, 91)
-    second_x, second_weights = second.wait()
-    assert first_weights is None and second_weights is None
-    assert second.wait() is None
-    torch.testing.assert_close(first_x.cpu(), x.cpu() * 8 + 3, atol=0, rtol=0)
-    torch.testing.assert_close(second_x.cpu(), x.cpu() * 8 + 5, atol=0, rtol=0)
-    del scratch
+        recv, _, _, handle = pending.wait()
+        combined = buffer.combine(recv, handle, async_with_compute_stream=True, defer_epilogue=True)
+    output, _ = combined.wait()
+    checks = [(recv.cpu(), tokens(source, 2 * (source % 2))), (output.cpu(), original)]
 
+    for dtype in (torch.float32, torch.int32):
+        x = tokens(rank, 2).to(torch.float8_e4m3fn)
+        (values, received_scales), _, _, _, _ = launch(
+            buffer, 'dispatch', 1, x=(x.npu(), scales(rank, dtype).npu()), topk_idx=routes, **options)
+        checks.append((values.cpu(), tokens(source, 2).to(torch.float8_e4m3fn)))
+        checks.append((received_scales.cpu(), scales(source, dtype)))
 
-def worker(local_rank, args):
-    import torch
-    import torch_npu
-    import torch.distributed as dist
-    import deep_ep
-    from ep_reference import agree, make_routes, expert_entries, payload, prepare_experts, expected_combine
+    # Alternate implementations on the same buffer. A cached call inherits its
+    # originating handle's capacity, including when the constructor default differs.
+    x = tokens(rank, 2).bfloat16().npu()
+    weights = torch.tensor([[0.25], [0.75]], dtype=torch.float32, device='npu')
+    for capacity in (16, 17, 16):
+        step = dict(options, num_max_tokens_per_rank=capacity)
+        # Native dispatch accepts contiguous [B, K, 1] indices. Combine uses the
+        # 2-D indices held by the separate handle below, as required by main.
+        routed, _, routed_weights, _, _ = launch(
+            buffer, 'dispatch', 1, x=x, topk_idx=routes.unsqueeze(-1),
+            topk_weights=weights.unsqueeze(-1), **step)
+        checks.extend(((routed.cpu(), tokens(source, 2).bfloat16()), (routed_weights.cpu(), weights.cpu().flatten())))
+        _, _, _, handle, _ = launch(buffer, 'dispatch', 1, x=x, topk_idx=routes,
+                                    topk_weights=weights.unsqueeze(-1), **step)
+        received, _, received_weights, _, _ = launch(
+            buffer, 'dispatch', 1, x=x, handle=handle, topk_weights=weights.unsqueeze(-1),
+            do_expand=True, async_with_compute_stream=True)
+        returned, returned_weights, _ = launch(
+            buffer, 'combine', 1, x=received, handle=handle,
+            topk_weights=received_weights, async_with_compute_stream=True)
+        checks.extend(((returned.cpu(), x.cpu()), (returned_weights.cpu(), weights.cpu())))
 
-    torch.npu.set_device(local_rank)
-    world = int(os.getenv('WORLD_SIZE', '1')) * args.num_processes
-    rank = int(os.getenv('RANK', '0')) * args.num_processes + local_rank
-    dist.init_process_group('hccl', rank=rank, world_size=world,
-                            device_id=torch.device(f'npu:{local_rank}'),
-                            init_method=f"tcp://{os.getenv('MASTER_ADDR', '127.0.0.1')}:{os.getenv('MASTER_PORT', '8361')}",
-                            timeout=timedelta(seconds=600))
-    buffer = deep_ep.EPBuffer(dist.group.WORLD, num_max_tokens_per_rank=max(args.bs),
-                              hidden=7168, num_topk=8, explicitly_destroy=True,
-                              use_huge1g_page=not args.no_huge1g_page)
-    retained = None
-    with torch.inference_mode():
-        if max(args.bs) >= 2 and world in (8, 16, 32, 128):
-            check_deferred_combine_with_empty_ranks(buffer)
-        for sync in (False, True):
-            for step, bs in enumerate(args.bs):
-                routes = make_routes(world, bs, 8, 128, step)
-                # Cover concentrated expert routes alongside the random reference.
-                if sync:
-                    routes = [[list(range(8)) for _ in range(bs)] for _ in range(world)]
-                entries = expert_entries(routes, 128, world, rank)
-                counts = [len(rows) for rows in entries]
-                x = payload([rank] * bs, range(bs), 7168, torch.bfloat16).npu()
-                indices = torch.tensor(routes[rank], dtype=torch.int64, device='npu')
-                weights = (torch.arange(1, 9, dtype=torch.float32, device='npu') / 32).repeat(bs, 1)
-                recv, recv_idx, recv_weights, handle, event = buffer.dispatch(
-                    x, topk_idx=indices, topk_weights=weights, num_experts=128,
-                    expert_alignment=1, num_sms=32, do_expand=True,
-                    do_cpu_sync=sync, async_with_compute_stream=True)
-                event.wait()
-                torch.npu.synchronize()
+    if world >= 4:
+        # For a [0,0,1,1] server map the old relay assigned the second token
+        # to rank 3, which has no expert rows and intentionally omits weights.
+        routing = torch.tensor([[0, 2, 4], [0, 2, 4]], dtype=torch.int64, device='npu')
+        weights = torch.tensor([[0.125, 0.5, 0.375], [0.5, 0.125, 0.375]], dtype=torch.float32, device='cpu')
+        x = torch.zeros((2, 256), dtype=torch.bfloat16, device='npu')
+        received, _, received_weights, handle, _ = launch(
+            buffer, 'dispatch', 1, x=x, topk_idx=routing, topk_weights=weights.npu(), num_sms=32, **options)
+        partials = [0.73828125, 0.375, 0.59765625]
+        received.fill_(partials[rank] if rank < 3 else 0)
+        returned, returned_weights, _ = launch(
+            buffer, 'combine', 1, x=received, handle=handle,
+            topk_weights=None if rank == 3 else received_weights, async_with_compute_stream=True)
+        # main's flat sum rounds to 1.7109375. Rounding ranks 0+1 first gives 1.703125.
+        checks.append((returned.cpu(), torch.full((2, 256), 1.7109375, dtype=torch.bfloat16, device='cpu')))
+        checks.append((returned_weights.cpu() if returned_weights is not None else None,
+                       None if rank == 3 else weights))
 
-                def check_dispatch():
-                    assert recv_idx is None
-                    assert recv_weights is not None
-                    assert handle.num_unaligned_recv_tokens_per_expert.cpu().tolist() == counts
-                    assert handle.num_recv_tokens_per_expert_list == (counts if sync else [])
-                    start = 0
-                    for rows in entries:
-                        if rows:
-                            block = recv[start:start + len(rows)].float().cpu()
-                            ids = (block[:, 0].long() * 16 + block[:, 1].long()) * bs
-                            ids += block[:, 2].long() * 16 + block[:, 3].long()
-                            sources, tokens = zip(*rows)
-                            torch.testing.assert_close(block[ids.argsort()], payload(sources, tokens, 7168, torch.float32),
-                                                       atol=0, rtol=0)
-                        start += len(rows)
-                agree(check_dispatch)
-                for weighted in (False, True):
-                    expert = prepare_experts(recv, counts, rank, 128, world, torch.bfloat16,
-                                             weighted=weighted, routes=routes)
-                    expected = expected_combine(routes, rank, 7168, torch.bfloat16, weighted=weighted,
-                                                experts=128)
-                    saved = expert.clone()
-                    producer = torch.npu.current_stream()
-                    other = torch.npu.Stream()
-                    other.wait_stream(producer)
-                    for repeat in range(2):
-                        with torch.npu.stream(producer if repeat == 0 else other):
-                            output, _, event = buffer.combine(expert, handle, async_with_compute_stream=True)
-                        event.wait()
-                        torch.npu.synchronize()
-                        agree(lambda: torch.testing.assert_close(output.float().cpu(), expected.float(), atol=.125, rtol=.02))
-                        agree(lambda: torch.testing.assert_close(expert, saved, atol=0, rtol=0))
-                if retained is None:
-                    retained = expert, handle, expected
-                else:
-                    # The first batch's handle remains usable after later dispatches.
-                    output, _, event = buffer.combine(retained[0], retained[1], async_with_compute_stream=True)
-                    event.wait()
-                    torch.npu.synchronize()
-                    agree(lambda: torch.testing.assert_close(output.float().cpu(), retained[2].float(), atol=.125, rtol=.02))
-                if rank == 0:
-                    print(f'PASS EP{world} BS={bs} sync={sync}', flush=True)
-        buffer.destroy()
-        buffer.destroy()
+    buffer.destroy()
     dist.destroy_process_group()
+    # Compare after the last collective so a rank-local mismatch cannot strand peers.
+    for actual, expected in checks:
+        if expected is None:
+            assert actual is None
+            continue
+        assert actual.dtype == expected.dtype, (actual.dtype, expected.dtype)
+        torch.testing.assert_close(actual.contiguous().view(torch.uint8),
+                                   expected.contiguous().view(torch.uint8), rtol=0, atol=0)
+    if rank == 0:
+        print(f'PASS EP{world} decode payloads and cross-stream epilogues')
 
 
 if __name__ == '__main__':
+    import os
+    from torch.multiprocessing import spawn
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--num-processes', type=int, default=8)
-    parser.add_argument('--bs', nargs='+', type=int, default=[2, 32, 64, 128, 256, 2])
-    parser.add_argument('--no-huge1g-page', action='store_true')
+    parser.add_argument('--num-processes', type=int, default=8, help='devices per node, as in test_ep.py')
     args = parser.parse_args()
     world = int(os.getenv('WORLD_SIZE', '1')) * args.num_processes
-    if world not in (8, 16, 32, 64, 128) or min(args.bs) <= 0:
-        parser.error('This test requires EP8/16/32/64/128 and positive BS')
-    import torch.multiprocessing as mp
-    mp.spawn(worker, args=(args,), nprocs=args.num_processes, join=True)
+    if args.num_processes < 1 or world < 2:
+        parser.error('This test needs at least one device per node and two ranks in total')
+    spawn(worker, args=(args.num_processes,), nprocs=args.num_processes)

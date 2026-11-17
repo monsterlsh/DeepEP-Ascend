@@ -120,7 +120,7 @@ class PublicAPIContracts(unittest.TestCase):
         self.assertFalse(hasattr(self.buffer, 'low_latency_mode'))
         self.native.LowLatencyBuffer.assert_not_called()
         self.native.calculate_ep_buffer_size.assert_called_once_with(128, 256, 7168, 8, False)
-        self.native.EPBuffer.assert_called_once_with(0, 128, 'hccl', 2 << 20, 0, True, 300, 100, True)
+        self.native.EPBuffer.assert_called_once_with(0, 128, 'hccl', 2 << 20, 0, True, 300, 100, True, False)
         self.assertIs(self.buffer.context, self.runtime.context)
         self.torch.distributed.barrier.assert_called_once_with(self.group)
         self.assertEqual(self.torch.npu.synchronize.call_count, 2)
@@ -148,35 +148,28 @@ class PublicAPIContracts(unittest.TestCase):
                 self.assertEqual(handle.num_recv_tokens_per_expert_list, [16])
                 self.assertIs(event.event, self.event)
 
-    def test_decode_provenance_follows_completed_fresh_handle(self):
-        # Exercise both private runtime return forms through the public dispatch/combine API.
-        options = dict(expert_alignment=128, do_cpu_sync=False, async_with_compute_stream=True)
-        _, _, _, legacy, _ = self.dispatch(**options)
-        self.buffer.combine(self.recv, legacy)
-        self.assertFalse(self.runtime.combine.call_args.kwargs['decode_handle'])
-        self.runtime.dispatch.return_value = None, self.event, lambda: self.result, True
-        fresh = self.dispatch(**options, defer_epilogue=True)
-        _, _, _, matched = fresh.wait()
-        self.assertIs(matched._decode_owner, self.buffer._decode_handle_owner)
-        self.buffer.combine(self.recv, matched)
-        self.assertTrue(self.runtime.combine.call_args.kwargs['decode_handle'])
-        self.buffer.combine(Tensor((15, 7168)), matched)
-        self.assertFalse(self.runtime.combine.call_args.kwargs['decode_handle'])
-        # Handles from another buffer cannot opt into its arena.
-        self.buffer._decode_handle_owner = object()
-        self.buffer.combine(self.recv, matched)
-        self.assertFalse(self.runtime.combine.call_args.kwargs['decode_handle'])
+    def test_combine_uses_completed_fresh_handle_without_transport_metadata(self):
+        self.runtime.dispatch.return_value = None, self.event, lambda: self.result
+        fresh = self.dispatch(expert_alignment=128, do_cpu_sync=False, async_with_compute_stream=True,
+                              defer_epilogue=True)
+        _, _, _, handle = fresh.wait()
+        self.buffer.combine(self.recv, handle)
+        args = self.runtime.combine.call_args.args
+        self.assertIs(args[4], handle.recv_src_metadata)
+        self.assertIs(args[5], handle.topk_idx)
+        self.assertEqual(self.runtime.combine.call_args.kwargs, {})
 
     def test_cached_dispatch_reuses_handle_configuration_and_updated_weights(self):
-        handle = self.dispatch(num_max_tokens_per_rank=64, expert_alignment=16, num_sms=16)[3]
-        updated = Tensor((2, 8), self.torch.float32)
+        handle = self.dispatch(num_max_tokens_per_rank=16, expert_alignment=16, num_sms=16)[3]
+        self.dispatch(num_max_tokens_per_rank=17)
+        updated = Tensor((2, 8, 1), self.torch.float32)
         result = self.buffer.dispatch(self.x, handle=handle, topk_weights=updated, num_sms=32, do_expand=True)
         args = self.runtime.dispatch.call_args.args
         self.assertIs(result[3], handle)
         self.assertIs(args[2], self.routes)
         self.assertIs(args[3], updated)
         self.assertEqual(args[5:14], self.ep.EPBuffer._unpack_handle(handle))
-        self.assertEqual(args[14:18], (64, 128, 16, 16))
+        self.assertEqual(args[14:18], (16, 128, 16, 16))
         self.assertIs(args[22], False)
 
     def test_native_sync_return_keeps_event_wrapper_without_inventing_an_event(self):
@@ -230,8 +223,8 @@ class PublicAPIContracts(unittest.TestCase):
         self.assertIs(returned[0][1], recv_scales)
 
     def test_combine_uses_originating_handle_and_preserves_bias_weight_side_channel(self):
-        handle = self.dispatch(num_max_tokens_per_rank=64, num_sms=16)[3]
-        self.dispatch(num_max_tokens_per_rank=256, num_sms=32)
+        handle = self.dispatch(num_max_tokens_per_rank=17, num_sms=16)[3]
+        self.dispatch(num_max_tokens_per_rank=16, num_sms=32)
         bias0, bias1 = Tensor((2, 7168)), Tensor((2, 7168))
         previous = Event()
         for bias, expected_bias in ((None, (None, None)), (bias0, (bias0, None)),
@@ -245,12 +238,46 @@ class PublicAPIContracts(unittest.TestCase):
             self.assertEqual(args[2:4], expected_bias)
             self.assertIs(args[4], handle.recv_src_metadata)
             self.assertIs(args[5], self.routes)
-            self.assertEqual(args[7:10], (128, 64, 16))
+            self.assertEqual(args[7:10], (128, 17, 16))
             self.assertEqual(args[10:], (previous, True, True, False))
             self.assertIs(result[0], self.x)
             self.assertIs(result[1], self.weights)
         # Python forwarding does not imply the baseline C++ runtime honors these options.
         self.assertEqual(previous.waits, 0)
+
+    def test_empty_rank_keeps_handle_capacity_and_optional_weights_across_deferred_calls(self):
+        # Local dispatch rows and local expert rows can be empty independently of M.
+        for capacity in (16, 17):
+            for local, expanded in ((0, 3), (2, 0)):
+                with self.subTest(capacity=capacity, local=local, expanded=expanded):
+                    x, routes = Tensor((local, 7168)), RouteTensor((local, 8), self.torch.int64)
+                    weights = Tensor((local, 8), self.torch.float32)
+                    expert_x, expert_weights = Tensor((expanded, 7168)), Tensor((expanded,), self.torch.float32)
+                    metadata = Tensor((expanded, 10), self.torch.int32)
+                    result = (expert_x, None, expert_weights, expanded, expanded, [expanded],
+                              *self.metadata[:3], metadata, *self.metadata[4:])
+                    self.runtime.dispatch.return_value = (None, self.event, lambda: result)
+                    def dispatch(**kwargs):
+                        return self.buffer.dispatch(x, topk_weights=weights, do_expand=True,
+                                                    async_with_compute_stream=True, defer_epilogue=True, **kwargs).wait()
+                    recv, _, returned_weights, handle = dispatch(topk_idx=routes, num_experts=128,
+                                                                 num_max_tokens_per_rank=capacity)
+                    self.assertIs(recv, expert_x)
+                    self.assertIs(returned_weights, expert_weights)
+                    self.assertIs(handle.recv_src_metadata, metadata)
+                    self.assertIs(handle.topk_idx, routes)
+                    self.assertIs(dispatch(handle=handle)[3], handle)
+                    args = self.runtime.dispatch.call_args.args
+                    self.assertEqual(args[5:7], (expanded, expanded))
+                    self.assertIs(args[3], weights)
+                    self.assertEqual(args[14], capacity)
+                    self.runtime.combine.return_value = None, self.event, lambda: (x, weights)
+                    combined = self.buffer.combine(recv, handle, topk_weights=returned_weights,
+                                                   async_with_compute_stream=True, defer_epilogue=True).wait()
+                    self.assertIs(combined[0], x)
+                    self.assertIs(combined[1], weights)
+                    self.assertIs(self.runtime.combine.call_args.args[1], expert_weights)
+                    self.assertEqual(self.runtime.combine.call_args.args[8], capacity)
 
     def test_deferred_dispatch_returns_event_then_four_values_and_runs_once(self):
         epilogue = Mock(return_value=self.result)

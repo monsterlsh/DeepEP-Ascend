@@ -6,7 +6,7 @@
 
 ## Performance
 
-The following prefill measurements predate the decode transport described under [Automatic decode transport in EPBuffer](#automatic-decode-transport-in-epbuffer).
+The following prefill measurements predate the [capacity-based decode implementation](#capacity-based-ep-dispatch-and-combine).
 
 Measured on Ascend 950DT NPUs with CANN 9.2.0 and the manually configured PoC HDK described under [Recommended HDK and firmware](#recommended-hdk-and-firmware). All measurements use netlayer 1, the supernode's external Clos network.
 
@@ -94,7 +94,7 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 
 | Interface | Ascend support |
 | --- | --- |
-| `EPBuffer` | Expanded BF16/FP16/FP8 dispatch, BF16/FP16 combine, cached handles, deterministic layouts, expert padding, deferred epilogues and native MTE transport with optional cross-server deduplication |
+| `EPBuffer` | Expanded BF16/FP8 dispatch and BF16 combine, FP16 dispatch/combine at capacities up to 16, cached handles, deterministic layouts, expert padding, deferred epilogues and native MTE transport with optional cross-server deduplication |
 | `PPBuffer` | Send/receive between adjacent pipeline ranks |
 | `EngramBuffer` | NPU-backed BF16/FP8 tables and per-layer fetch hooks |
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
@@ -226,75 +226,94 @@ output, _ = pending.wait()
 
 Training saves `handle` for `combine_backward` and `dispatch_backward`; wait on their returned events in the same way. See [EP tests](tests/ep/test_ep.py) for complete examples.
 
-## Automatic decode transport in EPBuffer
+## Capacity-based EP dispatch and combine
 
-The native EP interface can select MTE for the following decode workload:
+The effective `M = num_max_tokens_per_rank` selects the complete dispatch and combine implementation.
+Fresh dispatch uses its explicit capacity or the buffer default. Cached dispatch and combine use the
+capacity saved in the originating handle. All ranks use the same `M`, and their local token counts may
+range from zero to `M`.
+
+| Capacity per rank | Fresh dispatch, cached dispatch and combine |
+|---|---|
+| `1 ≤ M ≤ 16` | Decode implementation, including FP16 and extended FP8 scale formats. |
+| `M > 16` | Original implementation from main, including BF16 and native FP8 dispatch and BF16 combine. |
+
+For BF16 H7168/K6/E384 and alignment 128, the EP64 combine measurement at `M=16` was
+55.479 µs on `7004d16` and 53.774 µs on `main@4dfccac` (+3.17%).
+
+Within the decode implementation, MTE transport is available for the following configurations:
 
 - Ascend950DT_9582 on A5, 32 AI cores (64 vector cores), 216 KiB of UB per vector core
   and the default 100-second device timeout.
-- EP2, EP4, EP8, EP16, EP32, EP64 or EP128 with a common per-rank capacity
-  `1 ≤ M ≤ 256`. Each rank can supply any number of tokens from 1 through `M`.
+- EP2, EP4, EP8, EP16, EP32, EP64 or EP128.
 - BF16/FP16 activations with `H` divisible by 128, or FP8 E4M3 with `H` divisible by 256.
   FP8 dispatch carries native 16-bit scale packs, FP32 scales per 128 channels, or INT32 words
   containing four E8M0 scales per 128 channels. The returned scales preserve their dtype and bits.
 - `1 ≤ K ≤ min(E, 32)`, `E ≤ 512`, and `E` evenly divisible by the EP group size. The
   dispatch stages and the combine reduction ring must fit UB. This covers H7168/K6/E384,
-  as well as H7168/K8/E128. Use expert alignment 128, FP32 routing weights, expanded output,
-  zero padding and an asynchronous deferred epilogue. Host count sync and deterministic sorting
-  use the general path.
+  as well as H7168/K8/E128. Alignment, host count sync, padding and epilogue scheduling
+  keep their usual expanded dispatch semantics. Deterministic buffers use URMA.
 - The expert computation applies the routing weight once to each selected expert output.
   Combine sums BF16 or FP16 expert rows. Its optional `topk_weights` argument restores the
-  weights in their original routing slots. Bias or an omitted weight side channel uses URMA.
+  weights in their original routing slots. Bias is applied by the reduce epilogue.
 
 Dispatch writes each token into the destination rank's registered EP communication buffer.
-The native copy epilogue and cached handle use the same token layout as URMA. Fresh and
-cached dispatch and either barrier placement use the full capacity range. Combine selects
-its transport independently on a compatible handle from the same buffer.
-All ranks use the same H/K/E, capacity, payload dtype and scale format. When the host does
-not synchronize receive counts, expanded output reserves up to `world × M × K` expert
-rows plus alignment space. Repeated routing slots can each produce a row even when they
-select the same expert. Exact-count and cached calls reuse their respective receive counts.
+The native copy epilogue and cached handle use the same token layout as URMA.
+All ranks use the same H/K/E, capacity, payload dtype and scale format. Use distinct expert
+IDs within each token's top-k selection, as returned by `torch.topk`. Masked slots may
+contain `-1`. With `L = E / world` local experts, a token contributes at most one row to
+any expert and at most `min(K, L)` rows to a rank. A fresh dispatch without host count
+synchronization reserves `world × M × min(K, L)` rows plus alignment space. Synchronized
+dispatch uses the actual aligned expert counts, and cached dispatch reuses its handle's size.
 
-For cross-server deduplication, set `EP_DECODE_SERVER_ID` on **each rank** before creating
-the buffer. Use the same nonnegative integer for ranks on one physical server and different
-integers for different servers. EP ranks may be interleaved. The group exchanges IDs at
-initialization. With a multi-server group containing a shared server, dispatch sends the
-full packet once per remote server and its other recipients fetch it within that server.
-Combine reduces rank partials inside each server, merges the per-slot weight bits, then
-sends one partial to the token owner. Each server partial rounds to the expert output dtype,
-so floating-point sums can differ from rank-direct reduction. The default uses rank-direct MTE.
+For cross-server deduplication, set `EP_DECODE_SERVER_ID` on **each rank** before constructing
+the `EPBuffer`. Use the same nonnegative integer for ranks on one physical server and different
+integers for different servers. EP ranks may be interleaved. An incomplete or invalid map disables
+server relaying for the group. With a multi-server group containing a shared server,
+dispatch sends the full packet once per remote server and its other recipients fetch it within that server.
+Combine always sends each expert rank's partial directly to the token owner when using MTE.
+The owner applies biases and reduces rank partials in the same routing-slot order as URMA.
+Each contributing rank returns its own optional weights directly to the corresponding slots.
 
-Relay storage shares the HCCL registration and is allocated after the EP and LB regions.
-Dispatch needs one 32-bit descriptor per source capacity slot. Combine needs
-`world × M × (2H + align(4K, 32) + 4)` bytes per rank. The operations reuse the same region.
-If you construct a buffer with an explicit byte size and no model dimensions, that size also
-sets the relay reserve. Each operation uses rank-direct MTE when its staging does not fit.
-
-For eligible geometry, each operation exchanges its current eligibility across all ranks
-on a separate HCCL stream. A local veto, including an empty input rank, selects URMA for
-the group. Collective graph capture uses URMA and requires the same capture and replay
-order across ranks. The capacity range is open for performance comparison with main.
-See the [decode benchmark and device trace commands](tests/ep/README.compat.md).
+Dispatch relay descriptors occupy reserved space in the existing registered EP workspace.
+During buffer construction, ranks exchange server IDs, device capabilities and transport settings
+alongside their communication ports.
+Dispatch and combine select their transport from this group configuration and the shared launch
+geometry. Use the same vector core count, fresh/cached mode and barrier placement on all ranks.
+Empty ranks participate in the collective. Local token count, statistics, bias and deferred
+execution do not enter transport selection. Graph capture remains unsupported. Parameter validation
+errors detected on all ranks before submission can be corrected and retried on the same buffer.
+If a rank has already entered the collective, a lone rank cannot retry it. When a submission fails
+and work may still be outstanding, restart the distributed job. Releasing the failed buffer retains
+its registered memory and outstanding URMA sources until process exit. Explicit destruction reports the failure to the caller.
 
 Dispatch and combine both use the communication buffer allocated by `EPBuffer` and registered
 with HCCL. Complete a deferred epilogue with `event.current_stream_wait()` before reusing
-or destroying the buffer.
+or destroying the buffer. If a call with `M > 16` does not request an event or defer its epilogue,
+establish a stream dependency yourself before reusing that buffer on another stream. For example,
+record an event on the producer stream immediately after the call and wait on it in the consumer stream.
 
-Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` to use URMA for dispatch and combine.
-`EP_MTE_BS_THRESHOLD` optionally sets a lower inclusive upper bound on shared `M` for
-combine. Leave it unset to compare the full range. Use the same settings on all ranks.
+Set `EP_DISABLE_LOW_LATENCY_TRANSPORT=1` before constructing the `EPBuffer` to use URMA in the
+decode implementation. If any rank disables MTE, the group uses URMA.
 
 For decode calls that return routing weights, pass the `recv_weights` from
 `EPBuffer.dispatch` to `EPBuffer.combine` as `topk_weights`. Combine returns
 these weights in the original token order. The expert computation applies the
 weights to its outputs once, as in [Dispatch and combine](#dispatch-and-combine).
-Run the [EP8 decode test](tests/ep/test_ep_decode_portable.py) with the same command on NVIDIA and Ascend:
+To compare decode correctness and latency with main, run the same EP test on each build.
+Set `--num-tokens` to the per-rank capacity you want to measure.
+The stock benchmark labels the communication-kernel time `urma:` for both transports.
+Use the JIT specialization names (`dispatch_mte`, `dispatch_mte_relay`, `combine_mte`)
+to confirm which MTE kernels were selected.
 
 ```bash
-python tests/ep/test_ep_decode_portable.py --num-processes 8
+python tests/ep/test_ep.py --num-processes 8 --num-ai-cores 32 \
+    --num-tokens 16 --hidden 7168 --num-topk 6 --num-experts 384 --dispatch-dtype bf16
 ```
 
-The [compatibility test guide](tests/ep/README.compat.md) also shows how to verify the selected Ascend transport with a device trace.
+Run [the decode regression](tests/ep/test_decode.py) for empty ranks, deferred combine
+across streams, capacity overrides, FP16 activations and 32-bit FP8 scales. With at
+least four ranks it also checks BF16 rounding and optional routing weights byte for byte.
 
 ## Other buffer interfaces
 

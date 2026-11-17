@@ -167,7 +167,9 @@ class EPBuffer(BufferBase):
     expert computation before combine sums the expert outputs.
 
     Stream usage:
-        All operations run on the current stream.
+        All operations run on the current stream. After a call with capacity above
+        16 and no async event or deferred epilogue, establish a stream dependency
+        before reusing the buffer on another stream.
     """
 
     barrier = comm.barrier
@@ -200,6 +202,8 @@ class EPBuffer(BufferBase):
         workspace and must be allocation-aligned.
 
         Decode dispatch and combine use the communication buffer registered with HCCL.
+        Set decode transport options before construction; ranks exchange these settings
+        along with their communication ports.
         """
         lb_allocation_plan = lb_allocation_plan_or_num_bytes if isinstance(lb_allocation_plan_or_num_bytes, BufferAllocator) else None
         num_lb_bytes = lb_allocation_plan_or_num_bytes if lb_allocation_plan is None else lb_allocation_plan.num_bytes
@@ -219,7 +223,6 @@ class EPBuffer(BufferBase):
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
         self.deterministic = deterministic
-        self._decode_handle_owner = object()
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_allocated_qps = 0
         self.num_lb_bytes = num_lb_bytes
@@ -234,15 +237,10 @@ class EPBuffer(BufferBase):
 
         self.hccl_comm_handle = comm.get_hccl_comm_handle(group)
         super().__init__(explicitly_destroy)
-        relay_size = ()
-        if os.environ.get('EP_DECODE_SERVER_ID') and hidden > 0 and num_max_tokens_per_rank > 0:
-            # FP8 dispatch can use a smaller arena than the BF16/FP16 combine partials.
-            capacity = min(num_max_tokens_per_rank, 256)
-            relay_size = (self.get_buffer_size_hint(group, capacity, hidden, num_topk),)
         self.runtime = _C.EPBuffer(
             self.rank_idx, self.num_ranks, self.hccl_comm_handle.get(),
             num_bytes, num_lb_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
-            explicitly_destroy, *relay_size)
+            explicitly_destroy, deterministic)
         self.context = self.runtime.context
         if lb_allocation_plan is not None:
             lb_allocation_plan.materialize(self.runtime.lb_storage)
@@ -349,26 +347,30 @@ class EPBuffer(BufferBase):
         Dispatch tokens to different ranks.
 
         Arguments:
-            x: BF16 or FP16 tokens shaped `[num_tokens, hidden]`, or an FP8 tuple
+            x: BF16 tokens shaped `[num_tokens, hidden]`, or an FP8 tuple
                 containing `torch.float8_e4m3fn` tokens and their scales. Scales may
-                be native 16-bit packs, FP32 values per 128 hidden elements, or
-                INT32 words packing four per-32 E8M0 scale bytes per word.
-                Dispatch preserves the scale dtype and columns per token.
+                be native 16-bit packs. Capacities up to 16 also support FP16 activations,
+                FP32 scales per 128 hidden elements and INT32 words packing four per-32 E8M0
+                scale bytes per word.
+                Dispatch preserves the scale dtype and columns per token. A native pack tensor
+                with zero columns skips scale transfer and returns zero columns.
             topk_idx: `[num_tokens, num_topk]` with `torch.int64`, the expert indices selected by each
-                token, `-1` means no selections. Must be `None` if `handle` is provided.
+                token. Use `-1` for masked slots. Must be `None` if `handle` is provided.
                 Stored by reference in the handle; must not be modified until all uses of the handle complete.
             topk_weights: `[num_tokens, num_topk]` with `torch.float`, the expert weights of each token
-                to dispatch. Can be provided with a cached `handle` to dispatch updated weights.
+                to dispatch. A contiguous trailing singleton dimension is also accepted.
+                Can be provided with a cached `handle` to dispatch updated weights.
             cumulative_local_expert_recv_stats: `[num_local_experts]` with `torch.int`, a cumulative
                 expert count tensor for statistics, useful for online EP load balance monitoring.
             num_experts: the number of all experts. Inferred from `handle` if provided.
             num_max_tokens_per_rank: the maximum number of tokens per rank. Inferred from constructor
-                default or `handle` if provided.
+                default or `handle` if provided. Values from 1 through 16 use the decode
+                implementation, and larger values select the original EP implementation.
             expert_alignment: align the number of tokens received by each local expert to this variable.
             num_sms: the number of AI cores to use (0 selects a default in Python).
                 Cached dispatch always uses the core count from `handle`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
-            previous_event: compatibility parameter; providing an event selects the native URMA path.
+            previous_event: compatibility parameter; ignored on Ascend.
             async_with_compute_stream: return an event for the current-stream work.
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             handle: an optional cached `EPHandle` from a previous dispatch; if set, the host will reuse
@@ -437,12 +439,8 @@ class EPBuffer(BufferBase):
         expert_alignment = value_or(expert_alignment, 1)
         do_cpu_sync = value_or(do_cpu_sync, True)
 
-        # A combine handle retains its dispatch layout. Older and externally constructed
-        # handles have no provenance. Cached dispatch keeps the original handle immutable.
-        decode_handle = not self.deterministic and (
-            handle is None or getattr(handle, '_decode_owner', None) is self._decode_handle_owner)
         # Do dispatch
-        result, event, deferred_epilogue, *matched_layout = self.runtime.dispatch(
+        result, event, deferred_epilogue = self.runtime.dispatch(
             x, sf, topk_idx, topk_weights,
             cumulative_local_expert_recv_stats,
             cached_num_recv_tokens,
@@ -461,7 +459,7 @@ class EPBuffer(BufferBase):
             async_with_compute_stream, allocate_on_comm_stream,
             do_handle_copy, do_cpu_sync, do_expand,
             do_zero_padding, use_tma_aligned_col_major_sf,
-            defer_epilogue, decode_handle=decode_handle)
+            defer_epilogue)
         event_overlap = EventOverlap(event)
 
         def finalize_dispatch(dispatch_result: tuple, deterministic_by_hook: bool) \
@@ -495,8 +493,6 @@ class EPBuffer(BufferBase):
                                   recv_src_metadata,
                                   dst_buffer_slot_idx,
                                   dst_gsge_idx)
-                if matched_layout and matched_layout[0]:
-                    handle._decode_owner = self._decode_handle_owner
             assert handle is not None
 
             # Deterministic epilogue
@@ -551,8 +547,8 @@ class EPBuffer(BufferBase):
         Combine (reduce) tokens from different ranks back to their original ranks.
 
         Arguments:
-            x: BF16 or FP16 expert outputs shaped `[num_tokens, hidden]` to reduce
-                back to their original ranks.
+            x: BF16 expert outputs shaped `[num_tokens, hidden]` to reduce back to their
+                original ranks. FP16 is also supported when the handle capacity is at most 16.
             handle: a must-set communication handle, you can obtain this from the `dispatch` function.
             topk_weights: `[num_tokens]` with `torch.float`. The expanded tokens' top-k weights for
                 restoring to their original ranks as a separate output. These values do not
@@ -561,7 +557,7 @@ class EPBuffer(BufferBase):
                 the same dtype as `x`, added to the output.
             num_sms: compatibility parameter; combine always uses `handle.num_sms`.
             num_qps: must be 0 on Ascend (automatic backend configuration).
-            previous_event: compatibility parameter; providing an event selects the native URMA path.
+            previous_event: compatibility parameter; ignored on Ascend.
             async_with_compute_stream: return an event for the current-stream work.
             allocate_on_comm_stream: compatibility parameter; allocations use the current stream on Ascend.
             defer_epilogue: whether to defer the reduce epilogue until `event.current_stream_wait()` is called.
@@ -596,9 +592,6 @@ class EPBuffer(BufferBase):
             async_with_compute_stream,
             allocate_on_comm_stream,
             defer_epilogue,
-            decode_handle=(not self.deterministic and handle.expert_alignment == 128 and
-                           handle.do_expand and x.size(0) == handle.num_expanded_tokens and
-                           getattr(handle, '_decode_owner', None) is self._decode_handle_owner),
         )
         event_overlap = EventOverlap(event)
 

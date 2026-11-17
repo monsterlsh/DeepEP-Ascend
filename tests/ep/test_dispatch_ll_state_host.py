@@ -13,25 +13,54 @@ def host_test_source():
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <exception>
+#include <format>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+#include "csrc/comm/decode_topology.hpp"
+#include "csrc/kernels/ep/kernel_mode.hpp"
 #include "csrc/kernels/ep/dispatch_low_latency_policy.hpp"
+using deep_ep::EPKernelMode;
 
+namespace torch {
+struct Tensor {
+    std::shared_ptr<int> allocation;
+    bool defined() const { return allocation != nullptr; }
+};
+}
 namespace mock {
 std::vector<std::string> events;
 int stream = 0, arch = 3510, cores = 64, vec_per_ai = 2, ub_bytes = 216 * 1024;
 const char* soc = "Ascend950DT_9582";
-bool event_failure = false, wait_failure = false;
+bool event_failure = false, wait_failure = false, capable_peer = true;
+int setups = 0;
 void note(const std::string& value) { events.push_back(value); }
 }
+using aclmdlRI = void*;
+enum aclmdlRICaptureStatus { ACL_MODEL_RI_CAPTURE_STATUS_NONE, ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE };
+aclmdlRICaptureStatus capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+int aclrtCaptureError = 0;
+int aclmdlRICaptureGetInfo(int, aclmdlRICaptureStatus* status, aclmdlRI*) {
+    *status = capture_status;
+    return aclrtCaptureError;
+}
+#define ACL_CHECK(op) do { if (op) throw std::runtime_error("capture"); } while(false)
 const char* aclrtGetSocName() { return mock::soc; }
 namespace c10_npu {
 using NPUStream = int;
 NPUStream getCurrentNPUStream() { return mock::stream; }
+}
+constexpr int ACL_MEMCPY_HOST_TO_DEVICE = 1;
+int aclrtMemcpy(void* dst, size_t capacity, const void* src, size_t bytes, int kind) {
+    assert(bytes <= capacity && kind == ACL_MEMCPY_HOST_TO_DEVICE);
+    std::memcpy(dst, src, bytes);
+    return 0;
 }
 namespace deep_ep {
 struct FakeRuntime {
@@ -54,53 +83,57 @@ struct EventHandle {
 };
 namespace comm {
 constexpr int64_t kNumSystemCyclesPerSecond = 1000000000LL;
-struct HcclContext { void* comm = nullptr; };
 struct Context {
-    int rank_idx = 3, num_ranks = 8, num_cpu_timeout_secs = 300;
+    int num_ranks = 8, num_cpu_timeout_secs = 300;
     int64_t num_gpu_timeout_cycles = 100 * kNumSystemCyclesPerSecond;
-    HcclContext hccl;
-    HcclContext* hccl_context = &hccl;
-};
-struct DecodeAgreement {
-    inline static bool resources = true, capable_peer = true, matching_peer = true, capturing = false;
-    inline static int initial_votes = 0;
-    inline static std::vector<uint16_t> proposals;
-    bool initialize(int) { return resources; }
-    static bool is_capturing() { return capturing; }
-    bool matches(void*, int, int, uint16_t proposal) {
-        proposals.push_back(proposal);
-        return matching_peer && proposal != 0;
-    }
-};
-struct DecodeTopology {
-    bool group_enabled = false;
-    static DecodeTopology discover(const std::string&, int, int, int64_t, int64_t, bool local) {
-        ++DecodeAgreement::initial_votes;
-        return {local && DecodeAgreement::capable_peer};
-    }
+    void* workspace = nullptr;
+    void finalize() {}
 };
 }
 }
 """
     production = re.sub(r'^#(?:include|pragma).*\n', '', HEADER.read_text(), flags=re.M)
+    dispatch_header = (ROOT / 'csrc/kernels/ep/dispatch.hpp').read_text()
+    launcher = dispatch_header[dispatch_header.index('static void launch_ep_dispatch('):
+                               dispatch_header.index('static void launch_dispatch(')]
+    recording_jit = r"""
+#define EP_HOST_ASSERT(cond) do { if (!(cond)) throw std::runtime_error(#cond); } while(false)
+struct Config { int num_blocks, num_ubuf_bytes; };
+struct TestJit {
+    int launches = 0;
+    int compile(const char*, const std::string&) { return 1; }
+    void launch(int, Config, auto...) { ++launches; }
+} test_jit;
+auto jit = &test_jit;
+"""
     harness = r"""
 using deep_ep::comm::Context;
-using deep_ep::comm::DecodeAgreement;
+using deep_ep::comm::DecodeTopology;
 using deep_ep::EPLowLatencyState;
-constexpr int64_t buffer_bytes = 1LL << 30;
 
-void initialize(EPLowLatencyState& state, const Context& ctx) {
-    state.initialize("ep", ctx.num_ranks, ctx.num_cpu_timeout_secs,
-                     int(ctx.num_gpu_timeout_cycles / deep_ep::comm::kNumSystemCyclesPerSecond), buffer_bytes, buffer_bytes);
+void initialize(EPLowLatencyState& state, std::shared_ptr<Context> ctx, bool deterministic = false) {
+    auto topology = state.local_topology(ctx->num_ranks, int(ctx->num_gpu_timeout_cycles / deep_ep::comm::kNumSystemCyclesPerSecond), deterministic);
+    if (ctx->num_ranks > 1) {
+        topology.gather_ports(3000, [&](DecodeTopology::Record local) {
+            ++mock::setups;
+            std::vector<DecodeTopology::Record> peers(ctx->num_ranks, {3000, -1, mock::capable_peer ? 64 : 0});
+            peers[0] = local;
+            return peers;
+        });
+    }
+    state.attach_context(ctx, topology);
+}
+void initialize(EPLowLatencyState& state, const Context& ctx, bool deterministic = false) {
+    initialize(state, std::make_shared<Context>(ctx), deterministic);
 }
 
-bool dispatch(EPLowLatencyState& state, const Context& ctx, int m = 2, bool cached = false,
-              bool prologue = false, bool options = true, int num_sf_packs = 0) {
-    return state.prepare_dispatch(ctx, m, 7168, 8, 128, 64, 216 * 1024, num_sf_packs, cached, prologue, options);
+bool dispatch(EPLowLatencyState& state, const Context& ctx, int m = 2, int sf_words = 0) {
+    state.prepare();
+    return state.prepare_dispatch(ctx.num_ranks, m, 7168, 8, 128, 64, 216 * 1024, sf_words, sf_words > 0);
 }
-bool combine(EPLowLatencyState& state, const Context& ctx, int m = 2, bool options = true,
-             int b = 1, bool prologue = false) {
-    return state.prepare_combine(ctx, m, 7168, 8, 128, 64, 216 * 1024, b, options, prologue);
+bool combine(EPLowLatencyState& state, const Context& ctx, int m = 2) {
+    state.prepare();
+    return state.prepare_combine(ctx.num_ranks, m, 7168, 8, 128, 64, 216 * 1024);
 }
 template <class F> void rejects(F fn, std::string_view message) {
     try { fn(); } catch (const std::runtime_error& e) {
@@ -111,7 +144,7 @@ template <class F> void rejects(F fn, std::string_view message) {
 }
 
 void check_admission() {
-    for (int mode = 0; mode < 10; ++mode) {
+    for (int mode = 0; mode < 11; ++mode) {
         Context ctx;
         if (mode == 0) mock::soc = nullptr;
         if (mode == 1) mock::arch = 3500;
@@ -119,140 +152,145 @@ void check_admission() {
         if (mode == 3) mock::vec_per_ai = 1;
         if (mode == 4) mock::ub_bytes = 100;
         if (mode == 5) --ctx.num_gpu_timeout_cycles;
-        if (mode == 6) DecodeAgreement::resources = false;
-        if (mode == 7) DecodeAgreement::capable_peer = false;
-        if (mode == 8) ctx.num_ranks = 1;
-        const auto votes = DecodeAgreement::initial_votes;
-        DecodeAgreement::proposals.clear();
-        EPLowLatencyState state(buffer_bytes);
-        initialize(state, ctx);
-        assert(DecodeAgreement::initial_votes == votes + (mode != 8));
-        assert(dispatch(state, ctx) == (mode == 9));
-        assert(combine(state, ctx) == (mode == 9));
-        assert(DecodeAgreement::proposals.size() == (mode == 9 ? 2u : 0u));
+        if (mode == 6) mock::capable_peer = false;
+        if (mode == 7) ctx.num_ranks = 1;
+        if (mode == 10) mock::cores = 80;
+        EPLowLatencyState state;
+        const auto setups = mock::setups;
+        initialize(state, ctx, mode == 8);
+        for (int i = 0; i < 3; ++i) {
+            assert(dispatch(state, ctx) == (mode == 9));
+            assert(combine(state, ctx) == (mode == 9));
+        }
+        assert(mock::setups == setups + (mode != 7));
         state.close();
         mock::soc = "Ascend950DT_9582"; mock::arch = 3510; mock::cores = 64;
         mock::vec_per_ai = 2; mock::ub_bytes = 216 * 1024;
-        DecodeAgreement::resources = DecodeAgreement::capable_peer = true;
+        mock::capable_peer = true;
     }
-
-    Context ctx;
-    for (int sf_words : {0, 56, 112}) {
-        const auto plan = deep_ep::get_dispatch_low_latency_plan(3510, 8, 2, 7168, 8, 128, 64, 216 * 1024, sf_words);
-        for (auto bytes : {plan->buffer_bytes - 1, plan->buffer_bytes}) {
-            EPLowLatencyState state(bytes);
-            initialize(state, ctx);
-            assert(dispatch(state, ctx, 2, false, false, true, sf_words) == (bytes == plan->buffer_bytes));
+    for (int world : {2, 4, 8, 16, 32, 64, 128}) {
+        Context ctx;
+        ctx.num_ranks = world;
+        EPLowLatencyState state;
+        initialize(state, ctx);
+        for (int m = 1; m <= 16; ++m) {
+            assert(dispatch(state, ctx, m) && dispatch(state, ctx, m, 112));
+            assert(combine(state, ctx, m));
         }
+        assert(!dispatch(state, ctx, 2, -1));
+        assert(!state.prepare_dispatch(world, 2, 7168, 8, 128, 64, 216 * 1024, 0, true));
+        capture_status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+        assert(!dispatch(state, ctx) && !combine(state, ctx));
+        capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+        aclrtCaptureError = 1;
+        rejects([&] { dispatch(state, ctx); }, "capture");
+        aclrtCaptureError = 0;
+        assert(dispatch(state, ctx));
     }
 }
-
-void check_proposals() {
+void check_capacity_boundary() {
     Context ctx;
-    EPLowLatencyState state(buffer_bytes);
+    EPLowLatencyState state;
+    const auto before = mock::events.size();
     initialize(state, ctx);
-    DecodeAgreement::proposals.clear();
-    for (bool cached : {false, true})
-        for (bool prologue : {false, true}) {
-            assert(dispatch(state, ctx, 3, cached, prologue));
-            assert(DecodeAgreement::proposals.back() == 1 + 2 * cached + prologue);
-        }
-    assert(!dispatch(state, ctx, 3, false, false, false));
-    assert(dispatch(state, ctx, 3, false, false, true, 112));
-    assert(!dispatch(state, ctx, 3, false, false, true, -1));
-    assert(dispatch(state, ctx, 9, true));
-    assert(dispatch(state, ctx, 9, false));
-    assert(!combine(state, ctx, 3, false));
-    assert(!combine(state, ctx, 3, true, 0));
-    assert(DecodeAgreement::proposals.back() == 0);
-    assert(combine(state, ctx, 3, true, 3, true));
-    assert(DecodeAgreement::proposals.back() == 2);
-    DecodeAgreement::matching_peer = false;
-    assert(!dispatch(state, ctx) && !combine(state, ctx));
-    DecodeAgreement::matching_peer = true;
-    const auto count = DecodeAgreement::proposals.size();
-    DecodeAgreement::capturing = true;
-    assert(!dispatch(state, ctx) && !combine(state, ctx));
-    DecodeAgreement::capturing = false;
-    assert(DecodeAgreement::proposals.size() == count);
-}
-void check_all_rank_admission() {
-    for (int world : {2, 4, 8, 16, 32, 64, 128})
-        for (int rank = 0; rank < world; ++rank) {
-            Context ctx;
-            ctx.num_ranks = world; ctx.rank_idx = rank;
-            EPLowLatencyState state(buffer_bytes);
-            initialize(state, ctx);
-            for (int m = 1; m <= 256; ++m) {
-                for (bool prologue : {false, true}) {
-                    assert(dispatch(state, ctx, m, false, prologue));
-                    assert(dispatch(state, ctx, m, true, prologue));
-                    assert(combine(state, ctx, m, true, m, prologue));
-                    assert(combine(state, ctx, m, true, std::max(1, m - rank), prologue));
-                }
-            }
-            const auto votes = DecodeAgreement::proposals.size();
-            for (int m : {0, 257}) {
-                assert(!dispatch(state, ctx, m) && !combine(state, ctx, m));
-            }
-            assert(DecodeAgreement::proposals.size() == votes);
-        }
-}
-void check_threshold_override() {
-#ifdef _WIN32
-    assert(_putenv_s("EP_MTE_BS_THRESHOLD", "16") == 0);
-#else
-    assert(setenv("EP_MTE_BS_THRESHOLD", "16", 1) == 0);
-#endif
-    Context ctx;
-    EPLowLatencyState state(buffer_bytes);
-    initialize(state, ctx);
-    assert(combine(state, ctx, 16));
-    assert(!combine(state, ctx, 17));
-    assert(DecodeAgreement::proposals.back() == 0);
-    assert(dispatch(state, ctx, 256));
+    const auto setups = mock::setups;
+    const torch::Tensor source{std::make_shared<int>(1)}, staging{std::make_shared<int>(2)};
+    rejects([&] {
+        auto guard = state.submission_guard(source, staging);
+        throw std::runtime_error("JIT");
+    }, "JIT");
+    for (int capacity : {17, 32, 256}) {
+        assert(!deep_ep::use_decode_implementation(capacity));
+        state.prepare();
+        state.submission_guard(source, staging).begin_submission();
+        state.record_completion(false);
+    }
+    assert(mock::events.size() == before && mock::setups == setups);
+    assert(deep_ep::use_decode_implementation(16));
+    capture_status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+    assert(!dispatch(state, ctx, 16) && mock::setups == setups);
+    capture_status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    assert(dispatch(state, ctx, 16) && combine(state, ctx, 16));
+    assert(mock::setups == setups);
 }
 void check_events() {
     Context ctx;
-    EPLowLatencyState state(buffer_bytes);
+    EPLowLatencyState state;
     initialize(state, ctx);
     assert(dispatch(state, ctx));
-    state.begin();
+    state.submission_guard().begin_submission();
     rejects([&] { combine(state, ctx); }, "outstanding");
     rejects([&] { state.close(); }, "outstanding");
     mock::stream = 1;
-    state.record_completion();
+    state.record_completion(true);
     const auto count = mock::events.size();
     assert(mock::events.back() == "record:1");
     assert(combine(state, ctx));
     assert(mock::events.size() == count);
-    state.begin();
-    state.record_completion();
+    state.submission_guard().begin_submission();
+    state.record_completion(true);
     mock::stream = 2;
-    assert(!combine(state, ctx, 2, false));
+    state.prepare();
     assert(mock::events.back() == "wait:1->2");
-    state.begin();
-    state.record_completion();
+    torch::Tensor source{std::make_shared<int>(1)}, staging{std::make_shared<int>(2)};
+    std::weak_ptr<int> retained = staging.allocation;
+    state.submission_guard(source, staging).begin_submission();
+    staging = {};
+    assert(!retained.expired());
+    rejects([&] { dispatch(state, ctx); }, "outstanding");
+    state.record_completion(true);
+    assert(mock::events.back() == "record:2");
+    const auto event_count = mock::events.size();
+    assert(state.completion_event().stream == 2 && mock::events.size() == event_count);
+    mock::note("unrelated work on stream 2");
+    assert(retained.expired());
     mock::stream = 3;
-    assert(dispatch(state, ctx, 2, true));
-    assert(mock::events.back() == "wait:2->3");
+    assert(dispatch(state, ctx));
+    assert(mock::events.size() == event_count + 2 && mock::events.back() == "wait:2->3");
+    state.submission_guard().begin_submission();
+    state.record_completion(false);  // A native call that did not request an event follows main's stream contract.
+    ++mock::stream;
+    state.prepare();
+    assert(mock::events.size() == event_count + 2);
     state.close();
+}
+void check_invalid_core_count_retry() {
+    EPLowLatencyState state;
+    Context ctx;
+    initialize(state, ctx);
+    const auto submit = [&](int vec_cores) {
+        auto guard = state.submission_guard();
+        launch_ep_dispatch(EPKernelMode::DecodeURMA, [&] { guard.begin_submission(); }, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                        0, 8, 2, 2, 128, 8, 128, false, false, 14336, 0, 0, 0, 216 * 1024, vec_cores, 100);
+    };
+    rejects([&] { submit(8); }, "16 <= num_vec_cores");
+    assert(jit->launches == 0);
+    assert(dispatch(state, ctx));
+    submit(64);
+    assert(jit->launches == 1);
+    state.record_completion(true);
+    assert(combine(state, ctx));
 }
 void check_failures() {
     Context ctx;
     for (int mode = 0; mode < 3; ++mode) {
-        EPLowLatencyState state(buffer_bytes);
+        EPLowLatencyState state;
         initialize(state, ctx);
         assert(dispatch(state, ctx));
-        state.begin();
+        rejects([&] { auto guard = state.submission_guard(); throw std::runtime_error("preflight"); }, "preflight");
+        assert(dispatch(state, ctx));
         if (mode == 0) {
-            rejects([&] { auto guard = state.failure_guard(); throw std::runtime_error("submit"); }, "submit");
+            rejects([&] { auto guard = state.submission_guard(); guard.begin_submission();
+                          throw std::runtime_error("submit"); }, "submit");
         } else if (mode == 1) {
+            state.submission_guard().begin_submission();
             mock::event_failure = true;
-            rejects([&] { auto guard = state.failure_guard(); state.record_completion(); }, "record");
+            rejects([&] { auto guard = state.failure_guard(); state.record_completion(true); }, "record");
             mock::event_failure = false;
         } else {
-            state.record_completion();
+            state.submission_guard().begin_submission();
+            state.record_completion(true);
             ++mock::stream;
             mock::wait_failure = true;
             rejects([&] { combine(state, ctx); }, "wait");
@@ -262,16 +300,45 @@ void check_failures() {
         rejects([&] { state.close(); }, "failed");
     }
 }
+void check_resource_lifetime() {
+    for (int mode = 0; mode < 4; ++mode) {
+        auto ctx = std::make_shared<Context>();
+        auto source = torch::Tensor{std::make_shared<int>(1)};
+        auto staging = torch::Tensor{std::make_shared<int>(2)};
+        std::weak_ptr<Context> window = ctx;
+        std::weak_ptr<int> input = source.allocation, send_buffer = staging.allocation;
+        {
+            EPLowLatencyState state;
+            initialize(state, ctx);
+            assert(dispatch(state, *ctx));
+            ctx.reset();
+            try {
+                auto submission = state.submission_guard(source, staging);
+                source = {};
+                staging = {};
+                if (mode == 0) throw std::runtime_error("before launch");
+                submission.begin_submission();
+                if (mode == 1) state.record_completion(true);
+                if (mode == 2) throw std::runtime_error("after launch");
+                // mode 3 drops a submitted operation without running the epilogue.
+            } catch (const std::runtime_error&) {}
+            assert(input.expired() == (mode < 2) && send_buffer.expired() == (mode < 2));
+            assert(!window.expired() && state.unfinished() == (mode >= 2));
+        }
+        assert(window.expired() == (mode < 2));
+        assert(input.expired() == (mode < 2) && send_buffer.expired() == (mode < 2));
+    }
+}
 int main() {
     check_admission();
-    check_proposals();
-    check_all_rank_admission();
     check_events();
+    check_invalid_core_count_retry();
     check_failures();
-    check_threshold_override();
+    check_resource_lifetime();
+    check_capacity_boundary();
 }
 """
-    return prefix + production + harness
+    return prefix + production + recording_jit + launcher + harness
 
 
 class DispatchLLStateHostTests(unittest.TestCase):
@@ -282,13 +349,69 @@ class DispatchLLStateHostTests(unittest.TestCase):
     def test_actual_state_transitions(self):
         run_host_cpp(host_test_source(), include_dirs=(ROOT, ROOT / 'deep_ep/include'))
 
-    def test_hccl_agreement(self):
-        source = (ROOT / 'tests/ep/decode_agreement_host_test.cpp').read_text()
-        headers = {name: '#pragma once\n' for name in (
-            'acl/acl.h', 'hccl/hccl.h', 'hccl/hccl_comm.h', 'torch_npu/csrc/core/npu/NPUStream.h')}
-        headers['deep_ep/common/exception.hpp'] = (
-            '#pragma once\n#define ACL_CHECK(op) do { if ((op) != 0) throw std::runtime_error("ACL"); } while (false)\n'
-            '#define HCCL_CHECK(op) ACL_CHECK(op)\n')
+    def test_automatic_teardown_after_failure(self):
+        base = (ROOT / 'csrc/buffers/base.hpp').read_text()
+        ep = (ROOT / 'csrc/buffers/ep.hpp').read_text()
+        cleanup = base[base.index('    void destroy_on_destruction'):base.index('public:')]
+        destructor = ep[ep.index('    ~EPBuffer()'):ep.index('    EventHandle lb_prefetch_weights')]
+        stubs = r'''
+namespace comm {
+int drains = 0;
+bool drain_failed = false;
+void barrier(Context&, bool) {
+    ++drains;
+    if (drain_failed) throw std::runtime_error("drain");
+}
+}
+int aclrtHostUnregister(void*) { return 0; }
+int aclrtFreeHost(void*) { return 0; }
+struct Base {
+    bool explicitly_destroy = false, destroyed = false;
+    std::shared_ptr<Context> main_context;
+    virtual ~Base() noexcept(false) = default;
+    virtual void destroy() = 0;
+'''
+        fixture = r'''
+};
+struct EPBuffer : Base {
+    std::shared_ptr<Context> context = std::make_shared<Context>();
+    std::shared_ptr<EPLowLatencyState> low_latency_state = std::make_shared<EPLowLatencyState>();
+    void* host_workspace = nullptr;
+    torch::Tensor lb_storage;
+    EPBuffer() {
+        initialize(*low_latency_state, context);
+    }
+'''
+        cases = r'''
+};
+int main() {
+    static_assert(std::is_nothrow_destructible_v<EPBuffer>);
+    { auto buffer = std::make_unique<EPBuffer>(); }
+    assert(comm::drains == 1);
+    {
+        auto buffer = std::make_unique<EPBuffer>();
+        assert(dispatch(*buffer->low_latency_state, *buffer->context));
+        rejects([&] {
+            auto guard = buffer->low_latency_state->submission_guard();
+            guard.begin_submission();
+            throw std::runtime_error("launch");
+        }, "launch");
+        rejects([&] { buffer->destroy(); }, "failed");
+    }
+    assert(comm::drains == 1);
+    comm::drain_failed = true;
+    { auto buffer = std::make_unique<EPBuffer>(); }
+    assert(comm::drains == 2);
+}
+'''
+        source = host_test_source().split('int main() {')[0] + stubs + cleanup + fixture + destructor + cases
+        run_host_cpp(source, include_dirs=(ROOT, ROOT / 'deep_ep/include'))
+
+    def test_group_topology_and_transport_limits(self):
+        source = (ROOT / 'tests/ep/decode_topology_host_test.cpp').read_text()
+        hccl = (ROOT / 'csrc/kernels/comm/hccl.hpp').read_text()
+        headers = {'gather_listen_ports.inc': hccl[hccl.index('    std::vector<uint16_t> gather_listen_ports('):
+                                                    hccl.index('    void wait_for_channels(')]}
         run_host_cpp(source, include_dirs=(ROOT,), headers=headers)
 
 

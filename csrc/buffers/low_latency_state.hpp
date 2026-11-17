@@ -1,13 +1,14 @@
 #pragma once
 
-#include <cstdint>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
 
-#include "../comm/decode_agreement.hpp"
-#include "../comm/decode_topology.hpp"
+#include <acl/acl.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
+
 #include "../kernels/comm/api.hpp"
 #include "../kernels/ep/dispatch_low_latency_policy.hpp"
 #include "../utils/event.hpp"
@@ -20,114 +21,139 @@ class EPLowLatencyState {
         EventHandle event{stream};
     };
 
-    int64_t num_buffer_bytes;
     std::optional<Completion> last_completion;
+    // The queue can still read these allocations after the issuing NPU kernel exits.
+    struct Resources {
+        std::shared_ptr<comm::Context> context;
+        torch::Tensor source, staging;
+    };
+    std::unique_ptr<Resources> resources = std::make_unique<Resources>();
     bool pending = false;
     bool failed = false;
-    bool group_enabled = false;
-    comm::DecodeAgreement agreement;
+    bool mte_enabled = false;
+    bool server_relay = false;
 
-    void wait_for_workspace() {
-        if (last_completion and last_completion->stream != c10_npu::getCurrentNPUStream())
-            last_completion->event.current_stream_wait();
+    static bool stream_is_captured() {
+        aclmdlRICaptureStatus status{};
+        aclmdlRI model = nullptr;
+        ACL_CHECK(aclmdlRICaptureGetInfo(c10_npu::getCurrentNPUStream(), &status, &model));
+        return status != ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    }
+
+    void release_sources() {
+        resources->source = torch::Tensor();
+        resources->staging = torch::Tensor();
     }
 
 public:
-    explicit EPLowLatencyState(int64_t num_buffer_bytes): num_buffer_bytes(num_buffer_bytes) {}
+    static comm::DecodeTopology local_topology(int world, int gpu_timeout_secs, bool deterministic) {
+        if (not is_decode_capacity(world, 1) or deterministic or not low_latency_transport_enabled())
+            return comm::DecodeTopology(0);
+        const auto* soc = aclrtGetSocName();
+        const bool capable = soc and std::string_view(soc) == "Ascend950DT_9582" and
+            runtime->get_npu_arch() == 3510 and gpu_timeout_secs == 100 and
+            runtime->get_num_vec_cores() >= 64 and runtime->get_num_vec_cores_per_ai_core() == 2 and
+            runtime->get_num_ubuf_bytes_per_vec_core() == 216 * 1024;
+        return comm::DecodeTopology(capable ? runtime->get_num_vec_cores() : 0);
+    }
+
+    void attach_context(const std::shared_ptr<comm::Context>& context, const comm::DecodeTopology& topology) {
+        resources->context = context;
+        if (not topology.server_ids.empty()) {
+            auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
+            ACL_CHECK(aclrtMemcpy(workspace.decode_server_ids, sizeof(workspace.decode_server_ids),
+                                  topology.server_ids.data(), topology.server_ids.size() * sizeof(int), ACL_MEMCPY_HOST_TO_DEVICE));
+            server_relay = true;
+        }
+        mte_enabled = topology.mte_enabled;
+    }
+
+    bool unfinished() const noexcept { return pending or failed; }
+
+    ~EPLowLatencyState() {
+        // An unconfirmed collective may still access the registered window and URMA
+        // sources. Only process teardown can reclaim them safely in this state.
+        if (unfinished())
+            resources.release();
+    }
 
     struct FailureGuard {
         EPLowLatencyState* owner;
+        bool armed;
         int exceptions = std::uncaught_exceptions();
 
+        void begin_submission() {
+            owner->pending = true;
+            armed = true;
+        }
+
         ~FailureGuard() {
-            if (std::uncaught_exceptions() > exceptions)
-                owner->fail();
+            if (std::uncaught_exceptions() > exceptions) {
+                if (armed)
+                    owner->fail();
+                else
+                    owner->release_sources();
+            }
         }
     };
 
     FailureGuard failure_guard() {
-        return {this};
+        return {this, true};
     }
 
-    comm::DecodeTopology initialize(const std::string& group, int world, int cpu_timeout_secs,
-                                    int gpu_timeout_secs, int64_t arena_bytes, int64_t scratch_hint) {
-        if (not is_decode_capacity(world, 1))
-            return {};
-        const auto* soc = aclrtGetSocName();
-        const bool local = soc and std::string_view(soc) == "Ascend950DT_9582" and
-            runtime->get_npu_arch() == 3510 and
-            gpu_timeout_secs == 100 and
-            runtime->get_num_vec_cores() >= 64 and runtime->get_num_vec_cores_per_ai_core() == 2 and
-            runtime->get_num_ubuf_bytes_per_vec_core() == 216 * 1024 and agreement.initialize(world);
-        auto topology = comm::DecodeTopology::discover(group, world, cpu_timeout_secs, arena_bytes, scratch_hint, local);
-        group_enabled = topology.group_enabled;
-        return topology;
+    FailureGuard submission_guard(const torch::Tensor& source = {}, const torch::Tensor& staging = {}) {
+        if (staging.defined()) {
+            resources->source = source;
+            resources->staging = staging;
+        }
+        return {this, false};
     }
+
+    bool server_relay_enabled() const { return server_relay; }
 
     void require_idle() const {
         if (failed)
-            throw std::runtime_error("Low-latency EP operation failed; restart the distributed job");
+            throw std::runtime_error("EP operation failed; restart the distributed job");
         if (pending)
             throw std::runtime_error("Complete the outstanding EP epilogue before reusing or destroying the EPBuffer");
     }
 
-    bool prepare_dispatch(
-            const comm::Context& context, int capacity, int hidden,
-            int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes, int num_sf_packs,
-            bool cached_mode, bool barrier_in_prologue, bool matched_options) {
+    void prepare() {
         require_idle();
-        const auto guard = failure_guard();
-        wait_for_workspace();
-        const auto world = context.num_ranks;
-        // Only shared wire geometry may skip the collective. Rank-local options vote below.
-        if (not group_enabled or not is_decode_geometry(world, capacity, hidden, num_topk, num_experts) or
-            comm::DecodeAgreement::is_capturing())
-            return false;
-
-        const auto plan = get_dispatch_low_latency_plan(runtime->get_npu_arch(), world, capacity,
-            hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, num_sf_packs);
-        const bool match = plan and num_buffer_bytes >= plan->buffer_bytes and
-            low_latency_transport_enabled() and matched_options;
-        const uint16_t proposal = match ? 1 + 2 * cached_mode + barrier_in_prologue : 0;
-        return agreement.matches(context.hccl_context->comm, world, context.num_cpu_timeout_secs, proposal);
+        if (last_completion and last_completion->stream != c10_npu::getCurrentNPUStream()) {
+            const auto guard = failure_guard();
+            last_completion->event.current_stream_wait();
+        }
     }
 
-    bool prepare_combine(
-            const comm::Context& context, int capacity, int hidden, int num_topk,
-            int num_experts, int num_vec_cores, int num_ub_bytes, int batch, bool matched_options,
-            bool barrier_in_prologue) {
-        require_idle();
-        const auto guard = failure_guard();
-        wait_for_workspace();
-        const auto world = context.num_ranks;
-        if (not group_enabled or not is_decode_geometry(world, capacity, hidden, num_topk, num_experts) or
-            comm::DecodeAgreement::is_capturing())
-            return false;
-
-        const auto threshold = mte_bs_threshold_override();
-        const bool match = (threshold < 0 or capacity <= threshold) and
-            low_latency_transport_enabled() and matched_options and is_decode_batch(batch, capacity) and
-            is_decode_shape(world, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes, false);
-        const uint16_t proposal = match ? 1 + barrier_in_prologue : 0;
-        return agreement.matches(context.hccl_context->comm, world, context.num_cpu_timeout_secs, proposal);
+    bool prepare_dispatch(int world, int capacity, int hidden, int num_topk, int num_experts,
+                          int num_vec_cores, int num_ub_bytes, int num_sf_packs, bool fp8) const {
+        return mte_enabled and (not fp8 or num_sf_packs > 0) and
+            supports_dispatch_mte(3510, world, capacity, hidden, num_topk, num_experts,
+                                  num_vec_cores, num_ub_bytes, num_sf_packs) and not stream_is_captured();
     }
 
-    void begin() {
-        pending = group_enabled;
+    bool prepare_combine(int world, int capacity, int hidden, int num_topk, int num_experts,
+                         int num_vec_cores, int num_ub_bytes) const {
+        return mte_enabled and is_decode_shape(world, capacity, hidden, num_topk, num_experts,
+            num_vec_cores, num_ub_bytes, false) and not stream_is_captured();
     }
 
-    void fail() noexcept {
-        if (group_enabled)
-            failed = true;
-    }
+    void fail() noexcept { failed = true; }
 
-    void record_completion() {
-        if (not group_enabled)
-            return;
-        // Both transports use the native EP buffer and workspace across streams.
-        last_completion.emplace();
+    // For decode, deferred or async operations record at the epilogue itself;
+    // the same event can serve both the caller and the next workspace user.
+    void record_completion(bool track) {
+        if (track)
+            last_completion.emplace();
+        else
+            last_completion.reset();
         pending = false;
+        if (resources->staging.defined())
+            release_sources();
     }
+
+    EventHandle completion_event() const { return last_completion.value().event; }
 
     void close() {
         require_idle();

@@ -10,42 +10,65 @@
 #include <deep_ep/common/compiled.hpp>
 #include <deep_ep/comm/barrier.hpp>
 #include <deep_ep/impls/ep/combine_utils.hpp>
-#include <deep_ep/impls/ep/combine_layout.hpp>
-#include <deep_ep/impls/ep/combine_relay.hpp>
 #include <deep_ep/common/exception.hpp>
 #include <deep_ep/common/math.hpp>
 #include <deep_ep/layout/ep/workspace.hpp>
 
 namespace deep_ep {
 
+template <int kNumTopk, int kNumTokenElems, int kNumSlots, int kNumHiddenElems>
+__simd_vf__ __forceinline__ void restore_combine_weights(
+    __ubuf__ uint32_t* ub_tokens, __ubuf__ uint32_t* ub_output,
+    const int first_token_idx, const int num_tokens) {
+    uint32_t remaining = kNumTopk;
+    const auto mask = asc_update_mask_b32(remaining);
+    vector_uint32_t result;
+    asc_duplicate_scalar(result, static_cast<uint32_t>(0), mask);
+    const auto num_wrap_tokens = math::min(kNumSlots - first_token_idx, num_tokens);
+    auto ub_input = ub_tokens + (first_token_idx * kNumTokenElems + kNumHiddenElems) / 2;
+    #pragma unroll 1
+    for (int i = 0; i < num_wrap_tokens; ++ i) {
+        vector_uint32_t weights;
+        asc_loadalign_postupdate(weights, ub_input, kNumTokenElems / 2);
+        asc_or(result, result, weights, mask);
+    }
+    ub_input = ub_tokens + kNumHiddenElems / 2;
+    #pragma unroll 1
+    for (int i = num_wrap_tokens; i < num_tokens; ++ i) {
+        vector_uint32_t weights;
+        asc_loadalign_postupdate(weights, ub_input, kNumTokenElems / 2);
+        asc_or(result, result, weights, mask);
+    }
+    asc_storealign(ub_output, result, mask);
+}
+
 template <int kNumRanks, int kNumExperts, int kNumTopk,
           int kHidden, int kNumMaxTokensPerRank, int kNumUbBytes,
           int kNumVecCores, int64_t kNumTimeoutCycles, bool kDoBarrier = true,
-          int kNumHiddenBytes = kHidden * static_cast<int>(sizeof(uint16_t)), typename element_t = bfloat16_t,
-          bool kDomainRelay = false>
+          int kNumHiddenBytes = kHidden * static_cast<int>(sizeof(bfloat16_t))>
 __global__ __vector__ void combine_reduce_epilogue_impl(
-    __gm__ element_t* combined_x,
+    __gm__ bfloat16_t* combined_x,
     __gm__ float* combined_topk_weights,
     __gm__ int64_t* combined_topk_idx,
-    __gm__ element_t* buffer,
-    __gm__ element_t* bias_0,
-    __gm__ element_t* bias_1,
+    __gm__ bfloat16_t* buffer,
+    __gm__ bfloat16_t* bias_0,
+    __gm__ bfloat16_t* bias_1,
     __gm__ void* workspace,
     __gm__ void* jetty_ptrs,
-    const int num_combined_tokens, __gm__ const int* server_ids) {
+    const int num_combined_tokens) {
     AscendC::InitSocState();
 
     const auto vec_core_idx = static_cast<int>(AscendC::GetBlockIdx());
     if constexpr (kDoBarrier)
         comm::scalar::barrier<
-            kNumRanks, kNumTimeoutCycles, true, kDomainRelay, true, kNumVecCores, kDomainRelay ? 0 : kNumVecCores>(
+            kNumRanks, kNumTimeoutCycles, true, false, true, kNumVecCores, kNumVecCores>(
                 static_cast<__gm__ layout::EPSignals*>(workspace)->common_signals, vec_core_idx, jetty_ptrs);
 
-    static constexpr int kNumWeightBytes = get_combine_weight_bytes(kNumTopk);
-    static constexpr int kNumHiddenSlots = get_combine_hidden_slots(kNumUbBytes, kNumHiddenBytes + kNumWeightBytes);
+    static constexpr int kNumWeightBytes = math::align(kNumTopk * static_cast<int>(sizeof(float)), kNumUbAlignmentBytes);
+    static constexpr int kNumHiddenSlots = math::min(32, kNumUbBytes / (kNumHiddenBytes + kNumWeightBytes));
     static constexpr int kNumCombineTokenElems = kHidden + kNumWeightBytes / static_cast<int>(sizeof(bfloat16_t));
     using HiddenReducer = RingReducer<
-        kHidden, math::min(kNumRanks, kNumTopk) + 2, kNumHiddenSlots, 0, kNumWeightBytes, element_t>;
+        kHidden, math::min(kNumRanks, kNumTopk) + 2, kNumHiddenSlots, 0, kNumWeightBytes>;
 
     struct UBLayout {
         typename HiddenReducer::Buffer hidden;
@@ -74,8 +97,7 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
         const auto relative_token_idx = local_token_idx + token_rotation;
         const auto token_idx = token_begin +
             (relative_token_idx < num_core_tokens ? relative_token_idx : relative_token_idx - num_core_tokens);
-        // The relay writes at the last selected lane in its server. The flat
-        // transport writes at the last selected lane in each destination rank.
+        // Keep the last top-k slot for each destination rank.
         uint64_t master_slot_mask = 0;
         uint64_t seen_ranks[math::ceil_div(kNumRanks, 64)] = {};
         #pragma unroll
@@ -83,7 +105,7 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             const auto expert_idx = combined_topk_idx[token_idx * kNumTopk + slot_idx];
             if (expert_idx < 0)
                 continue;
-            const auto dst_rank_idx = combine_group_rank<kDomainRelay>(server_ids, expert_idx / (kNumExperts / kNumRanks));
+            const auto dst_rank_idx = expert_idx / (kNumExperts / kNumRanks);
             const auto rank_bit = uint64_t{1} << (dst_rank_idx % 64);
             if ((seen_ranks[dst_rank_idx / 64] & rank_bit) == 0)
                 master_slot_mask |= uint64_t{1} << slot_idx;
@@ -107,7 +129,7 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
             auto slot_group_idx = slot_idx;
             if constexpr (kNumRanks < kNumTopk) {
                 const auto expert_idx = combined_topk_idx[token_idx * kNumTopk + slot_idx];
-                slot_group_idx = combine_group_rank<kDomainRelay>(server_ids, expert_idx / (kNumExperts / kNumRanks));
+                slot_group_idx = expert_idx / (kNumExperts / kNumRanks);
             }
             const auto combine_slot_idx = slot_group_idx * kNumMaxTokensPerRank + token_idx;
             const auto gm_input = buffer + static_cast<int64_t>(combine_slot_idx) * kNumCombineTokenElems;
@@ -122,8 +144,6 @@ __global__ __vector__ void combine_reduce_epilogue_impl(
                 reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[0]),
                 reinterpret_cast<__ubuf__ uint32_t*>(ub->hidden.buf[output_idx] + kHidden),
                 (first_input_idx + num_biases) % kNumHiddenSlots, num_inputs - num_biases);
-            asc_sync_notify(PIPE_V, PIPE_MTE2, EVENT_ID0);
-            asc_sync_wait(PIPE_V, PIPE_MTE2, EVENT_ID0);
             asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID0);
             asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID0);
         }
