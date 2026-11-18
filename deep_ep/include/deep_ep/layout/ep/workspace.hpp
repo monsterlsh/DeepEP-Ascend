@@ -5,7 +5,7 @@
 
 namespace deep_ep::layout {
 
-inline constexpr int kDecodeCapacity = 16;
+inline constexpr int kNumDecodeRelaySlots = 4096;
 
 struct alignas(kNumAllocationAlignmentBytes) EPSignals {
     CommonSignals common_signals;
@@ -20,7 +20,7 @@ struct alignas(kNumAllocationAlignmentBytes) EPSignals {
     int decode_server_ids[kNumMaxRanks];
     // Relay descriptors occupy padding of the original registered workspace. Every peer
     // addresses them at the same offset, independently of its EP and LB buffer sizes.
-    int decode_relay_slots[kNumMaxRanks * kDecodeCapacity];
+    int decode_relay_slots[kNumDecodeRelaySlots];
 };
 static_assert(sizeof(EPSignals) == kNumAllocationAlignmentBytes, "Keep the native EP buffer offset");
 

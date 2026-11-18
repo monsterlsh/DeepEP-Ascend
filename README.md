@@ -69,10 +69,16 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
 | `BufferAllocator`, `BufferBase`, `deep_ep.comm` | Allocation planning, buffer lifecycle, communicator queries, barriers and stream access |
 
-`EPBuffer` automatically selects the decode path for `1 ≤ num_max_tokens_per_rank ≤ 16`, using MTE when supported.
-At these capacities, dispatch and combine also support FP16, and FP8 dispatch accepts FP32 or packed INT32 scales.
-For these formats, the dispatch input row size must be a multiple of 32 bytes (256 bytes with `do_zero_padding=True`).
-FP16 combine requires a hidden size divisible by 128.
+On supported Ascend 950 hardware, `EPBuffer` selects MTE for BF16 operations with hidden size 7168, top-k 6 and 384 experts when the common per-rank capacity `M` is between 1 and the limit below, inclusive. Each operation selects its own transport using the capacity supplied to dispatch or saved in its handle.
+
+| EP ranks | Dispatch max M | Cached dispatch max M | Combine max M |
+| ---: | ---: | ---: | ---: |
+| 8 | 128 | 128 | 96 |
+| 16 | 128 | 128 | 16 |
+| 32 | 32 | 32 | 32 |
+| 64 | 32 | 16 | 8 |
+
+Other configurations and calls for which MTE is unavailable use the native EP kernels and their usual input formats (BF16, or FP8 dispatch with 16-bit scale packs).
 
 PP, Engram and Bucket are experimental; remaining work is listed under [Ongoing](#ongoing). EP requires `do_expand=True` and `allow_multiple_reduction=True`; `do_handle_copy` must remain `False`.
 

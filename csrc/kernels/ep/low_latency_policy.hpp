@@ -8,24 +8,34 @@
 
 namespace deep_ep {
 
-constexpr int kMaxDecodeRanks = 128;
-
-// M is the common per-rank slot capacity used to address each peer's communication buffer.
-constexpr bool use_decode_implementation(int capacity) {
-    return capacity >= 1 and capacity <= layout::kDecodeCapacity;
+// Inclusive per-rank capacities from the BF16 H=7168, K=6, E=384 benchmark.
+constexpr int get_dispatch_mte_threshold(int num_ranks, bool cached_mode) {
+    switch (num_ranks) {
+        case 8:
+        case 16: return 128;
+        case 32: return 32;
+        case 64: return cached_mode ? 16 : 32;
+        default: return 0;
+    }
 }
 
-constexpr bool is_decode_capacity(int num_ranks, int capacity) {
-    return num_ranks > 1 and num_ranks <= kMaxDecodeRanks and math::is_power_of_2(num_ranks) and
-           use_decode_implementation(capacity);
+constexpr int get_combine_mte_threshold(int num_ranks) {
+    switch (num_ranks) {
+        case 8: return 96;
+        case 16: return 16;
+        case 32: return 32;
+        case 64: return 8;
+        default: return 0;
+    }
 }
 
-constexpr bool is_decode_geometry(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
-                                  int num_vec_cores, int num_ub_bytes) {
-    return is_decode_capacity(num_ranks, capacity) and num_vec_cores == 64 and num_ub_bytes == 216 * 1024 and
-           hidden > 0 and hidden % (kNumVectorRegisterBytes / 2) == 0 and
-           num_experts > 0 and num_experts <= kDispatchWorkerThreads and num_experts % num_ranks == 0 and
-           num_topk > 0 and num_topk <= 32 and num_topk <= num_experts;
+constexpr bool is_decode_rank_count(int num_ranks) {
+    return get_dispatch_mte_threshold(num_ranks, false) > 0;
+}
+
+constexpr bool is_decode_geometry(int hidden, int num_topk, int num_experts, int num_vec_cores, int num_ub_bytes) {
+    return hidden == 7168 and num_topk == 6 and num_experts == 384 and
+           num_vec_cores == 64 and num_ub_bytes == 216 * 1024;
 }
 
 constexpr DispatchBufferStages get_dispatch_mte_stages(int num_ranks, int num_experts, int64_t tokens_per_core,
@@ -38,27 +48,23 @@ constexpr DispatchBufferStages get_dispatch_mte_stages(int num_ranks, int num_ex
 }
 
 inline bool supports_dispatch_mte(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
-                                  int num_vec_cores, int num_ub_bytes, int num_sf_packs) {
-    const bool use_fp8 = num_sf_packs > 0;
-    if (num_sf_packs < 0 or num_sf_packs > num_ub_bytes / static_cast<int>(sizeof(sf_pack_t)) or
-        not is_decode_geometry(num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes) or
-        (use_fp8 and hidden % kNumVectorRegisterBytes != 0))
+                                  int num_vec_cores, int num_ub_bytes, bool cached_mode) {
+    if (capacity <= 0 or capacity > get_dispatch_mte_threshold(num_ranks, cached_mode) or
+        not is_decode_geometry(hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes) or
+        get_dispatch_max_expert_rows(num_ranks, capacity) > reduction::kReductionMaxLowCount)
         return false;
 
-    static_assert(kMaxDecodeRanks <= kNumMaxRanks and kMaxDecodeRanks <= reduction::kReductionMaxHighCount);
-    static_assert(get_dispatch_max_expert_rows(kMaxDecodeRanks, layout::kDecodeCapacity) <= reduction::kReductionMaxLowCount);
-    const auto hidden_bytes = static_cast<int64_t>(hidden) * (use_fp8 ? 1 : 2);
-    const int sf_bytes = num_sf_packs * static_cast<int>(sizeof(sf_pack_t));
+    const int64_t hidden_bytes = int64_t{2} * hidden;
     const auto tokens_per_core = math::ceil_div<int64_t>(capacity, num_vec_cores);
-    return get_dispatch_mte_stages(num_ranks, num_experts, tokens_per_core, hidden_bytes, sf_bytes, num_topk, num_ub_bytes, false).fits() and
-           get_dispatch_mte_stages(num_ranks, num_experts, tokens_per_core, hidden_bytes, sf_bytes, num_topk, num_ub_bytes, true).fits();
+    return get_dispatch_mte_stages(num_ranks, num_experts, tokens_per_core, hidden_bytes, 0, num_topk,
+                                   num_ub_bytes, cached_mode).fits();
 }
 
 constexpr bool supports_combine_mte(int num_ranks, int capacity, int hidden, int num_topk, int num_experts,
                                     int num_vec_cores, int num_ub_bytes) {
-    if (not is_decode_geometry(num_ranks, capacity, hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes))
+    if (capacity <= 0 or capacity > get_combine_mte_threshold(num_ranks) or
+        not is_decode_geometry(hidden, num_topk, num_experts, num_vec_cores, num_ub_bytes))
         return false;
-    // BF16 and FP16 expert outputs use two bytes per element after any dispatch dtype.
     const int64_t hidden_bytes = int64_t{2} * hidden;
     const int issue_bytes = num_ub_bytes - get_combine_fixed_bytes(num_ranks, num_topk, true);
     const auto reduce_slots = get_combine_hidden_slots(num_ub_bytes, hidden_bytes + get_combine_weight_bytes(num_topk));

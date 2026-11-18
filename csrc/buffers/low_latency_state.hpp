@@ -33,6 +33,7 @@ class EPLowLatencyState {
     bool failed = false;
     bool mte_enabled = false;
     bool server_relay = false;
+    bool used_mte = false;
 
     static bool stream_is_captured() {
         aclmdlRICaptureStatus status{};
@@ -48,7 +49,7 @@ class EPLowLatencyState {
 
 public:
     static comm::DecodeTopology local_topology(int world) {
-        if (not is_decode_capacity(world, 1))
+        if (not is_decode_rank_count(world))
             return comm::DecodeTopology(0);
         const auto* soc = aclrtGetSocName();
         const bool capable = soc and std::string_view(soc) == "Ascend950DT_9582" and
@@ -138,10 +139,9 @@ public:
     }
 
     bool prepare_dispatch(int world, int capacity, int hidden, int num_topk, int num_experts,
-                          int num_vec_cores, int num_ub_bytes, int num_sf_packs, bool fp8) const {
-        return mte_enabled and (not fp8 or num_sf_packs > 0) and
-            supports_dispatch_mte(world, capacity, hidden, num_topk, num_experts,
-                                  num_vec_cores, num_ub_bytes, num_sf_packs) and not stream_is_captured();
+                          int num_vec_cores, int num_ub_bytes, bool cached_mode) const {
+        return mte_enabled and supports_dispatch_mte(world, capacity, hidden, num_topk, num_experts,
+            num_vec_cores, num_ub_bytes, cached_mode) and not stream_is_captured();
     }
 
     bool prepare_combine(int world, int capacity, int hidden, int num_topk, int num_experts,
@@ -152,16 +152,21 @@ public:
 
     void fail() noexcept { failed = true; }
 
-    // For decode, deferred or async operations record at the epilogue itself;
-    // the same event can serve both the caller and the next workspace user.
-    void record_completion(bool track) {
-        if (track)
+    // Once MTE uses this buffer, follow the last writer even across native epilogues.
+    void record_completion(bool mte, bool async_with_compute_stream) {
+        used_mte = used_mte or mte;
+        if (used_mte or async_with_compute_stream)
             last_completion.emplace();
         else
             last_completion.reset();
         pending = false;
         if (resources->staging.defined())
             release_sources();
+    }
+
+    void clear_after_drain() {
+        used_mte = false;
+        record_completion(false, false);
     }
 
     EventHandle completion_event() const { return last_completion.value().event; }

@@ -109,7 +109,7 @@ public:
         low_latency_state->require_healthy();
         try {
             comm::barrier(*context, true);
-            low_latency_state->record_completion(false);
+            low_latency_state->clear_after_drain();
             ACL_CHECK(aclrtHostUnregister(host_workspace));
             ACL_CHECK(aclrtFreeHost(host_workspace));
             context->finalize(true);
@@ -161,7 +161,6 @@ public:
              const bool& defer_epilogue) const {
         EP_HOST_ASSERT(not destroyed);
         EP_HOST_ASSERT(not defer_epilogue or async_with_compute_stream);
-        const bool decode = use_decode_implementation(num_max_tokens_per_rank);
 
         // Ascend EP has some limitations over NVIDIA version
         EP_HOST_ASSERT(do_expand);
@@ -197,38 +196,21 @@ public:
         int num_sf_packs = 0;
         int sf_token_stride = 0;
         int sf_hidden_stride = 0;
-        bool pack_scales = false;
+        void* sf_ptr = nullptr;
         if (sf.has_value()) {
             EP_HOST_ASSERT(x.scalar_type() == torch::kFloat8_e4m3fn);
             EP_HOST_ASSERT(sf->dim() == 2 and sf->size(0) == num_tokens);
+            EP_HOST_ASSERT(sf->element_size() == sizeof(sf_pack_t));
             EP_HOST_ASSERT(sf->device() == x.device());
             EP_HOST_ASSERT(sf->stride(0) == 1 or sf->stride(1) == 1);
-            const bool wide = decode and (sf->scalar_type() == torch::kFloat32 or sf->scalar_type() == torch::kInt32);
-            EP_HOST_ASSERT(wide or sf->element_size() == sizeof(sf_pack_t));
-            // FP32 per-128 scales and packed E8M0 INT32 use two consecutive
-            // 16-bit wire words per entry. Preserve their bits and public dtype.
-            if (wide) {
-                EP_HOST_ASSERT(num_hidden_bytes % kNumUbAlignmentBytes == 0 and
-                               "32-bit FP8 scales require a 32-byte aligned hidden row");
-                EP_HOST_ASSERT(sf->size(1) == math::ceil_div<int64_t>(hidden, 128));
-            }
-            pack_scales = wide or (decode and (sf->stride(0) == 0 or sf->stride(1) == 0));
-            const int words_per_scale = wide ? 2 : 1;
-            const auto columns = sf->size(1);
-            // Singleton/empty dimensions can carry arbitrary PyTorch strides.
-            const auto row_stride = (pack_scales or (decode and (num_tokens <= 1 or columns == 0))) ? columns : sf->stride(0);
-            const auto column_stride = (pack_scales or (decode and (num_tokens == 0 or columns <= 1))) ? 1 : sf->stride(1);
-            EP_HOST_ASSERT(columns <= std::numeric_limits<int>::max() / (words_per_scale * static_cast<int>(sizeof(sf_pack_t))) and
-                           row_stride <= std::numeric_limits<int>::max() / words_per_scale and
-                           column_stride <= std::numeric_limits<int>::max());
-            num_sf_packs = static_cast<int>(columns) * words_per_scale;
-            sf_token_stride = static_cast<int>(row_stride) * words_per_scale;
-            sf_hidden_stride = static_cast<int>(column_stride);
+            EP_HOST_ASSERT(sf->stride(0) <= std::numeric_limits<int>::max() and
+                           sf->stride(1) <= std::numeric_limits<int>::max());
+            num_sf_packs = static_cast<int>(sf->size(1));
+            sf_ptr = sf->data_ptr();
+            sf_token_stride = static_cast<int>(sf->stride(0));
+            sf_hidden_stride = static_cast<int>(sf->stride(1));
         } else {
-            EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 or (decode and x.scalar_type() == torch::kFloat16));
-            // FP16 uses the same wire packet for fresh and cached dispatch. Every UB token starts on a block boundary.
-            EP_HOST_ASSERT((x.scalar_type() != torch::kFloat16 or num_hidden_bytes % kNumUbAlignmentBytes == 0) and
-                           "FP16 dispatch requires a 32-byte aligned hidden row");
+            EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
         }
 
         // Check top-k stuffs
@@ -330,12 +312,12 @@ public:
 
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
         low_latency_state->prepare();
-        const bool low_latency_transport = decode and low_latency_state->prepare_dispatch(
+        const bool use_mte = not sf.has_value() and low_latency_state->prepare_dispatch(
             context->num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts,
-            num_used_vec_cores, num_ub_bytes, num_sf_packs, sf.has_value());
+            num_used_vec_cores, num_ub_bytes, cached_mode);
         torch::Tensor metadata_send_buffer;
         const auto tokens_per_core = math::ceil_div<int64_t>(num_max_tokens_per_rank, num_used_vec_cores);
-        if (not low_latency_transport or not get_dispatch_mte_stages(
+        if (not use_mte or not get_dispatch_mte_stages(
                 context->num_ranks, num_experts, tokens_per_core, num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t),
                 num_topk, num_ub_bytes, cached_mode).keeps_metadata_in_ub(num_sf_packs, tokens_per_core)) {
             metadata_send_buffer = torch::empty(
@@ -352,12 +334,10 @@ public:
         }
 
         // Direct launches may read inputs allocated on another NPU stream.
-        const auto issue_stream = (decode or defer_epilogue) ? std::optional{c10_npu::getCurrentNPUStream()} : std::nullopt;
-        if (decode) {
+        const auto issue_stream = (use_mte or defer_epilogue) ? std::optional{c10_npu::getCurrentNPUStream()} : std::nullopt;
+        if (use_mte) {
             record_use(x, *issue_stream);
             record_use(topk_idx, *issue_stream);
-            if (sf.has_value())
-                record_use(*sf, *issue_stream);
             if (topk_weights.has_value())
                 record_use(*topk_weights, *issue_stream);
             if (cumulative_local_expert_recv_stats.has_value())
@@ -370,11 +350,10 @@ public:
         }
 
         // Launch dispatch
-        // A previous dispatch on this buffer may have produced the scales on another stream.
-        const auto wire_scales = pack_scales ? std::optional{sf->contiguous()} : sf;
-        const bool relay = low_latency_transport and low_latency_state->server_relay_enabled();
+        const bool relay = use_mte and low_latency_state->server_relay_enabled() and
+            max_expert_rows <= layout::kNumDecodeRelaySlots;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
-        const auto mode = get_ep_kernel_mode(decode, low_latency_transport);
+        const auto mode = use_mte ? EPKernelMode::DecodeMTE : EPKernelMode::Native;
         const int recv_sf_hidden_stride = sf.has_value() ? 1 : 0;
         const auto copy_epilogue = make_epilogue_launcher(mode, [=, ranks = context->num_ranks,
                                                                 timeout = context->num_gpu_timeout_cycles] {
@@ -386,7 +365,7 @@ public:
         auto submission = low_latency_state->submission_guard(x, metadata_send_buffer);
         launch_ep_dispatch(
             mode, [&] { submission.begin_submission(); },
-            x.data_ptr(), wire_scales.has_value() ? wire_scales->data_ptr() : nullptr,
+            x.data_ptr(), sf_ptr,
             topk_idx.data_ptr(), topk_weights_ptr,
             metadata_send_buffer.defined() ? metadata_send_buffer.data_ptr() : nullptr,
             cumulative_local_expert_recv_stats_ptr,
@@ -415,13 +394,13 @@ public:
             if (issue_stream.has_value()) {
                 const auto copy_stream = c10_npu::getCurrentNPUStream();
                 const bool cross_stream = copy_stream != *issue_stream;
-                if ((decode and cached_mode) or cross_stream) {
+                if ((use_mte and cached_mode) or cross_stream) {
                     record_use(psum_num_recv_tokens_per_rank, copy_stream);
                     record_use(psum_num_recv_tokens_per_expert, copy_stream);
                     if (cached_mode)
                         record_use(*cached_recv_src_metadata, copy_stream);
                 }
-                if (not low_latency_transport and cross_stream) {
+                if (not use_mte and cross_stream) {
                     record_use(x, copy_stream);
                     record_use(metadata_send_buffer, copy_stream);
                 }
@@ -482,7 +461,7 @@ public:
             copy_epilogue(
                 context->buffer,
                 context->workspace,
-                low_latency_transport ? nullptr : context->hccl_context->jetty_device_ptrs,
+                use_mte ? nullptr : context->hccl_context->jetty_device_ptrs,
                 psum_num_recv_tokens_per_rank.data_ptr<int>(),
                 psum_num_recv_tokens_per_expert.data_ptr<int>(),
                 recv_x.data_ptr(),
@@ -496,7 +475,7 @@ public:
             if (recv_sf.has_value() and use_cube_aligned_col_major_sf)
                 recv_sf = recv_sf->transpose(0, 1).contiguous().transpose(0, 1);
 
-            low_latency_state->record_completion(decode or async_with_compute_stream);
+            low_latency_state->record_completion(use_mte, async_with_compute_stream);
 
             return pybind11::make_tuple(
                 recv_x, recv_sf, recv_topk_weights,
@@ -531,7 +510,6 @@ public:
             const bool& defer_epilogue) const {
         EP_HOST_ASSERT(not destroyed);
         EP_HOST_ASSERT(not defer_epilogue or async_with_compute_stream);
-        const bool decode = use_decode_implementation(num_max_tokens_per_rank);
         EP_HOST_ASSERT(num_experts > 0 and num_experts % context->num_ranks == 0);
 
         // Check data tensor
@@ -540,7 +518,7 @@ public:
                        x.size(1) <= std::numeric_limits<int>::max() / x.element_size());
         const auto num_tokens = static_cast<int>(x.size(0));
         const auto hidden = static_cast<int>(x.size(1));
-        EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16 or (decode and x.scalar_type() == torch::kFloat16));
+        EP_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
         // Check the existing reduce-epilogue requirement before issuing the collective.
         EP_HOST_ASSERT(hidden % (kNumVectorRegisterBytes / static_cast<int>(sizeof(uint16_t))) == 0);
 
@@ -599,28 +577,27 @@ public:
         // Push data into remote reduce buffers
         const auto barrier_in_prologue = runtime->get_barrier_in_prologue();
         low_latency_state->prepare();
-        const bool low_latency_transport = decode and low_latency_state->prepare_combine(
+        const bool use_mte = low_latency_state->prepare_combine(
             context->num_ranks, num_max_tokens_per_rank, hidden, num_topk, num_experts, num_used_vec_cores, num_ub_bytes);
         torch::Tensor send_buffer;
-        if (not low_latency_transport) {
+        if (not use_mte) {
             const auto token_layout = get_combine_token_layout(hidden * static_cast<int>(sizeof(uint16_t)), num_topk);
             send_buffer = torch::empty({num_reduced_tokens, token_layout.get_num_bytes()}, x.options().dtype(torch::kByte));
         }
         // Direct JIT launches bypass Torch's allocator stream tracking.
-        const auto issue_stream = (decode or defer_epilogue) ? std::optional{c10_npu::getCurrentNPUStream()} : std::nullopt;
-        if (decode) {
+        const auto issue_stream = (use_mte or defer_epilogue) ? std::optional{c10_npu::getCurrentNPUStream()} : std::nullopt;
+        if (use_mte) {
             record_use(x, *issue_stream);
             record_use(src_metadata, *issue_stream);
             record_use(psum_num_recv_tokens_per_rank, *issue_stream);
             if (topk_weights.has_value())
                 record_use(*topk_weights, *issue_stream);
         }
-        const auto mode = get_ep_kernel_mode(decode, low_latency_transport);
-        const bool use_fp16 = x.scalar_type() == torch::kFloat16;
+        const auto mode = use_mte ? EPKernelMode::DecodeMTE : EPKernelMode::Native;
         const auto reduce_epilogue = make_epilogue_launcher(mode, [=, ranks = context->num_ranks,
                                                                   timeout = context->num_gpu_timeout_cycles] {
             return prepare_combine_reduce_epilogue(mode, ranks, num_max_tokens_per_rank, num_experts,
-                num_topk, hidden, num_ub_bytes, num_used_vec_cores, timeout, not barrier_in_prologue, use_fp16);
+                num_topk, hidden, num_ub_bytes, num_used_vec_cores, timeout, not barrier_in_prologue);
         });
         auto submission = low_latency_state->submission_guard(x, send_buffer);
         const auto reduce_buffer = launch_ep_combine(
@@ -639,7 +616,7 @@ public:
             num_ub_bytes,
             num_used_vec_cores,
             context->num_gpu_timeout_cycles,
-            barrier_in_prologue, use_fp16
+            barrier_in_prologue
         );
 
         // URMA still reads x (direct sends) and send_buffer after the issue kernel exits.
@@ -650,7 +627,7 @@ public:
             if (issue_stream.has_value()) {
                 const auto reduce_stream = c10_npu::getCurrentNPUStream();
                 const bool cross_stream = reduce_stream != *issue_stream;
-                if (decode or cross_stream) {
+                if (use_mte or cross_stream) {
                     record_use(combined_topk_idx, reduce_stream);
                     if (bias_0.has_value())
                         record_use(*bias_0, reduce_stream);
@@ -684,7 +661,7 @@ public:
                 num_combined_tokens
             );
 
-            low_latency_state->record_completion(decode or async_with_compute_stream);
+            low_latency_state->record_completion(use_mte, async_with_compute_stream);
             return pybind11::make_tuple(combined_x, combined_topk_weights);
         };
 

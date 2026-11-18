@@ -5,13 +5,7 @@
 
 namespace deep_ep {
 
-enum class EPKernelMode { Native, DecodeURMA, DecodeMTE };
-
-constexpr EPKernelMode get_ep_kernel_mode(bool decode, bool mte) {
-    if (not decode)
-        return EPKernelMode::Native;
-    return mte ? EPKernelMode::DecodeMTE : EPKernelMode::DecodeURMA;
-}
+enum class EPKernelMode { Native, DecodeMTE };
 
 // A decode specialization can reject the selected UB geometry. Resolve it before
 // submitting the collective. Native epilogues keep their original JIT timing.

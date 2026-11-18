@@ -32,15 +32,14 @@ static void* launch_ep_combine(EPKernelMode mode, auto&& before_launch,
                                const int& num_ub_bytes,
                                const int& num_vec_cores,
                                const int64_t& num_timeout_cycles,
-                               const bool& do_barrier = false, bool use_fp16 = false) {
+                               const bool& do_barrier = false) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
 
     const bool native = mode == EPKernelMode::Native;
-    const bool mte = mode == EPKernelMode::DecodeMTE;
-    const auto decode_args = native ? std::string{} : std::format(", {}, {}", mte, use_fp16 ? "half" : "bfloat16_t");
-    const auto kernel = jit->compile(mte ? "combine_mte" : "combine", std::format(R"(
+    const auto decode_args = native ? "" : ", true, bfloat16_t";
+    const auto kernel = jit->compile(native ? "combine" : "combine_mte", std::format(R"(
 #include <deep_ep/impls/ep/{}combine.hpp>
 
 using namespace deep_ep;
@@ -91,8 +90,7 @@ static void* launch_combine(void* x,
 
 static auto prepare_combine_reduce_epilogue(EPKernelMode mode, int num_ranks, int num_max_tokens_per_rank,
                                             int num_experts, int num_topk, int hidden, int num_ub_bytes,
-                                            int num_vec_cores, int64_t num_timeout_cycles, bool do_barrier,
-                                            bool use_fp16) {
+                                            int num_vec_cores, int64_t num_timeout_cycles, bool do_barrier) {
     EP_HOST_ASSERT(num_vec_cores > 0);
     EP_HOST_ASSERT(num_ub_bytes > 0);
     EP_HOST_ASSERT(num_max_tokens_per_rank > 0);
@@ -100,8 +98,7 @@ static auto prepare_combine_reduce_epilogue(EPKernelMode mode, int num_ranks, in
     EP_HOST_ASSERT(hidden % (kNumVectorRegisterBytes / static_cast<int>(sizeof(uint16_t))) == 0);
 
     const bool native = mode == EPKernelMode::Native;
-    const bool mte = mode == EPKernelMode::DecodeMTE;
-    const auto decode_args = native ? std::string{} : std::format(", {}, {}", mte, use_fp16 ? "half" : "bfloat16_t");
+    const auto decode_args = native ? "" : ", true, bfloat16_t";
     const auto kernel = jit->compile("combine_reduce_epilogue", std::format(R"(
 #include <deep_ep/impls/ep/{}combine_reduce_epilogue.hpp>
 
@@ -141,7 +138,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int64_t& num_timeout_cycles,
                                            const bool& do_barrier = true) {
     const auto launch = prepare_combine_reduce_epilogue(EPKernelMode::Native, num_ranks, num_max_tokens_per_rank,
-        num_experts, num_topk, hidden, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier, false);
+        num_experts, num_topk, hidden, num_ub_bytes, num_vec_cores, num_timeout_cycles, do_barrier);
     launch(combined_x, combined_topk_weights, combined_topk_idx, reduce_buffer, bias_0, bias_1,
            workspace, jetty_ptrs, num_combined_tokens);
 }
