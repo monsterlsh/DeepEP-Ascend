@@ -5,6 +5,8 @@
 
 namespace deep_ep::layout {
 
+inline constexpr int kNumDecodeRelaySlots = 4096;
+
 struct alignas(kNumAllocationAlignmentBytes) EPSignals {
     CommonSignals common_signals;
     // Local histogram counters occupy separate sectors.
@@ -15,7 +17,12 @@ struct alignas(kNumAllocationAlignmentBytes) EPSignals {
     int host_rank_expert_count[kNumMaxRanks + kNumMaxExperts];
     // Rows are packed with the active number of experts per rank.
     int epilogue_expert_counter[kNumMaxVecCores * kNumMaxExperts];
+    int decode_server_ids[kNumMaxRanks];
+    // Relay descriptors occupy padding of the original registered workspace. Every peer
+    // addresses them at the same offset, independently of its EP and LB buffer sizes.
+    int decode_relay_slots[kNumDecodeRelaySlots];
 };
+static_assert(sizeof(EPSignals) == kNumAllocationAlignmentBytes, "Keep the native EP buffer offset");
 
 struct EPWorkspaceLayout {
     __gm__ EPSignals& signals;

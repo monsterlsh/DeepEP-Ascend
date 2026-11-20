@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -23,12 +24,29 @@
 #include <deep_ep/common/math.hpp>
 #include <deep_ep/common/exception.hpp>
 
+#include "../../comm/decode_topology.hpp"
 #include "symmetric.hpp"
 
 namespace deep_ep {
 
 struct HCCLContext {
-    std::shared_ptr<symmetric::SymmetricMemory> memory;
+private:
+    struct Registrations {
+        std::shared_ptr<symmetric::SymmetricMemory> memory;
+        HcclMemHandle mem_handle = nullptr;
+        std::vector<EndpointHandle> jetty_endpoints;
+        std::vector<HcommMemHandle> jetty_mem_handles;
+        std::vector<ChannelHandle> channel_handles;
+        // HCOMM shallow-copies channelName pointers until channel destruction.
+        std::vector<std::string> channel_names;
+    };
+    std::unique_ptr<Registrations> registrations = std::make_unique<Registrations>();
+    HcommResult close_status = 0;
+
+public:
+    const std::shared_ptr<symmetric::SymmetricMemory>& registered_memory() const { return registrations->memory; }
+    int num_jetties() const { return static_cast<int>(registrations->jetty_endpoints.size()); }
+
     HcclComm comm = nullptr;
     void* buffer = nullptr;
     int64_t num_bytes = 0;
@@ -37,18 +55,19 @@ struct HCCLContext {
     int rank_idx = 0;
     std::vector<int64_t> peer_ptrs;
 
-    // HCCL registration for UB_MEM address discovery
-    HcclMemHandle mem_handle = nullptr;
-
-    // Jetty endpoints, peer channels and their device lookup table
-    std::vector<EndpointHandle> jetty_endpoints;
-    std::vector<ChannelHandle> channel_handles;
-    void* jetty_device_ptrs = nullptr;  // Device copy of `channel_handles`
+    void* jetty_device_ptrs = nullptr;  // Device copy of the channel handles
 
     HCCLContext(const std::string& hccl_group_name, const int& rank_idx,
                 const int& num_ranks, const int64_t& num_bytes,
                 const int& num_jetties, const int& num_cpu_timeout_secs, const bool& use_huge1g_page,
                 const std::shared_ptr<symmetric::SymmetricMemory>& shared_memory = nullptr):
+        HCCLContext(hccl_group_name, rank_idx, num_ranks, num_bytes, num_jetties, num_cpu_timeout_secs,
+                    use_huge1g_page, shared_memory, nullptr) {}
+
+    HCCLContext(const std::string& hccl_group_name, const int& rank_idx,
+                const int& num_ranks, const int64_t& num_bytes,
+                const int& num_jetties, const int& num_cpu_timeout_secs, const bool& use_huge1g_page,
+                const std::shared_ptr<symmetric::SymmetricMemory>& shared_memory, comm::DecodeTopology* decode_topology):
         num_bytes(num_bytes),
         num_ranks(num_ranks), rank_idx(rank_idx) {
         EP_HOST_ASSERT(num_bytes > 0);
@@ -63,6 +82,7 @@ struct HCCLContext {
         const auto buffer_uid = "deep_ep/" + hccl_group_name + "/" + std::to_string(buffer_idx);
 
         // Share the allocation when registering the same storage with another group.
+        auto& memory = registrations->memory;
         memory = shared_memory == nullptr ? std::make_shared<symmetric::SymmetricMemory>(num_bytes, use_huge1g_page) : shared_memory;
         EP_HOST_ASSERT(memory->num_bytes == num_bytes);
         buffer = memory->ptr;
@@ -74,7 +94,7 @@ struct HCCLContext {
         mem.addr = buffer;
         mem.size = static_cast<uint64_t>(this->num_bytes);
         HCCL_CHECK(HcclCommGetHandleWithName(hccl_group_name.c_str(), &comm));
-        HCCL_CHECK(HcclCommMemReg(comm, buffer_uid.c_str(), &mem, &mem_handle));
+        HCCL_CHECK(HcclCommMemReg(comm, buffer_uid.c_str(), &mem, &registrations->mem_handle));
         // TODO: do we need a barrier after member reg?
 
         // Discover peer buffer pointers
@@ -93,30 +113,56 @@ struct HCCLContext {
 
             // Acquire UBMEM channels and Jetties
             acquire_ubmem_channels(layer);
-            acquire_jetties(layer, num_jetties, buffer_uid, num_cpu_timeout_secs);
+            acquire_jetties(layer, num_jetties, buffer_uid, num_cpu_timeout_secs, decode_topology);
         }
     }
 
-    ~HCCLContext() noexcept(false) {
+    void close() {
         // TODO: do we have to destroy the connections as well?
+        // HCOMM can consume handles before returning an error. Never resubmit those handles.
+        HCOMM_CHECK(close_status);
+        auto& channel_handles = registrations->channel_handles;
+        auto& jetty_endpoints = registrations->jetty_endpoints;
+        auto& jetty_mem_handles = registrations->jetty_mem_handles;
         if (jetty_device_ptrs != nullptr) {
             ACL_CHECK(aclrtFree(jetty_device_ptrs));
             jetty_device_ptrs = nullptr;
         }
-        if (not channel_handles.empty())
-            HCOMM_CHECK(HcommChannelDestroy(channel_handles.data(), static_cast<uint32_t>(channel_handles.size())));
-        for (size_t i = 0; i < jetty_endpoints.size(); ++ i) {
-            HCOMM_CHECK(HcommMemUnreg(jetty_endpoints[i], jetty_mem_handles[i]));
-            HCOMM_CHECK(HcommEndpointDestroy(jetty_endpoints[i]));
+        if (not channel_handles.empty()) {
+            close_status = HcommChannelDestroy(channel_handles.data(), static_cast<uint32_t>(channel_handles.size()));
+            HCOMM_CHECK(close_status);
+            channel_handles.clear();
         }
-        memory.reset();
+        while (not jetty_endpoints.empty()) {
+            close_status = HcommMemUnreg(jetty_endpoints.back(), jetty_mem_handles.back());
+            HCOMM_CHECK(close_status);
+            close_status = HcommEndpointDestroy(jetty_endpoints.back());
+            HCOMM_CHECK(close_status);
+            jetty_mem_handles.pop_back();
+            jetty_endpoints.pop_back();
+        }
+        registrations->memory.reset();
         buffer = nullptr;
     }
 
+    ~HCCLContext() noexcept {
+        close_noexcept();
+    }
+
 private:
-    std::vector<HcommMemHandle> jetty_mem_handles;
-    // HCOMM shallow-copies channelName pointers; keep channel_names until channel destruction.
-    std::vector<std::string> channel_names;
+    void close_noexcept() noexcept {
+        try {
+            close();
+        } catch (const std::exception& e) {
+            // Outstanding registrations may still refer to the window and channel metadata.
+            // Leave their owners intact through process exit, without allocating on this path.
+            (void)registrations.release();
+            std::fprintf(stderr, "DeepEP: HCOMM cleanup failed; retaining registered resources: %s\n", e.what());
+        } catch (...) {
+            (void)registrations.release();
+            std::fputs("DeepEP: HCOMM cleanup failed; retaining registered resources.\n", stderr);
+        }
+    }
 
     // Build a channel desc for the first link to `peer_rank_idx` on `layer` whose
     // protocol satisfies `accept`. Returns nullptr if no such link exists.
@@ -144,7 +190,7 @@ private:
             // TODO: what do the magic numbers (3 and 1) mean?
             desc.notifyNum               = 3;
             // Attach our registered workspace so peers' writes land in our region.
-            desc.memHandles              = &mem_handle;
+            desc.memHandles              = &registrations->mem_handle;
             desc.memHandleNum            = 1;
             return desc;
         }
@@ -195,7 +241,7 @@ private:
 
     // Acquire exactly one shared Jetty per AIV, with separate channels for peer metadata.
     void acquire_jetties(uint32_t layer, const int& num_jetties,
-                         const std::string& buffer_uid, const int& num_cpu_timeout_secs) {
+                         const std::string& buffer_uid, const int& num_cpu_timeout_secs, comm::DecodeTopology* decode_topology) {
         const auto peer_descs = build_peer_descs(layer,
             [](auto proto) { return proto == COMM_PROTOCOL_UBC_CTP; },
             "no UBC_CTP link to peer on the chosen layer");
@@ -221,6 +267,8 @@ private:
         mem.type = COMM_MEM_TYPE_DEVICE;
         mem.addr = buffer;
         mem.size = static_cast<uint64_t>(num_bytes);
+        auto& jetty_endpoints = registrations->jetty_endpoints;
+        auto& jetty_mem_handles = registrations->jetty_mem_handles;
         jetty_endpoints.resize(num_jetties);
         jetty_mem_handles.resize(num_jetties);
         for (int i = 0; i < num_jetties; ++ i) {
@@ -232,12 +280,16 @@ private:
         uint32_t listen_port = 0;
         HCOMM_CHECK(HcommEndpointGetListenPort(jetty_endpoints.front(), &listen_port));
         EP_HOST_ASSERT(listen_port > 0 and listen_port <= std::numeric_limits<uint16_t>::max());
-        const auto listen_ports = gather_listen_ports(static_cast<uint16_t>(listen_port), num_cpu_timeout_secs);
+        if (decode_topology != nullptr)
+            decode_topology->local_server = comm::DecodeTopology::get_server_location(jetty_endpoint_desc.loc);
+        const auto listen_ports = gather_listen_ports(static_cast<uint16_t>(listen_port), num_cpu_timeout_secs, decode_topology);
 
         // The first entries describe every peer; pair the remaining Jetty owners directly.
         HcommChannelConfig config = nullptr;
         HCOMM_CHECK(HcommChannelConfigCreate(&config));
         HCOMM_CHECK(HcommChannelConfigSetInt(config, HCOMM_CHANNEL_CONFIG_TYPE_IS_SHARED_QUEUE, 1));
+        auto& channel_handles = registrations->channel_handles;
+        auto& channel_names = registrations->channel_names;
         channel_handles.resize(num_channels);
         channel_names.resize(num_channels);
         for (int channel_idx = 0; channel_idx < num_channels; ++ channel_idx) {
@@ -280,25 +332,56 @@ private:
                               ACL_MEMCPY_HOST_TO_DEVICE));
     }
 
-    std::vector<uint16_t> gather_listen_ports(const uint16_t& listen_port, const int& num_cpu_timeout_secs) const {
-        // Exchange once per buffer, regardless of the number of peers or Jetties.
-        std::vector<uint16_t> listen_ports(num_ranks);
-        const auto num_port_bytes = sizeof(uint16_t) * num_ranks;
-        void* device_ports = nullptr;
-        ACL_CHECK(aclrtMalloc(&device_ports, num_port_bytes + sizeof(uint16_t), ACL_MEM_MALLOC_NORMAL_ONLY));
-        const auto stream = c10_npu::getCurrentNPUStream();
-        const auto local_port = math::advance_ptr<void>(device_ports, num_port_bytes);
-        ACL_CHECK(aclrtMemcpy(local_port, sizeof(listen_port), &listen_port, sizeof(listen_port), ACL_MEMCPY_HOST_TO_DEVICE));
-        HCCL_CHECK(HcclAllGather(local_port, device_ports, 1, HCCL_DATA_TYPE_UINT16, comm, stream));
-        ACL_CHECK(aclrtSynchronizeStreamWithTimeout(stream, num_cpu_timeout_secs * 1000));
-        ACL_CHECK(aclrtMemcpy(listen_ports.data(), num_port_bytes, device_ports, num_port_bytes, ACL_MEMCPY_DEVICE_TO_HOST));
-        ACL_CHECK(aclrtFree(device_ports));
-        for (const auto& port: listen_ports)
-            EP_HOST_ASSERT(port > 0);
-        return listen_ports;
+    std::vector<uint16_t> gather_listen_ports(uint16_t listen_port, int num_cpu_timeout_secs,
+                                             comm::DecodeTopology* decode_topology) {
+        const auto gather = [&]<typename T>(const T& local) {
+            static_assert(sizeof(T) % sizeof(uint16_t) == 0);
+            std::vector<T> peers(num_ranks);
+            const auto bytes = sizeof(T) * peers.size();
+            void* raw = nullptr;
+            ACL_CHECK(aclrtMalloc(&raw, bytes + sizeof(T), ACL_MEM_MALLOC_NORMAL_ONLY));
+            std::unique_ptr<void, decltype(&aclrtFree)> allocation(raw, &aclrtFree);
+            auto* send = static_cast<char*>(raw) + bytes;
+            ACL_CHECK(aclrtMemcpy(send, sizeof(T), &local, sizeof(T), ACL_MEMCPY_HOST_TO_DEVICE));
+            const auto stream = c10_npu::getCurrentNPUStream();
+            const auto status = HcclAllGather(send, raw, sizeof(T) / sizeof(uint16_t), HCCL_DATA_TYPE_UINT16, comm, stream);
+            // If the wait times out, the collective may still access this allocation.
+            allocation.release();
+            const auto timeout_ms = std::min<int64_t>(int64_t{num_cpu_timeout_secs} * 1000, std::numeric_limits<int32_t>::max());
+            const auto wait_status = aclrtSynchronizeStreamWithTimeout(stream, static_cast<int32_t>(timeout_ms));
+            if (wait_status == ACL_SUCCESS)
+                allocation.reset(raw);
+            else if (status != HCCL_SUCCESS)
+                std::fprintf(stderr, "DeepEP: stream synchronization after failed HcclAllGather returned ACL error %d\n",
+                             static_cast<int>(wait_status));
+            HCCL_CHECK(status);
+            ACL_CHECK(wait_status);
+            ACL_CHECK(aclrtMemcpy(peers.data(), bytes, raw, bytes, ACL_MEMCPY_DEVICE_TO_HOST));
+            ACL_CHECK(aclrtFree(allocation.release()));
+            return peers;
+        };
+        try {
+            // Main exchanges one uint16_t and rejects port zero before creating channels.
+            // Use that same count so both sides reject a mixed group in the first collective.
+            auto listen_ports = gather(decode_topology ? uint16_t{0} : listen_port);
+            if (decode_topology != nullptr) {
+                EP_HOST_ASSERT(std::all_of(listen_ports.begin(), listen_ports.end(), [](uint16_t port) { return port == 0; })
+                               and "All EP ranks must use the same topology exchange protocol");
+                listen_ports = decode_topology->gather_ports(listen_port, gather);
+            }
+            for (const auto& port: listen_ports)
+                EP_HOST_ASSERT(port > 0);
+            return listen_ports;
+        } catch (...) {
+            // Every local Jetty has registered the window before EP negotiation.
+            if (decode_topology != nullptr)
+                close_noexcept();
+            throw;
+        }
     }
 
     void wait_for_channels(const int& num_cpu_timeout_secs) const {
+        const auto& channel_handles = registrations->channel_handles;
         // State values from the `HcommChannelGetStatus` contract.
         // TODO(HUAWEI): do not hardcode
         static constexpr int kChannelReady = 0;

@@ -69,6 +69,17 @@ Training, inference prefill and decoding share the same `EPBuffer` interface and
 | `BucketBuffer` | Batched all-gather, registered storage, multiple groups and sessions for ordinary tensors |
 | `BufferAllocator`, `BufferBase`, `deep_ep.comm` | Allocation planning, buffer lifecycle, communicator queries, barriers and stream access |
 
+On supported Ascend 950 hardware, `EPBuffer` selects MTE for BF16 operations with hidden size 7168, top-k 6 and 384 experts when the common per-rank capacity `M` is between 1 and the limit below, inclusive. Each operation selects its own transport using the capacity supplied to dispatch or saved in its handle.
+
+| EP ranks | Dispatch max M | Cached dispatch max M | Combine max M |
+| ---: | ---: | ---: | ---: |
+| 8 | 128 | 128 | 96 |
+| 16 | 128 | 128 | 16 |
+| 32 | 32 | 32 | 32 |
+| 64 | 32 | 16 | 8 |
+
+Other configurations and calls for which MTE is unavailable use the native EP kernels and their usual input formats (BF16, or FP8 dispatch with 16-bit scale packs).
+
 PP, Engram and Bucket are experimental; remaining work is listed under [Ongoing](#ongoing). EP requires `do_expand=True` and `allow_multiple_reduction=True`; `do_handle_copy` must remain `False`.
 
 Routing indices use `deep_ep.topk_idx_t`, currently fixed to `torch.int64`. Explicit RDMA service levels and QP counts are unsupported; leave `sl_idx=None` and QP arguments at their defaults. The NV-compatible `num_sms` argument selects AI cores on Ascend EP, with `0` selecting the default; cached dispatch and combine reuse the count saved in the handle.
@@ -88,6 +99,7 @@ Hybrid communication, CPU-backed Engram storage and graph capture remain unsuppo
 ### Buffer initialization
 
 Create one long-lived buffer per EP group and reuse it across layers or microbatches. All ranks must agree on the token capacity. Complete outstanding operations before resizing, reusing or destroying a buffer.
+Use the same DeepEP build on all ranks in the group.
 
 ```python
 import torch
@@ -114,6 +126,7 @@ buffer = EPBuffer(
 ```
 
 Use `EPBuffer.get_buffer_size_hint()` to check capacity when managing a buffer pool. After all uses and their waits have finished, call `buffer.destroy()` before tearing down the process group.
+If an EP operation fails after communication has been submitted, or `buffer.destroy()` reports a cleanup error, restart the distributed job.
 
 ### Dispatch and combine
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 
 #include <acl/acl.h>
 
@@ -20,8 +21,19 @@ public:
         ACL_CHECK(aclrtMemset(ptr, num_bytes, 0, num_bytes));
     }
 
-    ~SymmetricMemory() noexcept(false) {
-        ACL_CHECK(aclrtFree(ptr));
+    void close() {
+        if (ptr != nullptr) {
+            ACL_CHECK(aclrtFree(ptr));
+            ptr = nullptr;
+        }
+    }
+
+    ~SymmetricMemory() noexcept {
+        if (ptr != nullptr) {
+            const auto status = aclrtFree(ptr);
+            if (status != 0)
+                std::fprintf(stderr, "DeepEP: aclrtFree failed with status %d\n", static_cast<int>(status));
+        }
     }
 
     SymmetricMemory(const SymmetricMemory&) = delete;

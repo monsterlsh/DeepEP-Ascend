@@ -36,6 +36,15 @@ public:
             const int64_t& num_rdma_storage_bytes, const bool& use_huge1g_page,
             const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
             const std::shared_ptr<Context>& main_context = nullptr):
+        Context(hccl_group_name, rank_idx, num_ranks, num_workspace_bytes, num_gpu_buffer_bytes,
+                num_rdma_storage_bytes, use_huge1g_page, num_cpu_timeout_secs, num_gpu_timeout_secs,
+                main_context, nullptr) {}
+
+    Context(const std::string& hccl_group_name, const int& rank_idx, const int& num_ranks,
+            const int64_t& num_workspace_bytes, const int64_t& num_gpu_buffer_bytes,
+            const int64_t& num_rdma_storage_bytes, const bool& use_huge1g_page,
+            const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
+            const std::shared_ptr<Context>& main_context, DecodeTopology* decode_topology):
         rank_idx(rank_idx), num_ranks(num_ranks),
         num_cpu_timeout_secs(num_cpu_timeout_secs),
         num_gpu_timeout_cycles(static_cast<int64_t>(num_gpu_timeout_secs) * kNumSystemCyclesPerSecond),
@@ -55,8 +64,8 @@ public:
         hccl_context = std::make_shared<HCCLContext>(
             hccl_group_name, rank_idx, num_ranks, num_bytes, runtime->get_num_vec_cores(),
             num_cpu_timeout_secs, use_huge1g_page,
-            main_context == nullptr ? nullptr : main_context->symmetric_memory);
-        symmetric_memory = hccl_context->memory;
+            main_context == nullptr ? nullptr : main_context->symmetric_memory, decode_topology);
+        symmetric_memory = hccl_context->registered_memory();
         workspace = symmetric_memory->ptr;
         EP_HOST_ASSERT(reinterpret_cast<uintptr_t>(workspace) % kNumAllocationAlignmentBytes == 0);
         buffer = math::advance_ptr<void>(symmetric_memory->ptr, num_workspace_bytes);
@@ -93,10 +102,17 @@ public:
     }
 
     void finalize() {
-        EP_HOST_ASSERT(not finalized);
-        hccl_context.reset();
-        symmetric_memory.reset();
+        finalize(false);
+    }
+
+    void finalize(bool report_cleanup_errors) {
         finalized = true;
+        if (report_cleanup_errors and hccl_context.use_count() == 1)
+            hccl_context->close();
+        hccl_context.reset();
+        if (report_cleanup_errors and symmetric_memory.use_count() == 1)
+            symmetric_memory->close();
+        symmetric_memory.reset();
     }
 };
 
